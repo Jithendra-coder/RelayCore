@@ -1,0 +1,46 @@
+{
+  "classification": "MEASURED",
+  "completed_at_utc": "2026-10-04T13:53:33.076850+00:00",
+  "api": "http://127.0.0.1:8013",
+  "duplicate_delivery": {
+    "received": 10,
+    "logical_side_effects": 3,
+    "workflow_id": "2ce75cfb-cbd2-44bf-a967-343771c18bef",
+    "status": "completed"
+  },
+  "worker_kill_recovery": {
+    "worker_id_killed": "worker-1",
+    "worker_pid_killed": 14592,
+    "replacement_workers": [
+      "worker-2"
+    ],
+    "lease_expired_event": true,
+    "logical_side_effects": 4,
+    "workflow_id": "e3fa70a6-5881-4287-88d6-50484984a5f4",
+    "status": "completed"
+  },
+  "dead_letter_replay": {
+    "dead_letter_id": 1,
+    "workflow_id": "8d412499-f28c-493a-a707-9bada27038ca",
+    "status": "completed",
+    "audit_events": [
+      "workflow.replayed",
+      "workflow.completed"
+    ]
+  },
+  "final_metrics": {
+    "queue_depth": 0,
+    "dead_letters": 0,
+    "side_effect_count": 8,
+    "latency_ms": {
+      "p50": 1793.131,
+      "p95": 6902.175399999999,
+      "p99": 7356.31268
+    }
+  },
+  "elapsed_seconds": 9.719,
+  "limitations": [
+    "Charge effects are local PostgreSQL records, not real payments.",
+    "Failure/recovery runs in one local PostgreSQL deployment."
+  ]
+}

@@ -1,0 +1,80 @@
+{
+  "classification": "MEASURED",
+  "verified_at_utc": "2026-10-04T13:49:00.279572+00:00",
+  "scenario": "PostgreSQL immediate stop/restart while a real worker holds a lease",
+  "database": {
+    "data_directory": "C:/Users/JITHU/AppData/Local/Temp/relaycore-verify-utf8-20261004",
+    "port": "55433",
+    "database": "relaycore_demo"
+  },
+  "api_health_recovered": true,
+  "workflow_id": "870c5f2a-9fd5-4185-87fb-b427df5f3b95",
+  "workflow_status": "completed",
+  "task": {
+    "status": "succeeded",
+    "attempts": 0,
+    "last_error": {
+      "kind": "lease_expired",
+      "detail": "Worker lease expired."
+    },
+    "step_index": 2
+  },
+  "recovery_event_present": true,
+  "claim_workers": [
+    "worker-1",
+    "worker-2",
+    "worker-2"
+  ],
+  "logical_side_effects": 2,
+  "events": [
+    {
+      "kind": "workflow.created",
+      "worker_id": null,
+      "created_at": "2026-10-04T19:18:58.124221+05:30"
+    },
+    {
+      "kind": "task.claimed",
+      "worker_id": "worker-1",
+      "created_at": "2026-10-04T19:18:58.418755+05:30"
+    },
+    {
+      "kind": "task.lease_expired",
+      "worker_id": "worker-1",
+      "created_at": "2026-10-04T19:19:02.464098+05:30"
+    },
+    {
+      "kind": "task.claimed",
+      "worker_id": "worker-2",
+      "created_at": "2026-10-04T19:19:02.985755+05:30"
+    },
+    {
+      "kind": "side_effect.applied",
+      "worker_id": "worker-2",
+      "created_at": "2026-10-04T19:19:11.242442+05:30"
+    },
+    {
+      "kind": "task.step_completed",
+      "worker_id": "worker-2",
+      "created_at": "2026-10-04T19:19:11.243475+05:30"
+    },
+    {
+      "kind": "task.claimed",
+      "worker_id": "worker-2",
+      "created_at": "2026-10-04T19:19:11.247817+05:30"
+    },
+    {
+      "kind": "side_effect.applied",
+      "worker_id": "worker-2",
+      "created_at": "2026-10-04T19:19:11.250236+05:30"
+    },
+    {
+      "kind": "workflow.completed",
+      "worker_id": "worker-2",
+      "created_at": "2026-10-04T19:19:11.252284+05:30"
+    }
+  ],
+  "limitations": [
+    "Single local PostgreSQL instance; not a failover or network-partition test.",
+    "Sleep is a demo action; its in-progress attempt is restarted after lease expiry."
+  ]
+}
