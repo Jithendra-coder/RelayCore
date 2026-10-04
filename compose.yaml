@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: relaycore
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-relaycore-local-change-me}
+      POSTGRES_DB: relaycore
+    volumes:
+      - relaycore_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relaycore -d relaycore"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://relaycore:relaycore-local-change-me@db:5432/relaycore}
+      RELAYCORE_API_KEYS: ${RELAYCORE_API_KEYS-}
+      RELAYCORE_DEMO_MODE: ${RELAYCORE_DEMO_MODE:-1}
+      RELAYCORE_WORKERS: ${RELAYCORE_WORKERS:-2}
+      RELAYCORE_QUEUE_LIMIT: ${RELAYCORE_QUEUE_LIMIT:-1000}
+      RELAYCORE_RATE_LIMIT_PER_MINUTE: ${RELAYCORE_RATE_LIMIT_PER_MINUTE:-600}
+      RELAYCORE_LEASE_SECONDS: ${RELAYCORE_LEASE_SECONDS:-4}
+    ports:
+      - "127.0.0.1:${RELAYCORE_PORT:-8000}:8000"
+    restart: unless-stopped
+
+volumes:
+  relaycore_data:
