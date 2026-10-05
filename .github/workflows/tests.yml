@@ -36,3 +36,4 @@ jobs:
       - run: python -m ruff check app tests benchmarks scripts
       - run: python -m pre_commit run --all-files
       - run: python -m pytest --cov=app --cov-report=term-missing -q
+      - run: docker compose config --quiet
