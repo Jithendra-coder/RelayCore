@@ -19,6 +19,7 @@ Identity, workspace authorization, signed durable webhook intake, encrypted work
 | Workspace credential storage | Complete locally | GitHub, Slack, and generic bearer secrets are Fernet-encrypted, workspace-scoped, idempotently created/rotated, revocable, redacted from API/audit output, and covered by PostgreSQL tests. HTTP credentials bind to one operator-allowlisted host. |
 | Production HTTP action | Complete locally; external endpoint unverified | Manual workflow runs send bounded JSON over verified HTTPS to a host-bound public destination; stable per-step idempotency key, bounded/redacted JSON result, no redirects, status-aware retries, and permanent-error DLQ path are tested with a no-network transport. |
 | Existing-system audit | Complete | Source-based audit records reusable foundations, weak/missing areas, demo-only components, prioritized debt, and the decision to preserve the PostgreSQL core in `docs/audit/existing-system.md`. |
+| Demo action isolation | Complete locally | Simulated `record`/`charge`/sleep/failure actions execute only through `app/sandbox.py`; production workers reject stale sandbox tasks before importing that module and dead-letter them without side effects. |
 | Webhook workflow triggers | Complete locally for Demo Mode and constrained production HTTP | Exact endpoint ID + JSON `type`; event intake and matching run commit atomically. Duplicates do not enqueue twice. Production runs are HTTP-only, reference the source event, pin an immutable version, and support bounded JSON Pointer references in request bodies. |
 | GitHub/Slack integrations | Incomplete | Credential storage exists, but OAuth lifecycles, provider webhooks/actions, rate limits, and live interoperability are not implemented. |
 | Production secrets, scheduling, deployment, SDK/CLI | Incomplete | See `LIMITATIONS.md`. |
@@ -46,7 +47,7 @@ Identity, workspace authorization, signed durable webhook intake, encrypted work
 
 ## Latest change
 
-Added signed production webhook triggers for versioned HTTP-only workflows. Each run retains a foreign key to its event, worker execution resolves explicit JSON Pointer body references, duplicate deliveries create no second run, and queued runs keep their selected workflow version. Missing/oversized mappings fail permanently; event payloads do not appear in run-history APIs. Workers reject sandbox actions in production and send any stale queued demo task to the DLQ without an effect. Migration 009 and regression tests cover fresh/upgrade schemas, signature/deduplication, payload binding, and version pinning. The full script passes: 48 tests, Ruff, and pre-commit; coverage is 80%. Live provider endpoints, live OIDC, and cloud release remain unverified/incomplete.
+Moved simulated `record`/`charge`/sleep/failure behavior into `app/sandbox.py`; the production worker refuses those actions before importing the sandbox executor. The full script passes: 48 PostgreSQL tests, Ruff, and pre-commit; coverage is 80%. Production webhook-trigger behavior is covered by the previous checkpoint. Live provider endpoints, live OIDC, and cloud release remain unverified/incomplete.
 
 ## Next milestone
 

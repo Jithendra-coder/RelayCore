@@ -14,6 +14,7 @@
 - Request-validation responses include field locations and messages but omit submitted values and validator context, avoiding accidental echo of secrets or webhook payloads.
 - Static API keys and simulated provider actions are limited to Demo Mode.
 - The worker repeats the Demo/production action-mode check before dispatch. Old queued sandbox actions opened under production settings fail permanently into the DLQ without creating an effect.
+- Demo action implementations are isolated in `app/sandbox.py`, which production workers do not import.
 
 ## Unimplemented protections
 

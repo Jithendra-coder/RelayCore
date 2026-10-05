@@ -6,7 +6,6 @@ import json
 import os
 import secrets
 import socket
-import time
 import uuid
 from typing import Any
 
@@ -1119,33 +1118,6 @@ def execute_step(conn: Connection, worker_id: str, task: dict[str, Any], request
     action, payload = step["action"], step["payload"]
     if (DEMO_MODE and action == "http") or (not DEMO_MODE and action != "http"):
         raise PermanentActionError("Workflow action is not allowed in the current execution mode.")
-    if action == "fail_once" and task["attempts"] == 1:
-        raise RuntimeError("Deterministic Demo Mode failure on the first attempt.")
-    if action == "fail_until_replay":
-        released = conn.execute(
-            "SELECT EXISTS(SELECT 1 FROM dead_letters WHERE task_id=%s AND replayed_at IS NOT NULL) AS released",
-            (task["id"],),
-        ).fetchone()["released"]
-        if not released:
-            raise RuntimeError("Demo failure is held until an administrator replays its dead letter.")
-
-    if action == "sleep":
-        from app.settings import LEASE_SECONDS
-
-        remaining = float(payload.get("seconds", 0))
-        tick = min(0.2, max(0.05, LEASE_SECONDS / 4))
-        while remaining > 0:
-            duration = min(tick, remaining)
-            time.sleep(duration)
-            remaining -= duration
-            heartbeat(conn, worker_id, task["id"], LEASE_SECONDS)
-            cancelled = conn.execute("SELECT status FROM workflow_runs WHERE id=%s", (task["run_id"],)).fetchone()
-            if cancelled and cancelled["status"] == "cancelled":
-                with conn.transaction():
-                    conn.execute("UPDATE tasks SET status='cancelled',lease_owner=NULL,lease_until=NULL WHERE id=%s",
-                                 (task["id"],))
-                return
-
     if action == "http":
         from app.http_action import execute_http_action
         from app.settings import LEASE_SECONDS, secret_encryption_key
@@ -1175,7 +1147,11 @@ def execute_step(conn: Connection, worker_id: str, task: dict[str, Any], request
                                      credential["allowed_host"], task.get("trigger_payload"))
         heartbeat(conn, worker_id, task["id"], LEASE_SECONDS)
     else:
-        result = {"action": action, **payload}
+        from app.sandbox import execute_sandbox_action
+
+        result = execute_sandbox_action(conn, worker_id, task, step)
+        if result is None:
+            return
     with conn.transaction():
         locked = conn.execute(
             """SELECT t.tenant_id,t.run_id,t.step_index,w.definition,w.status
