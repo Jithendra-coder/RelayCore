@@ -18,7 +18,7 @@ The same queue-ready `SELECT ... ORDER BY available_at, created_at LIMIT 1` ran 
 
 ## Correctness and failure checks
 
-The acceptance suite completed with **42 passed** on PostgreSQL 18 / UTF-8 on 2026-10-05; app source coverage was **79%**. The current phase also ran Ruff and pre-commit successfully. It covers:
+The acceptance suite completed with **48 passed** on PostgreSQL 18 / UTF-8 on 2026-10-05; app source coverage was **80%**. The current phase also ran Ruff and pre-commit successfully. It covers:
 
 - API key authentication, role denial, request IDs, and cross-tenant `404` isolation.
 - Idempotent workflow creation, payload conflict, persisted history, step transitions, and fail-once retry.
@@ -32,6 +32,8 @@ The acceptance suite completed with **42 passed** on PostgreSQL 18 / UTF-8 on 20
 - PostgreSQL is stopped immediately and restarted while a real worker holds a lease; the API becomes healthy again, the expired lease is recovered, and the workflow completes. See [`database-restart.json`](database-restart.json).
 - A bounded-failure demo reaches DLQ; admin replay releases the deterministic demo hold, completes the workflow, and retains the audit history.
 - HTTP action validation rejects non-allowlisted/private destinations and host/credential mismatches before connecting; a no-network transport checks address pinning, verified TLS context setup, response caps/redaction, status retry classification, and the production workflow path.
+- A signed production webhook starts one HTTP-only run, duplicate delivery does not enqueue another, the run retains only safe source-event metadata, the worker receives the event for body mapping, and publishing version 2 does not alter an already queued version 1 run.
+- A production worker rejects an old queued simulated action and dead-letters it without writing an effect.
 
 The suite emits one dependency deprecation warning from Starlette's current `TestClient` adapter for HTTPX. It does not affect the results. The Compose manifest parses, but the stack itself was not launched because Docker Desktop's daemon was unavailable during this build.
 

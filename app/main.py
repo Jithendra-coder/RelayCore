@@ -26,7 +26,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.auth import Identity, Principal, SESSION_COOKIE, authenticated_identity, authorize, principal, verified_oidc_profile
-from app.http_action import validate_http_target
+from app.http_action import has_event_references, validate_http_target
 from app.coordinator import run as run_coordinator
 from app.models import (
     DemoFailureRequest,
@@ -416,10 +416,10 @@ def validate_workflow_actions(conn, workspace_id: str, steps: list[dict[str, Any
         if "http" in actions:
             raise HTTPException(422, "Outbound HTTP actions are disabled in Demo Mode.")
         return
-    if trigger:
-        raise HTTPException(501, "Production webhook-triggered workflow dispatch is not implemented yet.")
     if actions != {"http"}:
         raise HTTPException(422, "Production workflows currently support only allowlisted HTTP actions.")
+    if not trigger and any(has_event_references(step["payload"].get("body")) for step in steps):
+        raise HTTPException(422, "HTTP body event references require a webhook trigger.")
     for step in steps:
         host, _, _ = validate_http_target(step["payload"]["url"])
         if not active_workspace_credential(conn, workspace_id, step["payload"]["credential_id"], "http", host):
@@ -643,7 +643,8 @@ async def receive_webhook(
         with pool.connection() as conn, conn.transaction():
             result = persist_webhook_event(conn, endpoint["workspace_id"], endpoint_id,
                                            endpoint["version"], event_key, request_id(request), raw_body, payload,
-                                           allow_workflow_triggers=DEMO_MODE)
+                                           allow_workflow_triggers=DEMO_MODE,
+                                           allow_http_workflow_triggers=not DEMO_MODE)
     except IdempotencyConflict as exc:
         raise HTTPException(409, "This event ID was already used with a different payload.") from exc
     except WebhookSecretRotated as exc:
@@ -676,6 +677,8 @@ def create(
     pool: ConnectionPool = Depends(pool_for),
 ) -> dict[str, Any]:
     authorize(user, "admin", "operator")
+    if not DEMO_MODE:
+        raise HTTPException(422, "Production workflows must be created as versioned definitions.")
     try:
         key = valid_idempotency_key(idempotency_key)
         with pool.connection() as conn:
@@ -778,6 +781,8 @@ def run_workflow_definition(
             if definition:
                 latest = max(definition["versions"], key=lambda version: version["version_number"])
                 snapshot = latest["definition"]
+                if any(has_event_references(step["payload"].get("body")) for step in snapshot["steps"]):
+                    raise HTTPException(422, "This workflow requires a webhook event and cannot be started manually.")
                 validate_workflow_actions(conn, user.tenant_id, snapshot["steps"], snapshot.get("trigger"))
             result = trigger_workflow_definition(conn, user.tenant_id, workflow_id, key, request_id(request))
     except WorkflowDisabled as exc:

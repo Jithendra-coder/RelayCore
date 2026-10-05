@@ -17,6 +17,7 @@ _HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _FORBIDDEN_HEADERS = {"authorization", "connection", "content-length", "cookie", "host", "idempotency-key",
                       "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"}
+_EVENT_REFERENCE = "$event"
 _SENSITIVE_KEYS = {"access_token", "accesstoken", "api_key", "apikey", "authorization", "client_secret",
                    "clientsecret", "password", "private_key", "refresh_token", "refreshtoken", "secret",
                    "secret_key", "token"}
@@ -129,10 +130,58 @@ def validate_http_step(payload: dict) -> None:
             json.dumps(payload["body"], ensure_ascii=False, allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise ValueError("HTTP action body must be valid JSON.") from exc
+        _validate_event_references(payload["body"])
     timeout = payload.get("timeout_seconds", MAX_TIMEOUT_SECONDS)
     if (not isinstance(timeout, (int, float)) or isinstance(timeout, bool)
             or not 0.1 <= timeout <= MAX_TIMEOUT_SECONDS):
         raise ValueError(f"HTTP action timeout_seconds must be between 0.1 and {MAX_TIMEOUT_SECONDS}.")
+
+
+def _validate_event_references(value) -> None:
+    if isinstance(value, dict):
+        if _EVENT_REFERENCE in value:
+            pointer = value[_EVENT_REFERENCE]
+            if (set(value) != {_EVENT_REFERENCE} or not isinstance(pointer, str) or not pointer.startswith("/")
+                    or len(pointer) > 512 or re.search(r"~(?![01])", pointer)):
+                raise ValueError("HTTP body event references must be {$event: '/json/pointer'} objects.")
+            return
+        for item in value.values():
+            _validate_event_references(item)
+    elif isinstance(value, list):
+        for item in value:
+            _validate_event_references(item)
+
+
+def has_event_references(value) -> bool:
+    if isinstance(value, dict):
+        return _EVENT_REFERENCE in value or any(has_event_references(item) for item in value.values())
+    if isinstance(value, list):
+        return any(has_event_references(item) for item in value)
+    return False
+
+
+def _resolve_event_references(value, event_payload):
+    if isinstance(value, dict):
+        if _EVENT_REFERENCE in value:
+            if not isinstance(event_payload, dict):
+                raise PermanentActionError("HTTP action requires a webhook event payload.")
+            current = event_payload
+            for part in value[_EVENT_REFERENCE][1:].split("/"):
+                part = part.replace("~1", "/").replace("~0", "~")
+                if isinstance(current, dict) and part in current:
+                    current = current[part]
+                elif isinstance(current, list) and part.isdigit() and (part == "0" or not part.startswith("0")):
+                    index = int(part)
+                    if index >= len(current):
+                        raise PermanentActionError("HTTP action event reference was not present.")
+                    current = current[index]
+                else:
+                    raise PermanentActionError("HTTP action event reference was not present.")
+            return current
+        return {key: _resolve_event_references(item, event_payload) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_resolve_event_references(item, event_payload) for item in value]
+    return value
 
 
 def _resolve_public_addresses(host: str, port: int) -> list[str]:
@@ -165,7 +214,7 @@ def _redact_json(value, credential: str):
 
 
 def execute_http_action(payload: dict, credential: str, idempotency_key: str,
-                        credential_host: str | None) -> dict:
+                        credential_host: str | None, event_payload: dict | None = None) -> dict:
     validate_http_step(payload)
     if not credential or any(ord(c) < 32 or ord(c) == 127 for c in credential):
         raise PermanentActionError("HTTP action credential is invalid.")
@@ -178,7 +227,10 @@ def execute_http_action(payload: dict, credential: str, idempotency_key: str,
     headers = {"Accept": "application/json", "Authorization": f"Bearer {credential}",
                "Idempotency-Key": idempotency_key, "User-Agent": "RelayCore/0.1"}
     if "body" in payload:
-        body = json.dumps(payload["body"], ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
+        resolved_body = _resolve_event_references(payload["body"], event_payload)
+        body = json.dumps(resolved_body, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
+        if len(body) > 4096:
+            raise PermanentActionError("Rendered HTTP action body exceeded the 4 KiB limit.")
         headers["Content-Type"] = "application/json"
     headers.update(payload.get("headers", {}))
     connection = _PinnedHTTPSConnection(host, port, addresses[0], timeout)

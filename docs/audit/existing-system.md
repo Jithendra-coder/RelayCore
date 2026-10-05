@@ -1,6 +1,6 @@
 # Existing system audit
 
-Audit snapshot: 2026-10-05, repository commit `f11e5da` plus the in-progress constrained HTTP action. Scope: application source, migrations, tests, CI, local deployment files, and repository documentation. No live identity provider, third-party API, cloud environment, or Docker daemon was available for inspection.
+Audit snapshot: 2026-10-05, repository commit `58fe95a`, before the production webhook-trigger slice. Scope: application source, migrations, tests, CI, local deployment files, and repository documentation. No live identity provider, third-party API, cloud environment, or Docker daemon was available for inspection.
 
 ## A. What exists
 

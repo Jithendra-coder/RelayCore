@@ -294,6 +294,7 @@ def test_workspace_credentials_are_encrypted_scoped_rotatable_and_revocable(clie
 def test_production_workflow_runs_only_allowlisted_http_steps(client, monkeypatch):
     import app.http_action as http_action
     import app.main as main
+    import app.store as store
 
     monkeypatch.setenv("RELAYCORE_HTTP_ALLOWED_HOSTS", "hooks.example.com,other.example.com")
     owner_email = "production-http-owner@example.test"
@@ -317,6 +318,7 @@ def test_production_workflow_runs_only_allowlisted_http_steps(client, monkeypatc
     assert stored.status_code == 201, stored.text
 
     monkeypatch.setattr(main, "DEMO_MODE", False)
+    monkeypatch.setattr(store, "DEMO_MODE", False)
     steps = [{"name": "notify build service", "action": "http", "payload": {
         "method": "POST", "url": "https://hooks.example.com/v1/events",
         "credential_id": stored.json()["id"], "body": {"event": "build.completed"},
@@ -325,6 +327,10 @@ def test_production_workflow_runs_only_allowlisted_http_steps(client, monkeypatc
                             "Idempotency-Key": "http:workflow:create"},
                              json={"title": "Notify build service", "steps": steps})
     assert definition.status_code == 201, definition.text
+    unversioned = client.post("/api/workflows", headers={**scoped_headers,
+                                "Idempotency-Key": "http:workflow:unversioned"},
+                              json={"title": "Skip versioning", "steps": steps})
+    assert unversioned.status_code == 422
     wrong_host = client.post("/api/workflow-definitions", headers={**scoped_headers,
                              "Idempotency-Key": "http:workflow:wrong-host"}, json={
         "title": "Credential host mismatch", "steps": [{"name": "exfiltrate", "action": "http", "payload": {
@@ -336,8 +342,8 @@ def test_production_workflow_runs_only_allowlisted_http_steps(client, monkeypatc
 
     calls = []
 
-    def send(payload, credential, idempotency_key, allowed_host):
-        calls.append((payload, credential, idempotency_key, allowed_host))
+    def send(payload, credential, idempotency_key, allowed_host, event_payload=None):
+        calls.append((payload, credential, idempotency_key, allowed_host, event_payload))
         return {"status_code": 202, "response_bytes": 0, "content_type": "application/json"}
 
     monkeypatch.setattr(http_action, "execute_http_action", send)
@@ -348,7 +354,7 @@ def test_production_workflow_runs_only_allowlisted_http_steps(client, monkeypatc
     completed = get_run(client, run.json()["id"], workspace_id)
     assert completed["status"] == "completed"
     assert completed["side_effects"][0]["result"]["status_code"] == 202
-    assert calls == [(steps[0]["payload"], stored_secret, f"{run.json()['id']}:0", "hooks.example.com")]
+    assert calls == [(steps[0]["payload"], stored_secret, f"{run.json()['id']}:0", "hooks.example.com", None)]
     repeated = client.post(f"/api/workflow-definitions/{definition.json()['id']}/runs", headers=run_headers)
     assert repeated.status_code == 202 and repeated.json()["created"] is False
 
@@ -357,19 +363,71 @@ def test_production_workflow_runs_only_allowlisted_http_steps(client, monkeypatc
         "title": "Sandbox action", "steps": [{"name": "fake", "action": "record", "payload": {}}],
     })
     assert sandbox_actions.status_code == 422
-    webhook_trigger = client.post("/api/workflow-definitions", headers={**scoped_headers,
-                                "Idempotency-Key": "http:trigger"}, json={
-        "title": "Not enabled", "steps": steps,
-        "trigger": {"endpoint_id": str(uuid.uuid4()), "event_type": "push"},
+    webhook_path = f"/api/workspaces/{workspace_id}/webhooks"
+    webhook = client.post(webhook_path, headers={**scoped_headers, "Idempotency-Key": "http:webhook"},
+                          json={"name": "Build events"})
+    assert webhook.status_code == 201, webhook.text
+    trigger = {"endpoint_id": webhook.json()["id"], "event_type": "push"}
+    mapped_steps = [{"name": "notify build service", "action": "http", "payload": {
+        "method": "POST", "url": "https://hooks.example.com/v1/events",
+        "credential_id": stored.json()["id"], "body": {
+            "event": {"$event": "/type"},
+            "repository": {"$event": "/repository/full_name"},
+            "sender": {"$event": "/sender/login"},
+        },
+    }}]
+    triggered_definition = client.post("/api/workflow-definitions", headers={**scoped_headers,
+                                      "Idempotency-Key": "http:workflow:webhook"}, json={
+        "title": "Notify for pushes", "steps": mapped_steps, "trigger": trigger,
     })
-    assert webhook_trigger.status_code == 501
+    assert triggered_definition.status_code == 201, triggered_definition.text
+    assert triggered_definition.json()["version"] == 1
+    assert client.post(f"/api/workflow-definitions/{triggered_definition.json()['id']}/runs",
+                       headers={**scoped_headers, "Idempotency-Key": "http:workflow:webhook:manual"}).status_code == 422
+
+    event_payload = {"type": "push", "repository": {"full_name": "example/service"},
+                     "sender": {"login": "octocat"}}
+    raw_event = json.dumps(event_payload, separators=(",", ":")).encode()
+    event_key, timestamp = "build-event-1", str(int(time.time()))
+    signed = timestamp.encode() + b"\n" + event_key.encode() + b"\n" + raw_event
+    signature = hmac.new(webhook.json()["secret"].encode(), signed, hashlib.sha256).hexdigest()
+    event_headers = {"Content-Type": "application/json", "X-RelayCore-Event-ID": event_key,
+                     "X-RelayCore-Timestamp": timestamp,
+                     "X-RelayCore-Signature": f"sha256={signature}"}
+    endpoint_url = f"/hooks/{webhook.json()['id']}"
+    accepted = client.post(endpoint_url, content=raw_event, headers=event_headers)
+    assert accepted.status_code == 202, accepted.text
+    triggered_run = accepted.json()["triggered_runs"][0]
+    assert triggered_run["workflow_version_id"] == triggered_definition.json()["version_id"]
+    duplicate = client.post(endpoint_url, content=raw_event, headers=event_headers)
+    assert duplicate.status_code == 202 and duplicate.json()["duplicate"]
+    assert duplicate.json()["triggered_runs"] == []
+
+    next_steps = [{"name": "notify after v2", "action": "http", "payload": {
+        **mapped_steps[0]["payload"], "body": {"event": "v2"},
+    }}]
+    published = client.post(
+        f"/api/workflow-definitions/{triggered_definition.json()['id']}/versions",
+        headers={**scoped_headers, "Idempotency-Key": "http:workflow:webhook:v2"},
+        json={"title": "Notify for pushes v2", "steps": next_steps, "trigger": trigger},
+    )
+    assert published.status_code == 201 and published.json()["version"] == 2
+    drive_run(client, workspace_id, worker_id="production-http-trigger-worker")
+    triggered_result = get_run(client, triggered_run["run_id"], workspace_id)
+    assert triggered_result["status"] == "completed"
+    assert triggered_result["workflow_version_id"] == triggered_definition.json()["version_id"]
+    assert triggered_result["trigger_event"]["type"] == "push"
+    assert "payload" not in triggered_result["trigger_event"]
+    assert calls[-1][4] == event_payload
+    response_text = client.get(f"/api/workflows/{triggered_run['run_id']}", headers=scoped_headers).text
+    assert "example/service" not in response_text and "octocat" not in response_text
 
     cancelled_run = client.post(f"/api/workflow-definitions/{definition.json()['id']}/runs",
                                 headers={**scoped_headers, "Idempotency-Key": "http:workflow:cancel"})
     assert cancelled_run.status_code == 202, cancelled_run.text
     started, release = threading.Event(), threading.Event()
 
-    def slow_send(_payload, _credential, _idempotency_key, _allowed_host):
+    def slow_send(_payload, _credential, _idempotency_key, _allowed_host, _event_payload=None):
         started.set()
         assert release.wait(5)
         return {"status_code": 202, "response_bytes": 0, "content_type": "application/json"}
@@ -424,6 +482,28 @@ def test_permanent_provider_action_errors_dead_letter_without_retry(client):
         letters = conn.execute("SELECT attempts FROM dead_letters WHERE task_id=%s", (task["id"],)).fetchall()
     assert row == {"status": "dead", "attempts": 1, "max_attempts": 3}
     assert letters == [{"attempts": 1}]
+
+
+def test_production_worker_dead_letters_sandbox_actions_without_effect(client, monkeypatch):
+    import app.store as store
+    from app.http_action import PermanentActionError
+
+    tenant = random_tenant()
+    monkeypatch.setattr(store, "DEMO_MODE", False)
+    with client.app.state.pool.connection() as conn, conn.transaction():
+        run = create_workflow(conn, tenant, "Old sandbox run",
+                              [{"name": "fake payment", "action": "charge", "payload": {"amount": 25}}],
+                              f"old-sandbox:{uuid.uuid4()}", "mode-guard-test")
+    with client.app.state.pool.connection() as conn:
+        task = claim_task(conn, "mode-guard-worker", 1.2, tenant_id=tenant)
+        assert task and task["run_id"] == run["id"]
+        with pytest.raises(PermanentActionError, match="execution mode"):
+            store.execute_step(conn, "mode-guard-worker", task, task["request_id"])
+        store.fail_task(conn, task, "mode-guard-worker", PermanentActionError("mode guard"), task["request_id"])
+        assert conn.execute("SELECT count(*) AS n FROM side_effects WHERE run_id=%s",
+                            (run["id"],)).fetchone()["n"] == 0
+        state = conn.execute("SELECT status,attempts FROM tasks WHERE id=%s", (task["id"],)).fetchone()
+        assert state == {"status": "dead", "attempts": 1}
 
 
 def test_workspace_webhooks_verify_signatures_and_dedupe_replays(client, monkeypatch):
@@ -771,19 +851,24 @@ def test_concurrent_duplicate_delivery_creates_one_logical_event(client):
     tenant, key = random_tenant(), f"race-{uuid.uuid4()}"
     payload = {"order": "racing-order", "amount": 12, "currency": "USD"}
     barrier = threading.Barrier(2)
-    results = []
+    results, errors = [], []
 
     def deliver():
-        with connect(DATABASE_URL, row_factory=dict_row, autocommit=True) as conn:
-            barrier.wait()
-            with conn.transaction():
-                results.append(ingest_business_event(conn, tenant, key, payload, "race-test"))
+        try:
+            with connect(DATABASE_URL, row_factory=dict_row, autocommit=True) as conn:
+                barrier.wait(timeout=10)
+                with conn.transaction():
+                    results.append(ingest_business_event(conn, tenant, key, payload, "race-test"))
+        except Exception as exc:
+            errors.append(exc)
 
     threads = [threading.Thread(target=deliver) for _ in range(2)]
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=5)
+        thread.join(timeout=10)
+    assert not any(thread.is_alive() for thread in threads), "duplicate deliveries did not finish within 10 seconds"
+    assert not errors, errors
     assert len(results) == 2
     assert sum(result["created"] for result in results) == 1
     assert len({result["workflow_id"] for result in results}) == 1
@@ -942,9 +1027,13 @@ def test_versioned_migrations_bootstrap_and_skip_applied_files():
             assert conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall() == [
                 {"version": "001"}, {"version": "002"}, {"version": "003"},
                 {"version": "004"}, {"version": "005"}, {"version": "006"}, {"version": "007"},
-                {"version": "008"}
+                {"version": "008"}, {"version": "009"}
             ]
             assert conn.execute("SELECT count(*) AS n FROM tasks").fetchone()["n"] == 0
+            assert conn.execute(
+                """SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema()
+                   AND table_name='workflow_runs' AND column_name='trigger_event_id'"""
+            ).fetchone()
             tables = conn.execute(
                 """SELECT table_name FROM information_schema.tables
                    WHERE table_schema=current_schema() AND table_name=ANY(%s) ORDER BY table_name""",
@@ -998,7 +1087,7 @@ def test_workflow_version_migration_upgrades_an_existing_001_database():
             ).fetchall() == [
                 {"version": "001"}, {"version": "002"}, {"version": "003"},
                 {"version": "004"}, {"version": "005"}, {"version": "006"}, {"version": "007"},
-                {"version": "008"}
+                {"version": "008"}, {"version": "009"}
             ]
             columns = conn.execute(
                 """SELECT column_name FROM information_schema.columns
@@ -1006,6 +1095,11 @@ def test_workflow_version_migration_upgrades_an_existing_001_database():
                 (schema,),
             ).fetchall()
             assert columns == [{"column_name": "workflow_version_id"}]
+            assert conn.execute(
+                """SELECT 1 FROM information_schema.columns WHERE table_schema=%s
+                   AND table_name='workflow_runs' AND column_name='trigger_event_id'""",
+                (schema,),
+            ).fetchone()
             assert conn.execute(
                 """SELECT 1 FROM information_schema.tables
                    WHERE table_schema=%s AND table_name='workspace_members'""", (schema,)

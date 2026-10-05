@@ -17,6 +17,7 @@ Invariants:
 9. A transaction-scoped PostgreSQL advisory lock serializes workflow idempotency lookup and queue admission per tenant, preventing concurrent submissions from exceeding the configured bound or racing on the same key.
 10. Tenant event writes acquire a transaction-scoped ordering lock before allocating identity values, so a subscriber cursor cannot advance past an event that commits later with a lower ID.
 11. Published workflow versions are immutable rows. Each definition points to its current version; a run stores that version ID, hash, and a full definition snapshot so publishing a later version cannot change work already queued or running.
+12. Production webhook intake stores the accepted event, matches the active exact endpoint/type trigger, and admits its HTTP-only run in one transaction. The run references the event row; a worker loads payload only when the event workspace matches the run tenant. A duplicate endpoint/event key cannot create a second run.
 
 ## Delivery semantics and transaction boundaries
 
@@ -47,7 +48,7 @@ The browser talks only to the API. Production browser sessions are opaque and st
 
 FastAPI provides typed HTTP/OpenAPI validation. Authlib provides OIDC protocol handling; Cryptography/Fernet protects webhook signing keys and workspace credentials at rest. Psycopg provides PostgreSQL transactions and row locks. Uvicorn serves the API. PostgreSQL provides both durable state and work claiming, which is simpler than operating a second broker for this measured workload. Redis, Kafka, Celery, Kubernetes, cloud infrastructure, and third-party telemetry exporters are intentionally omitted until load or deployment evidence justifies their operating cost. Python 3.13 is used in the checked runtime and container because Python 3.12 was not installed in the build environment.
 
-Numbered SQL files in `app/migrations/` are applied once, in filename order, under a PostgreSQL transaction lock. Files 001–003 establish and enforce immutable workflow versions; 004 adds OIDC identities, workspaces, memberships and revocable sessions; 005 removes a session constraint that incorrectly prevented natural expiry; 006 adds encrypted webhook secrets and durable inbox rows; 007 adds encrypted workspace credential records and versioned secret values; 008 binds generic HTTP credentials to one exact host. Applied migration files must be treated as immutable.
+Numbered SQL files in `app/migrations/` are applied once, in filename order, under a PostgreSQL transaction lock. Files 001–003 establish and enforce immutable workflow versions; 004 adds OIDC identities, workspaces, memberships and revocable sessions; 005 removes a session constraint that incorrectly prevented natural expiry; 006 adds encrypted webhook secrets and durable inbox rows; 007 adds encrypted workspace credential records and versioned secret values; 008 binds generic HTTP credentials to one exact host; 009 associates triggered runs with their source webhook event. Applied migration files must be treated as immutable.
 
 ## Phase gates
 
@@ -67,5 +68,6 @@ Numbered SQL files in `app/migrations/` are applied once, in filename order, und
 | P11 | OIDC sessions, workspace RBAC, cross-workspace denial, fresh/upgrade migration checks |
 | P12 | Signed bounded webhook ingestion, secret rotation, duplicate protection, secret-free event metadata |
 | P13 | Constrained production HTTP action, per-credential host binding, outbound request/response bounds, status-aware retry and no-network security tests |
+| P14 | Production exact-match webhook triggers for HTTP-only versions, safe request-body event references, duplicate delivery, source-event retention, and version pinning |
 
 Cloud deployment and managed-service security are separate operational work: no cloud account, deployment credentials, or running Docker daemon were present during this build. Local Compose files exist, but the runtime was not exercised in the latest identity/webhook verification.

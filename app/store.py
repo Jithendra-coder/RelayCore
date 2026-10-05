@@ -15,7 +15,7 @@ from psycopg.types.json import Jsonb
 
 from app.secretbox import decrypt_secret, encrypt_secret
 from app.http_action import PermanentActionError
-from app.settings import MAX_ATTEMPTS, MAX_QUEUE_DEPTH, RATE_LIMIT_PER_MINUTE
+from app.settings import DEMO_MODE, MAX_ATTEMPTS, MAX_QUEUE_DEPTH, RATE_LIMIT_PER_MINUTE
 
 
 class QueueFull(Exception):
@@ -522,6 +522,7 @@ def webhook_signing_info(conn: Connection, endpoint_id: str) -> dict[str, Any] |
 def persist_webhook_event(
     conn: Connection, workspace_id: str, endpoint_id: str, secret_version: int, event_key: str,
     request_id: str, body: bytes, payload: dict[str, Any], *, allow_workflow_triggers: bool = False,
+    allow_http_workflow_triggers: bool = False,
 ) -> dict[str, Any]:
     endpoint = conn.execute(
         """SELECT id FROM webhook_endpoints WHERE id=%s AND workspace_id=%s
@@ -558,7 +559,7 @@ def persist_webhook_event(
                      "event_key": event_key, "payload_sha256": payload_hash})
     triggered_runs = []
     event_type = payload.get("type")
-    if allow_workflow_triggers and isinstance(event_type, str):
+    if (allow_workflow_triggers or allow_http_workflow_triggers) and isinstance(event_type, str):
         matches = conn.execute(
             """SELECT d.id AS workflow_id,v.id AS version_id,v.version_number,
                       v.definition,v.definition_hash
@@ -572,7 +573,11 @@ def persist_webhook_event(
             (workspace_id, endpoint_id, event_type),
         ).fetchall()
         for match in matches:
-            if any(step["action"] == "http" for step in match["definition"]["steps"]):
+            actions = {step["action"] for step in match["definition"]["steps"]}
+            if actions == {"http"}:
+                if not allow_http_workflow_triggers:
+                    continue
+            elif not allow_workflow_triggers or "http" in actions:
                 continue
             seed = f"{endpoint_id}:{event_key}:{match['version_id']}".encode()
             run_key = "webhook-trigger:" + hashlib.sha256(seed).hexdigest()
@@ -580,6 +585,7 @@ def persist_webhook_event(
             run = create_workflow(
                 conn, workspace_id, definition["title"], definition["steps"], run_key, request_id,
                 workflow_version_id=match["version_id"], definition_hash=match["definition_hash"],
+                trigger_event_id=event_id,
             )
             triggered_runs.append({"workflow_id": match["workflow_id"], "run_id": run["id"],
                                    "workflow_version_id": match["version_id"],
@@ -839,10 +845,13 @@ def create_workflow(
     *,
     workflow_version_id: str | None = None,
     definition_hash: str | None = None,
+    trigger_event_id: str | None = None,
 ) -> dict[str, Any]:
     fingerprint_payload = {"title": title, "steps": steps}
     if workflow_version_id is not None:
         fingerprint_payload["workflow_version_id"] = workflow_version_id
+    if trigger_event_id is not None:
+        fingerprint_payload["trigger_event_id"] = trigger_event_id
     fingerprint = hashlib.sha256(
         json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -871,10 +880,11 @@ def create_workflow(
     definition = {"title": title, "steps": steps}
     conn.execute(
         """INSERT INTO workflow_runs
-           (id,tenant_id,title,definition,status,idempotency_key,fingerprint,workflow_version_id,definition_hash)
-           VALUES (%s,%s,%s,%s,'queued',%s,%s,%s,%s)""",
+           (id,tenant_id,title,definition,status,idempotency_key,fingerprint,workflow_version_id,definition_hash,
+            trigger_event_id)
+           VALUES (%s,%s,%s,%s,'queued',%s,%s,%s,%s,%s)""",
         (run_id, tenant_id, title, Jsonb(definition), idempotency_key, fingerprint,
-         workflow_version_id, definition_hash or _definition_fingerprint(title, steps)),
+         workflow_version_id, definition_hash or _definition_fingerprint(title, steps), trigger_event_id),
     )
     conn.execute(
         "INSERT INTO tasks(id,tenant_id,run_id,max_attempts,request_id) VALUES (%s,%s,%s,%s,%s)",
@@ -939,8 +949,9 @@ def claim_task(conn: Connection, worker_id: str, lease_seconds: float,
     with conn.transaction():
         tenant_filter = "AND t.tenant_id=%s" if tenant_id else ""
         selection = """SELECT t.id,t.tenant_id,t.run_id,t.step_index,t.attempts,t.max_attempts,
-                          t.last_worker,t.request_id,w.title,w.definition
+                          t.last_worker,t.request_id,w.title,w.definition,i.payload AS trigger_payload
                    FROM tasks t JOIN workflow_runs w ON w.id=t.run_id
+                   LEFT JOIN incoming_events i ON i.id=w.trigger_event_id AND i.workspace_id=w.tenant_id
                    WHERE t.status IN ('queued','retry_wait') AND t.available_at<=clock_timestamp()
                      AND t.last_worker IS DISTINCT FROM %s
                      AND w.status NOT IN ('cancelled','completed','failed')
@@ -1106,6 +1117,8 @@ def execute_step(conn: Connection, worker_id: str, task: dict[str, Any], request
 
     step = steps[index]
     action, payload = step["action"], step["payload"]
+    if (DEMO_MODE and action == "http") or (not DEMO_MODE and action != "http"):
+        raise PermanentActionError("Workflow action is not allowed in the current execution mode.")
     if action == "fail_once" and task["attempts"] == 1:
         raise RuntimeError("Deterministic Demo Mode failure on the first attempt.")
     if action == "fail_until_replay":
@@ -1134,7 +1147,7 @@ def execute_step(conn: Connection, worker_id: str, task: dict[str, Any], request
                 return
 
     if action == "http":
-        from app.http_action import execute_http_action, PermanentActionError
+        from app.http_action import execute_http_action
         from app.settings import LEASE_SECONDS, secret_encryption_key
 
         active = conn.execute(
@@ -1159,7 +1172,7 @@ def execute_step(conn: Connection, worker_id: str, task: dict[str, Any], request
         if not credential or credential["provider"] != "http":
             raise PermanentActionError("HTTP action credential is unavailable or has the wrong provider.")
         result = execute_http_action(payload, credential["secret"], f"{task['run_id']}:{index}",
-                                     credential["allowed_host"])
+                                     credential["allowed_host"], task.get("trigger_payload"))
         heartbeat(conn, worker_id, task["id"], LEASE_SECONDS)
     else:
         result = {"action": action, **payload}
@@ -1225,15 +1238,32 @@ def execute_step(conn: Connection, worker_id: str, task: dict[str, Any], request
 def run_summary(conn: Connection, tenant_id: str, run_id: str) -> dict[str, Any] | None:
     run = conn.execute(
         """SELECT w.id,w.title,w.status,w.definition,w.workflow_version_id,w.definition_hash,
+                  w.trigger_event_id,i.event_key AS trigger_event_key,
+                  i.payload_sha256 AS trigger_event_payload_sha256,
+                  i.payload->>'type' AS trigger_event_type,
+                  i.received_at AS trigger_event_received_at,
                   w.created_at,w.finished_at,
                   t.id AS task_id,t.status AS task_status,t.step_index,t.attempts,t.max_attempts,
                   t.lease_owner,t.lease_until,t.last_error
            FROM workflow_runs w JOIN tasks t ON t.run_id=w.id
+           LEFT JOIN incoming_events i ON i.id=w.trigger_event_id AND i.workspace_id=w.tenant_id
            WHERE w.tenant_id=%s AND w.id=%s""",
         (tenant_id, run_id),
     ).fetchone()
     if not run:
         return None
+    if run["trigger_event_id"]:
+        run["trigger_event"] = {
+            "id": run.pop("trigger_event_id"),
+            "event_key": run.pop("trigger_event_key"),
+            "payload_sha256": run.pop("trigger_event_payload_sha256"),
+            "type": run.pop("trigger_event_type"),
+            "received_at": run.pop("trigger_event_received_at"),
+        }
+    else:
+        for key in ("trigger_event_id", "trigger_event_key", "trigger_event_payload_sha256",
+                    "trigger_event_type", "trigger_event_received_at"):
+            run.pop(key)
     run["events"] = conn.execute(
         "SELECT sequence,kind,worker_id,request_id,data,created_at FROM events WHERE tenant_id=%s AND run_id=%s ORDER BY sequence",
         (tenant_id, run_id),

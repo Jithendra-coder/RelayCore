@@ -134,6 +134,45 @@ def test_http_action_pins_public_dns_and_redacts_response_secrets(monkeypatch):
     assert connection.closed
 
 
+def test_http_action_resolves_limited_event_references_in_json_body(monkeypatch):
+    connections = fake_transport(monkeypatch)
+    request = payload(body={
+        "event": {"$event": "/type"},
+        "repository": {"name": {"$event": "/repository/full_name"}},
+        "label": {"$event": "/labels/0/name"},
+        "escaped/key": {"$event": "/metadata/a~1b"},
+    })
+    event = {"type": "push", "repository": {"full_name": "example/service"},
+             "labels": [{"name": "critical"}], "metadata": {"a/b": "ok"}}
+    http_action.execute_http_action(request, "workspace-token-123456", "run:0", "hooks.example.com", event)
+    assert connections[0].args[2] == (
+        b'{"event":"push","repository":{"name":"example/service"},"label":"critical",'
+        b'"escaped/key":"ok"}'
+    )
+
+
+@pytest.mark.parametrize("reference", [
+    {"$event": "type"}, {"$event": "/type~2name"}, {"$event": "/type", "fixed": True},
+])
+def test_http_action_rejects_invalid_event_references(monkeypatch, reference):
+    monkeypatch.setenv("RELAYCORE_HTTP_ALLOWED_HOSTS", "hooks.example.com")
+    with pytest.raises(ValueError, match="event references"):
+        http_action.validate_http_step(payload(body={"value": reference}))
+
+
+def test_http_action_dead_letters_missing_or_oversized_event_mappings(monkeypatch):
+    connections = fake_transport(monkeypatch)
+    with pytest.raises(http_action.PermanentActionError, match="not present"):
+        http_action.execute_http_action(payload(body={"value": {"$event": "/missing"}}),
+                                       "workspace-token-123456", "run:0", "hooks.example.com", {})
+    assert connections == []
+    with pytest.raises(http_action.PermanentActionError, match="4 KiB"):
+        http_action.execute_http_action(payload(body={"value": {"$event": "/large"}}),
+                                       "workspace-token-123456", "run:0", "hooks.example.com",
+                                       {"large": "x" * 4096})
+    assert connections == []
+
+
 @pytest.mark.parametrize(("status", "error"), [
     (302, http_action.PermanentActionError),
     (401, http_action.PermanentActionError),
