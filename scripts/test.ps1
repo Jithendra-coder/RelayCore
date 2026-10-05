@@ -7,6 +7,11 @@ if (-not (Test-Path -LiteralPath '.venv\Scripts\python.exe')) {
 }
 & .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
+$env:PATH = (Join-Path $projectRoot '.venv\Scripts') + [IO.Path]::PathSeparator + $env:PATH
+& .\.venv\Scripts\python.exe -m ruff check app tests benchmarks scripts
+if ($LASTEXITCODE -ne 0) { throw 'Ruff checks failed.' }
+& .\.venv\Scripts\python.exe -m pre_commit run --all-files
+if ($LASTEXITCODE -ne 0) { throw 'Pre-commit checks failed.' }
 
 if (-not $env:RELAYCORE_TEST_DATABASE_URL) {
     docker compose up -d db
@@ -20,5 +25,5 @@ $env:RELAYCORE_LEASE_SECONDS = '1.2'
 $testTenant = 'relaycore-test-' + [guid]::NewGuid().ToString('N')
 $otherTenant = 'relaycore-other-' + [guid]::NewGuid().ToString('N')
 $env:RELAYCORE_API_KEYS = "{`"demo-key-change-me-32`":{`"tenant_id`":`"$testTenant`",`"role`":`"admin`"},`"viewer-key-change-me-32`":{`"tenant_id`":`"$testTenant`",`"role`":`"viewer`"},`"other-key-change-me-32`":{`"tenant_id`":`"$otherTenant`",`"role`":`"admin`"}}"
-& .\.venv\Scripts\python.exe -m pytest -q
+& .\.venv\Scripts\python.exe -m pytest --cov=app --cov-report=term-missing -q
 exit $LASTEXITCODE

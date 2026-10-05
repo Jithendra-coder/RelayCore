@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
+import secrets
 import socket
 import time
 import uuid
 from typing import Any
 
 from psycopg import Connection
-from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from app.secretbox import decrypt_secret, encrypt_secret
 from app.settings import MAX_ATTEMPTS, MAX_QUEUE_DEPTH, RATE_LIMIT_PER_MINUTE
 
 
@@ -27,13 +29,212 @@ class IdempotencyConflict(Exception):
     pass
 
 
+class WorkflowDisabled(Exception):
+    pass
+
+
+class LastWorkspaceOwner(Exception):
+    pass
+
+
+class WorkspaceOwnerActionForbidden(Exception):
+    pass
+
+
+class WebhookSecretRotated(Exception):
+    pass
+
+
+class WebhookEndpointNotFound(Exception):
+    pass
+
+
 def migrate(conn: Connection) -> None:
     from pathlib import Path
 
-    for statement in Path(__file__).with_name("schema.sql").read_text(encoding="utf-8").split(";"):
-        if statement.strip():
-            conn.execute(statement)
-    conn.execute("INSERT INTO schema_migrations(version) VALUES ('001') ON CONFLICT DO NOTHING")
+    migration_dir = Path(__file__).with_name("migrations")
+    with conn.transaction():
+        conn.execute("SELECT pg_advisory_xact_lock(hashtextextended('relaycore:migrations', 0))")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS schema_migrations (
+                   version TEXT PRIMARY KEY,
+                   applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+               )"""
+        )
+        for migration in sorted(migration_dir.glob("[0-9]*_*.sql")):
+            version = migration.name.split("_", 1)[0]
+            if not version.isdigit():
+                raise RuntimeError(f"Invalid migration filename: {migration.name}")
+            applied = conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE version=%s", (version,)
+            ).fetchone()
+            if applied:
+                continue
+            with conn.transaction():
+                conn.execute(migration.read_text(encoding="utf-8"), prepare=False)
+                conn.execute("INSERT INTO schema_migrations(version) VALUES (%s)", (version,))
+
+
+def upsert_oidc_user(
+    conn: Connection, issuer: str, subject: str, email: str, display_name: str,
+) -> dict[str, Any]:
+    return conn.execute(
+        """INSERT INTO users(id,issuer,subject,email,display_name)
+           VALUES (%s,%s,%s,%s,%s)
+           ON CONFLICT (issuer,subject) DO UPDATE SET email=EXCLUDED.email,
+             display_name=EXCLUDED.display_name,updated_at=clock_timestamp()
+           RETURNING id,email,display_name,status""",
+        (str(uuid.uuid4()), issuer, subject, email.lower(), display_name[:100]),
+    ).fetchone()
+
+
+def create_auth_session(conn: Connection, user_id: str, request_id: str, ttl_seconds: int) -> str:
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    conn.execute(
+        """INSERT INTO auth_sessions(id,user_id,token_hash,expires_at)
+           VALUES (%s,%s,%s,clock_timestamp()+(%s * interval '1 second'))""",
+        (str(uuid.uuid4()), user_id, token_hash, ttl_seconds),
+    )
+    conn.execute(
+        "INSERT INTO identity_events(user_id,request_id,kind) VALUES (%s,%s,'auth.login')",
+        (user_id, request_id),
+    )
+    return token
+
+
+def auth_session(conn: Connection, token: str) -> dict[str, Any] | None:
+    if not 32 <= len(token) <= 256:
+        return None
+    return conn.execute(
+        """SELECT u.id AS user_id,u.email,u.display_name,s.token_hash
+           FROM auth_sessions s JOIN users u ON u.id=s.user_id
+           WHERE s.token_hash=%s AND s.revoked_at IS NULL AND s.expires_at>clock_timestamp()
+             AND u.status='active'""",
+        (hashlib.sha256(token.encode()).hexdigest(),),
+    ).fetchone()
+
+
+def revoke_auth_session(conn: Connection, token_hash: str, request_id: str) -> bool:
+    session = conn.execute(
+        """UPDATE auth_sessions SET revoked_at=clock_timestamp()
+           WHERE token_hash=%s AND revoked_at IS NULL RETURNING user_id""",
+        (token_hash,),
+    ).fetchone()
+    if session:
+        conn.execute(
+            "INSERT INTO identity_events(user_id,request_id,kind) VALUES (%s,%s,'auth.logout')",
+            (session["user_id"], request_id),
+        )
+        return True
+    return False
+
+
+def list_user_workspaces(conn: Connection, user_id: str) -> list[dict[str, Any]]:
+    return conn.execute(
+        """SELECT w.id,w.name,m.role FROM workspace_members m
+           JOIN workspaces w ON w.id=m.workspace_id
+           WHERE m.user_id=%s ORDER BY w.created_at,w.id""",
+        (user_id,),
+    ).fetchall()
+
+
+def workspace_membership(conn: Connection, workspace_id: str, user_id: str) -> dict[str, Any] | None:
+    return conn.execute(
+        """SELECT w.id AS workspace_id,m.role FROM workspace_members m
+           JOIN workspaces w ON w.id=m.workspace_id
+           WHERE m.workspace_id=%s AND m.user_id=%s""",
+        (workspace_id, user_id),
+    ).fetchone()
+
+
+def create_workspace(conn: Connection, user_id: str, name: str, request_id: str) -> dict[str, Any]:
+    workspace_id = str(uuid.uuid4())
+    conn.execute("INSERT INTO workspaces(id,name,created_by) VALUES (%s,%s,%s)",
+                 (workspace_id, name.strip(), user_id))
+    conn.execute(
+        "INSERT INTO workspace_members(workspace_id,user_id,role,created_by) VALUES (%s,%s,'OWNER',%s)",
+        (workspace_id, user_id, user_id),
+    )
+    emit_event(conn, workspace_id, "workspace.created", request_id=request_id,
+               data={"workspace_id": workspace_id, "actor_user_id": user_id})
+    return {"id": workspace_id, "name": name.strip(), "role": "OWNER"}
+
+
+def workspace_members(conn: Connection, workspace_id: str) -> list[dict[str, Any]]:
+    return conn.execute(
+        """SELECT u.id AS user_id,u.email,u.display_name,m.role,m.created_at,m.updated_at
+           FROM workspace_members m JOIN users u ON u.id=m.user_id
+           WHERE m.workspace_id=%s ORDER BY m.created_at,u.id""",
+        (workspace_id,),
+    ).fetchall()
+
+
+def set_workspace_member(
+    conn: Connection, workspace_id: str, actor_id: str, target_id: str, role: str, request_id: str,
+) -> bool:
+    conn.execute("SELECT id FROM workspaces WHERE id=%s FOR UPDATE", (workspace_id,))
+    target = conn.execute("SELECT id FROM users WHERE id=%s", (target_id,)).fetchone()
+    if not target:
+        return False
+    existing = conn.execute(
+        "SELECT role FROM workspace_members WHERE workspace_id=%s AND user_id=%s FOR UPDATE",
+        (workspace_id, target_id),
+    ).fetchone()
+    if existing and existing["role"] == "OWNER" and actor_id != target_id:
+        actor = conn.execute(
+            "SELECT role FROM workspace_members WHERE workspace_id=%s AND user_id=%s",
+            (workspace_id, actor_id),
+        ).fetchone()
+        if not actor or actor["role"] != "OWNER":
+            raise WorkspaceOwnerActionForbidden
+    if existing and existing["role"] == "OWNER" and role != "OWNER":
+        owners = conn.execute(
+            "SELECT count(*) AS n FROM workspace_members WHERE workspace_id=%s AND role='OWNER'",
+            (workspace_id,),
+        ).fetchone()["n"]
+        if owners < 2:
+            raise LastWorkspaceOwner
+    conn.execute(
+        """INSERT INTO workspace_members(workspace_id,user_id,role,created_by)
+           VALUES (%s,%s,%s,%s) ON CONFLICT (workspace_id,user_id)
+           DO UPDATE SET role=EXCLUDED.role,updated_at=clock_timestamp()""",
+        (workspace_id, target_id, role, actor_id),
+    )
+    emit_event(conn, workspace_id, "workspace.member_role_changed" if existing else "workspace.member_added",
+               request_id=request_id,
+               data={"actor_user_id": actor_id, "target_user_id": target_id, "role": role})
+    return True
+
+
+def remove_workspace_member(
+    conn: Connection, workspace_id: str, actor_id: str, target_id: str, request_id: str,
+) -> bool:
+    conn.execute("SELECT id FROM workspaces WHERE id=%s FOR UPDATE", (workspace_id,))
+    member = conn.execute(
+        "SELECT role FROM workspace_members WHERE workspace_id=%s AND user_id=%s FOR UPDATE",
+        (workspace_id, target_id),
+    ).fetchone()
+    if not member:
+        return False
+    if member["role"] == "OWNER":
+        actor = conn.execute(
+            "SELECT role FROM workspace_members WHERE workspace_id=%s AND user_id=%s",
+            (workspace_id, actor_id),
+        ).fetchone()
+        if not actor or actor["role"] != "OWNER":
+            raise WorkspaceOwnerActionForbidden
+        owners = conn.execute(
+            "SELECT count(*) AS n FROM workspace_members WHERE workspace_id=%s AND role='OWNER'",
+            (workspace_id,),
+        ).fetchone()["n"]
+        if owners < 2:
+            raise LastWorkspaceOwner
+    conn.execute("DELETE FROM workspace_members WHERE workspace_id=%s AND user_id=%s",
+                 (workspace_id, target_id))
+    emit_event(conn, workspace_id, "workspace.member_removed", request_id=request_id,
+               data={"actor_user_id": actor_id, "target_user_id": target_id})
+    return True
 
 
 def emit_event(
@@ -47,6 +248,11 @@ def emit_event(
     request_id: str | None = None,
     data: dict[str, Any] | None = None,
 ) -> None:
+    # ponytail: serialize events per tenant for commit-ordered SSE cursors; replace with an ordered outbox if this becomes a write bottleneck.
+    conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (f"relaycore:event-order:{tenant_id}",),
+    )
     conn.execute(
         """INSERT INTO events(tenant_id,run_id,task_id,worker_id,request_id,kind,data)
            VALUES (%s,%s,%s,%s,%s,%s,%s)""",
@@ -54,7 +260,338 @@ def emit_event(
     )
 
 
+def create_webhook_endpoint(
+    conn: Connection, workspace_id: str, actor_id: str, name: str, idempotency_key: str,
+    request_id: str, encryption_key: bytes,
+) -> dict[str, Any]:
+    fingerprint = hashlib.sha256(name.encode()).hexdigest()
+    conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                 (f"relaycore:webhook-create:{workspace_id}",))
+    existing = conn.execute(
+        """SELECT id,name,creation_fingerprint,created_at,revoked_at FROM webhook_endpoints
+           WHERE workspace_id=%s AND creation_key=%s FOR UPDATE""",
+        (workspace_id, idempotency_key),
+    ).fetchone()
+    if existing:
+        if existing["creation_fingerprint"] != fingerprint or existing["revoked_at"]:
+            raise IdempotencyConflict
+        active = conn.execute(
+            """SELECT encrypted_secret FROM webhook_secrets
+               WHERE endpoint_id=%s AND revoked_at IS NULL""", (existing["id"],)
+        ).fetchone()
+        if not active:
+            raise IdempotencyConflict
+        return {"id": existing["id"], "name": existing["name"], "created_at": existing["created_at"],
+                "secret": decrypt_secret(active["encrypted_secret"], encryption_key), "created": False}
+
+    endpoint_id, secret = str(uuid.uuid4()), secrets.token_urlsafe(32)
+    conn.execute(
+        """INSERT INTO webhook_endpoints
+           (id,workspace_id,name,created_by,creation_key,creation_fingerprint)
+           VALUES (%s,%s,%s,%s,%s,%s)""",
+        (endpoint_id, workspace_id, name, actor_id, idempotency_key, fingerprint),
+    )
+    conn.execute(
+        """INSERT INTO webhook_secrets(endpoint_id,version,encrypted_secret,idempotency_key)
+           VALUES (%s,1,%s,%s)""",
+        (endpoint_id, encrypt_secret(secret, encryption_key), f"create:{idempotency_key}"),
+    )
+    emit_event(conn, workspace_id, "webhook.endpoint_created", request_id=request_id,
+               data={"endpoint_id": endpoint_id, "actor_user_id": actor_id})
+    return {"id": endpoint_id, "name": name, "secret": secret, "created": True}
+
+
+def list_webhook_endpoints(conn: Connection, workspace_id: str) -> list[dict[str, Any]]:
+    return conn.execute(
+        """SELECT id,name,created_at,revoked_at,last_received_at
+           FROM webhook_endpoints WHERE workspace_id=%s ORDER BY created_at DESC""",
+        (workspace_id,),
+    ).fetchall()
+
+
+def create_workspace_credential(
+    conn: Connection, workspace_id: str, actor_id: str, provider: str, name: str, secret: str,
+    idempotency_key: str, request_id: str, encryption_key: bytes,
+) -> dict[str, Any]:
+    fingerprint_key = hashlib.sha256(encryption_key).digest()
+    fingerprint = hmac.new(fingerprint_key, f"{provider}\0{name}\0{secret}".encode(), hashlib.sha256).hexdigest()
+    conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                 (f"relaycore:credential-create:{workspace_id}:{idempotency_key}",))
+    existing = conn.execute(
+        """SELECT id,provider,name,creation_fingerprint,created_at,revoked_at
+           FROM integration_credentials WHERE workspace_id=%s AND creation_key=%s FOR UPDATE""",
+        (workspace_id, idempotency_key),
+    ).fetchone()
+    if existing:
+        if existing["creation_fingerprint"] != fingerprint or existing["revoked_at"]:
+            raise IdempotencyConflict
+        return {key: existing[key] for key in ("id", "provider", "name", "created_at")} | {"created": False}
+
+    credential_id = str(uuid.uuid4())
+    created_at = conn.execute(
+        """INSERT INTO integration_credentials
+           (id,workspace_id,provider,name,created_by,creation_key,creation_fingerprint)
+           VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING created_at""",
+        (credential_id, workspace_id, provider, name, actor_id, idempotency_key, fingerprint),
+    ).fetchone()
+    conn.execute(
+        """INSERT INTO integration_credential_secrets
+           (credential_id,version,encrypted_secret,idempotency_key,secret_fingerprint)
+           VALUES (%s,1,%s,%s,%s)""",
+        (credential_id, encrypt_secret(secret, encryption_key), f"create:{idempotency_key}", fingerprint),
+    )
+    emit_event(conn, workspace_id, "credential.created", request_id=request_id,
+               data={"credential_id": credential_id, "provider": provider, "actor_user_id": actor_id})
+    return {"id": credential_id, "provider": provider, "name": name, "created_at": created_at["created_at"],
+            "created": True}
+
+
+def list_workspace_credentials(conn: Connection, workspace_id: str) -> list[dict[str, Any]]:
+    return conn.execute(
+        """SELECT id,provider,name,created_at,revoked_at,
+                  (SELECT max(version) FROM integration_credential_secrets s WHERE s.credential_id=c.id) AS version
+           FROM integration_credentials c WHERE workspace_id=%s ORDER BY created_at DESC""",
+        (workspace_id,),
+    ).fetchall()
+
+
+def rotate_workspace_credential(
+    conn: Connection, workspace_id: str, credential_id: str, actor_id: str, secret: str,
+    idempotency_key: str, request_id: str, encryption_key: bytes,
+) -> dict[str, Any] | None:
+    credential = conn.execute(
+        """SELECT id,provider,name,revoked_at FROM integration_credentials
+           WHERE id=%s AND workspace_id=%s FOR UPDATE""", (credential_id, workspace_id)
+    ).fetchone()
+    if not credential or credential["revoked_at"]:
+        return None
+    fingerprint_key = hashlib.sha256(encryption_key).digest()
+    fingerprint = hmac.new(fingerprint_key, f"{credential['provider']}\0{credential['name']}\0{secret}".encode(),
+                           hashlib.sha256).hexdigest()
+    previous = conn.execute(
+        """SELECT version,secret_fingerprint,revoked_at FROM integration_credential_secrets
+           WHERE credential_id=%s AND idempotency_key=%s FOR UPDATE""", (credential_id, idempotency_key)
+    ).fetchone()
+    if previous:
+        if previous["secret_fingerprint"] != fingerprint or previous["revoked_at"]:
+            raise IdempotencyConflict
+        return {"id": credential_id, "provider": credential["provider"], "name": credential["name"],
+                "version": previous["version"], "created": False}
+    current = conn.execute(
+        """SELECT version FROM integration_credential_secrets
+           WHERE credential_id=%s AND revoked_at IS NULL FOR UPDATE""", (credential_id,)
+    ).fetchone()
+    if not current:
+        raise IdempotencyConflict
+    version = current["version"] + 1
+    conn.execute("UPDATE integration_credential_secrets SET revoked_at=clock_timestamp() "
+                 "WHERE credential_id=%s AND revoked_at IS NULL", (credential_id,))
+    conn.execute(
+        """INSERT INTO integration_credential_secrets
+           (credential_id,version,encrypted_secret,idempotency_key,secret_fingerprint)
+           VALUES (%s,%s,%s,%s,%s)""",
+        (credential_id, version, encrypt_secret(secret, encryption_key), idempotency_key, fingerprint),
+    )
+    emit_event(conn, workspace_id, "credential.rotated", request_id=request_id,
+               data={"credential_id": credential_id, "provider": credential["provider"],
+                     "version": version, "actor_user_id": actor_id})
+    return {"id": credential_id, "provider": credential["provider"], "name": credential["name"],
+            "version": version, "created": True}
+
+
+def revoke_workspace_credential(
+    conn: Connection, workspace_id: str, credential_id: str, actor_id: str, request_id: str,
+) -> bool:
+    changed = conn.execute(
+        """UPDATE integration_credentials SET revoked_at=clock_timestamp()
+           WHERE id=%s AND workspace_id=%s AND revoked_at IS NULL RETURNING id,provider""",
+        (credential_id, workspace_id),
+    ).fetchone()
+    if not changed:
+        return False
+    conn.execute("UPDATE integration_credential_secrets SET revoked_at=clock_timestamp() "
+                 "WHERE credential_id=%s AND revoked_at IS NULL", (credential_id,))
+    emit_event(conn, workspace_id, "credential.revoked", request_id=request_id,
+               data={"credential_id": credential_id, "provider": changed["provider"],
+                     "actor_user_id": actor_id})
+    return True
+
+
+def workspace_credential_secret(
+    conn: Connection, workspace_id: str, credential_id: str, encryption_key: bytes,
+) -> dict[str, str] | None:
+    row = conn.execute(
+        """SELECT c.provider,s.encrypted_secret FROM integration_credentials c
+           JOIN integration_credential_secrets s ON s.credential_id=c.id
+           WHERE c.id=%s AND c.workspace_id=%s AND c.revoked_at IS NULL AND s.revoked_at IS NULL""",
+        (credential_id, workspace_id),
+    ).fetchone()
+    if not row:
+        return None
+    return {"provider": row["provider"], "secret": decrypt_secret(row["encrypted_secret"], encryption_key)}
+
+
+def rotate_webhook_secret(
+    conn: Connection, workspace_id: str, endpoint_id: str, actor_id: str, idempotency_key: str,
+    request_id: str, encryption_key: bytes,
+) -> dict[str, Any] | None:
+    endpoint = conn.execute(
+        """SELECT id,revoked_at FROM webhook_endpoints
+           WHERE id=%s AND workspace_id=%s FOR UPDATE""", (endpoint_id, workspace_id)
+    ).fetchone()
+    if not endpoint or endpoint["revoked_at"]:
+        return None
+    previous = conn.execute(
+        """SELECT version,encrypted_secret,revoked_at FROM webhook_secrets
+           WHERE endpoint_id=%s AND idempotency_key=%s FOR UPDATE""", (endpoint_id, idempotency_key)
+    ).fetchone()
+    if previous:
+        if previous["revoked_at"]:
+            raise IdempotencyConflict
+        return {"endpoint_id": endpoint_id, "version": previous["version"],
+                "secret": decrypt_secret(previous["encrypted_secret"], encryption_key), "created": False}
+    current = conn.execute(
+        """SELECT version FROM webhook_secrets
+           WHERE endpoint_id=%s AND revoked_at IS NULL FOR UPDATE""", (endpoint_id,)
+    ).fetchone()
+    if not current:
+        raise WebhookSecretRotated
+    current_version = current["version"]
+    conn.execute(
+        """UPDATE webhook_secrets SET revoked_at=clock_timestamp()
+           WHERE endpoint_id=%s AND revoked_at IS NULL""", (endpoint_id,)
+    )
+    secret, version = secrets.token_urlsafe(32), current_version + 1
+    conn.execute(
+        """INSERT INTO webhook_secrets(endpoint_id,version,encrypted_secret,idempotency_key)
+           VALUES (%s,%s,%s,%s)""",
+        (endpoint_id, version, encrypt_secret(secret, encryption_key), idempotency_key),
+    )
+    emit_event(conn, workspace_id, "webhook.secret_rotated", request_id=request_id,
+               data={"endpoint_id": endpoint_id, "version": version, "actor_user_id": actor_id})
+    return {"endpoint_id": endpoint_id, "version": version, "secret": secret, "created": True}
+
+
+def revoke_webhook_endpoint(
+    conn: Connection, workspace_id: str, endpoint_id: str, actor_id: str, request_id: str,
+) -> bool:
+    endpoint = conn.execute(
+        """UPDATE webhook_endpoints SET revoked_at=clock_timestamp()
+           WHERE id=%s AND workspace_id=%s AND revoked_at IS NULL RETURNING id""",
+        (endpoint_id, workspace_id),
+    ).fetchone()
+    if not endpoint:
+        return False
+    conn.execute(
+        """UPDATE webhook_secrets SET revoked_at=clock_timestamp()
+           WHERE endpoint_id=%s AND revoked_at IS NULL""", (endpoint_id,)
+    )
+    emit_event(conn, workspace_id, "webhook.endpoint_revoked", request_id=request_id,
+               data={"endpoint_id": endpoint_id, "actor_user_id": actor_id})
+    return True
+
+
+def webhook_signing_info(conn: Connection, endpoint_id: str) -> dict[str, Any] | None:
+    return conn.execute(
+        """SELECT e.workspace_id,s.version,s.encrypted_secret
+           FROM webhook_endpoints e JOIN webhook_secrets s ON s.endpoint_id=e.id
+           WHERE e.id=%s AND e.revoked_at IS NULL AND s.revoked_at IS NULL""", (endpoint_id,)
+    ).fetchone()
+
+
+def persist_webhook_event(
+    conn: Connection, workspace_id: str, endpoint_id: str, secret_version: int, event_key: str,
+    request_id: str, body: bytes, payload: dict[str, Any], *, allow_workflow_triggers: bool = False,
+) -> dict[str, Any]:
+    endpoint = conn.execute(
+        """SELECT id FROM webhook_endpoints WHERE id=%s AND workspace_id=%s
+           AND revoked_at IS NULL FOR UPDATE""", (endpoint_id, workspace_id)
+    ).fetchone()
+    active = conn.execute(
+        """SELECT version FROM webhook_secrets WHERE endpoint_id=%s AND revoked_at IS NULL FOR UPDATE""",
+        (endpoint_id,),
+    ).fetchone()
+    if not endpoint or not active:
+        raise WebhookSecretRotated
+    if active["version"] != secret_version:
+        raise WebhookSecretRotated
+    payload_hash = hashlib.sha256(body).hexdigest()
+    event_id = str(uuid.uuid4())
+    inserted = conn.execute(
+        """INSERT INTO incoming_events
+           (id,workspace_id,endpoint_id,event_key,request_id,payload_sha256,raw_body,payload)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (endpoint_id,event_key) DO NOTHING
+           RETURNING id""",
+        (event_id, workspace_id, endpoint_id, event_key, request_id, payload_hash, body, Jsonb(payload)),
+    ).fetchone()
+    if not inserted:
+        previous = conn.execute(
+            """SELECT id,payload_sha256 FROM incoming_events
+               WHERE endpoint_id=%s AND event_key=%s""", (endpoint_id, event_key)
+        ).fetchone()
+        if previous["payload_sha256"] != payload_hash:
+            raise IdempotencyConflict
+        return {"id": previous["id"], "duplicate": True}
+    conn.execute("UPDATE webhook_endpoints SET last_received_at=clock_timestamp() WHERE id=%s", (endpoint_id,))
+    emit_event(conn, workspace_id, "webhook.received", request_id=request_id,
+               data={"event_id": event_id, "endpoint_id": endpoint_id,
+                     "event_key": event_key, "payload_sha256": payload_hash})
+    triggered_runs = []
+    event_type = payload.get("type")
+    if allow_workflow_triggers and isinstance(event_type, str):
+        matches = conn.execute(
+            """SELECT d.id AS workflow_id,v.id AS version_id,v.version_number,
+                      v.definition,v.definition_hash
+               FROM workflow_definitions d JOIN workflow_versions v
+                 ON v.tenant_id=d.tenant_id AND v.workflow_id=d.id AND v.version_number=d.current_version
+               WHERE d.tenant_id=%s AND d.status='active'
+                 AND v.definition->'trigger'->>'type'='webhook'
+                 AND v.definition->'trigger'->>'endpoint_id'=%s
+                 AND v.definition->'trigger'->>'event_type'=%s
+               ORDER BY d.id""",
+            (workspace_id, endpoint_id, event_type),
+        ).fetchall()
+        for match in matches:
+            seed = f"{endpoint_id}:{event_key}:{match['version_id']}".encode()
+            run_key = "webhook-trigger:" + hashlib.sha256(seed).hexdigest()
+            definition = match["definition"]
+            run = create_workflow(
+                conn, workspace_id, definition["title"], definition["steps"], run_key, request_id,
+                workflow_version_id=match["version_id"], definition_hash=match["definition_hash"],
+            )
+            triggered_runs.append({"workflow_id": match["workflow_id"], "run_id": run["id"],
+                                   "workflow_version_id": match["version_id"],
+                                   "version": match["version_number"], "created": run["created"]})
+    return {"id": event_id, "duplicate": False, "triggered_runs": triggered_runs}
+
+
+def list_incoming_events(
+    conn: Connection, workspace_id: str, limit: int,
+    before: tuple[Any, str] | None = None,
+) -> list[dict[str, Any]]:
+    query = """SELECT i.id,i.endpoint_id,e.name AS endpoint_name,i.event_key,
+                      i.request_id,i.payload_sha256,i.payload->>'type' AS event_type,i.received_at
+               FROM incoming_events i JOIN webhook_endpoints e ON e.id=i.endpoint_id
+               WHERE i.workspace_id=%s"""
+    params: tuple[Any, ...] = (workspace_id,)
+    if before:
+        query += " AND (i.received_at,i.id)<(%s,%s)"
+        params += before
+    return conn.execute(query + " ORDER BY i.received_at DESC,i.id DESC LIMIT %s",
+                        (*params, limit + 1)).fetchall()
+
+
 def _admit(conn: Connection, tenant_id: str) -> None:
+    admit_rate_limit(conn, tenant_id)
+    pending = conn.execute(
+        "SELECT count(*) AS count FROM tasks WHERE tenant_id=%s AND status IN ('queued','retry_wait','running')",
+        (tenant_id,),
+    ).fetchone()["count"]
+    if pending >= MAX_QUEUE_DEPTH:
+        raise QueueFull
+
+
+def admit_rate_limit(conn: Connection, tenant_id: str) -> None:
     conn.execute(
         "DELETE FROM rate_limits WHERE window_start<date_trunc('minute',clock_timestamp())-interval '1 hour'"
     )
@@ -68,12 +605,206 @@ def _admit(conn: Connection, tenant_id: str) -> None:
     ).fetchone()["request_count"]
     if rate > RATE_LIMIT_PER_MINUTE:
         raise RateLimited
-    pending = conn.execute(
-        "SELECT count(*) AS count FROM tasks WHERE tenant_id=%s AND status IN ('queued','retry_wait','running')",
+
+
+def _lock_tenant(conn: Connection, tenant_id: str) -> None:
+    conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (tenant_id,))
+
+
+def _workflow_definition(title: str, steps: list[dict[str, Any]],
+                         trigger: dict[str, Any] | None = None) -> dict[str, Any]:
+    definition = {"title": title, "steps": steps}
+    if trigger:
+        definition["trigger"] = {"type": "webhook", **trigger}
+    return definition
+
+
+def _definition_fingerprint(title: str, steps: list[dict[str, Any]],
+                            trigger: dict[str, Any] | None = None) -> str:
+    return hashlib.sha256(
+        json.dumps(_workflow_definition(title, steps, trigger), sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _validate_workflow_trigger(
+    conn: Connection, tenant_id: str, trigger: dict[str, Any] | None,
+) -> None:
+    if trigger and not conn.execute(
+        """SELECT 1 FROM webhook_endpoints WHERE id=%s AND workspace_id=%s AND revoked_at IS NULL""",
+        (str(trigger["endpoint_id"]), tenant_id),
+    ).fetchone():
+        raise WebhookEndpointNotFound
+
+
+def create_workflow_definition(
+    conn: Connection,
+    tenant_id: str,
+    title: str,
+    steps: list[dict[str, Any]],
+    idempotency_key: str,
+    author_credential_fingerprint: str,
+    request_id: str,
+    author_user_id: str | None = None,
+    trigger: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    fingerprint = _definition_fingerprint(title, steps, trigger)
+    _lock_tenant(conn, tenant_id)
+    existing = conn.execute(
+        "SELECT id,fingerprint FROM workflow_definitions WHERE tenant_id=%s AND idempotency_key=%s",
+        (tenant_id, idempotency_key),
+    ).fetchone()
+    if existing:
+        if existing["fingerprint"] != fingerprint:
+            raise IdempotencyConflict
+        version = conn.execute(
+            "SELECT id FROM workflow_versions WHERE tenant_id=%s AND workflow_id=%s AND version_number=1",
+            (tenant_id, existing["id"]),
+        ).fetchone()
+        return {"id": existing["id"], "version_id": version["id"], "version": 1, "created": False}
+
+    _validate_workflow_trigger(conn, tenant_id, trigger)
+    workflow_id, version_id = str(uuid.uuid4()), str(uuid.uuid4())
+    definition = _workflow_definition(title, steps, trigger)
+    conn.execute(
+        """INSERT INTO workflow_definitions
+           (id,tenant_id,title,idempotency_key,fingerprint,author_credential_fingerprint,author_user_id)
+           VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+        (workflow_id, tenant_id, title, idempotency_key, fingerprint, author_credential_fingerprint, author_user_id),
+    )
+    conn.execute(
+        """INSERT INTO workflow_versions
+           (id,tenant_id,workflow_id,version_number,definition,definition_hash,idempotency_key,
+            author_credential_fingerprint,author_user_id)
+           VALUES (%s,%s,%s,1,%s,%s,%s,%s,%s)""",
+        (version_id, tenant_id, workflow_id, Jsonb(definition), fingerprint,
+         idempotency_key, author_credential_fingerprint, author_user_id),
+    )
+    emit_event(conn, tenant_id, "workflow.version_published", request_id=request_id,
+               data={"workflow_id": workflow_id, "workflow_version_id": version_id, "version": 1})
+    return {"id": workflow_id, "version_id": version_id, "version": 1, "created": True}
+
+
+def add_workflow_version(
+    conn: Connection,
+    tenant_id: str,
+    workflow_id: str,
+    title: str,
+    steps: list[dict[str, Any]],
+    idempotency_key: str,
+    author_credential_fingerprint: str,
+    request_id: str,
+    author_user_id: str | None = None,
+    trigger: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    fingerprint = _definition_fingerprint(title, steps, trigger)
+    _lock_tenant(conn, tenant_id)
+    existing = conn.execute(
+        """SELECT id,version_number,definition_hash FROM workflow_versions
+           WHERE tenant_id=%s AND workflow_id=%s AND idempotency_key=%s""",
+        (tenant_id, workflow_id, idempotency_key),
+    ).fetchone()
+    if existing:
+        if existing["definition_hash"] != fingerprint:
+            raise IdempotencyConflict
+        return {"id": existing["id"], "version": existing["version_number"], "created": False}
+
+    workflow = conn.execute(
+        """SELECT current_version,status FROM workflow_definitions
+           WHERE tenant_id=%s AND id=%s FOR UPDATE""",
+        (tenant_id, workflow_id),
+    ).fetchone()
+    if not workflow:
+        return None
+    if workflow["status"] != "active":
+        raise WorkflowDisabled
+    _validate_workflow_trigger(conn, tenant_id, trigger)
+
+    version_number, version_id = workflow["current_version"] + 1, str(uuid.uuid4())
+    conn.execute(
+        """INSERT INTO workflow_versions
+           (id,tenant_id,workflow_id,version_number,definition,definition_hash,idempotency_key,
+            author_credential_fingerprint,author_user_id)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+        (version_id, tenant_id, workflow_id, version_number, Jsonb(_workflow_definition(title, steps, trigger)),
+         fingerprint, idempotency_key, author_credential_fingerprint, author_user_id),
+    )
+    conn.execute(
+        """UPDATE workflow_definitions SET title=%s,current_version=%s,updated_at=clock_timestamp()
+           WHERE tenant_id=%s AND id=%s""",
+        (title, version_number, tenant_id, workflow_id),
+    )
+    emit_event(conn, tenant_id, "workflow.version_published", request_id=request_id,
+               data={"workflow_id": workflow_id, "workflow_version_id": version_id, "version": version_number})
+    return {"id": version_id, "version": version_number, "created": True}
+
+
+def list_workflow_definitions(conn: Connection, tenant_id: str) -> list[dict[str, Any]]:
+    return conn.execute(
+        """SELECT id,title,status,current_version,created_at,updated_at
+           FROM workflow_definitions WHERE tenant_id=%s ORDER BY updated_at DESC LIMIT 100""",
         (tenant_id,),
-    ).fetchone()["count"]
-    if pending >= MAX_QUEUE_DEPTH:
-        raise QueueFull
+    ).fetchall()
+
+
+def get_workflow_definition(conn: Connection, tenant_id: str, workflow_id: str) -> dict[str, Any] | None:
+    workflow = conn.execute(
+        """SELECT id,title,status,current_version,created_at,updated_at
+           FROM workflow_definitions WHERE tenant_id=%s AND id=%s""",
+        (tenant_id, workflow_id),
+    ).fetchone()
+    if workflow:
+        workflow["versions"] = conn.execute(
+            """SELECT v.id,v.version_number,v.definition,v.definition_hash,v.author_user_id,
+                      u.email AS author_email,v.published_at
+               FROM workflow_versions v LEFT JOIN users u ON u.id=v.author_user_id
+               WHERE v.tenant_id=%s AND v.workflow_id=%s ORDER BY v.version_number""",
+            (tenant_id, workflow_id),
+        ).fetchall()
+    return workflow
+
+
+def trigger_workflow_definition(
+    conn: Connection,
+    tenant_id: str,
+    workflow_id: str,
+    idempotency_key: str,
+    request_id: str,
+) -> dict[str, Any] | None:
+    _lock_tenant(conn, tenant_id)
+    existing = conn.execute(
+        """SELECT r.id,r.status,r.workflow_version_id,v.workflow_id,v.version_number
+           FROM workflow_runs r LEFT JOIN workflow_versions v
+             ON v.tenant_id=r.tenant_id AND v.id=r.workflow_version_id
+           WHERE r.tenant_id=%s AND r.idempotency_key=%s""",
+        (tenant_id, idempotency_key),
+    ).fetchone()
+    if existing:
+        if existing["workflow_id"] != workflow_id:
+            raise IdempotencyConflict
+        result = {"id": existing["id"], "status": existing["status"], "created": False,
+                  "workflow_version_id": existing["workflow_version_id"]}
+        if existing["version_number"] is not None:
+            result["version"] = existing["version_number"]
+        return result
+
+    version = conn.execute(
+        """SELECT d.title,d.status,v.id,v.version_number,v.definition,v.definition_hash
+           FROM workflow_definitions d JOIN workflow_versions v
+             ON v.tenant_id=d.tenant_id AND v.workflow_id=d.id AND v.version_number=d.current_version
+           WHERE d.tenant_id=%s AND d.id=%s""",
+        (tenant_id, workflow_id),
+    ).fetchone()
+    if not version:
+        return None
+    if version["status"] != "active":
+        raise WorkflowDisabled
+    result = create_workflow(
+        conn, tenant_id, version["title"], version["definition"]["steps"], idempotency_key, request_id,
+        workflow_version_id=version["id"], definition_hash=version["definition_hash"],
+    )
+    result["workflow_version_id"] = version["id"]
+    result["version"] = version["version_number"]
+    return result
 
 
 def create_workflow(
@@ -83,10 +814,27 @@ def create_workflow(
     steps: list[dict[str, Any]],
     idempotency_key: str,
     request_id: str,
+    *,
+    workflow_version_id: str | None = None,
+    definition_hash: str | None = None,
 ) -> dict[str, Any]:
+    fingerprint_payload = {"title": title, "steps": steps}
+    if workflow_version_id is not None:
+        fingerprint_payload["workflow_version_id"] = workflow_version_id
     fingerprint = hashlib.sha256(
-        json.dumps({"title": title, "steps": steps}, sort_keys=True, separators=(",", ":")).encode()
+        json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+    existing = conn.execute(
+        "SELECT id,fingerprint,status FROM workflow_runs WHERE tenant_id=%s AND idempotency_key=%s",
+        (tenant_id, idempotency_key),
+    ).fetchone()
+    if existing:
+        if existing["fingerprint"] != fingerprint:
+            raise IdempotencyConflict
+        return {"id": existing["id"], "status": existing["status"], "created": False}
+
+    # Serialize the lookup, capacity check, and insert within this tenant's transaction.
+    _lock_tenant(conn, tenant_id)
     existing = conn.execute(
         "SELECT id,fingerprint,status FROM workflow_runs WHERE tenant_id=%s AND idempotency_key=%s",
         (tenant_id, idempotency_key),
@@ -100,17 +848,21 @@ def create_workflow(
     run_id, task_id = str(uuid.uuid4()), str(uuid.uuid4())
     definition = {"title": title, "steps": steps}
     conn.execute(
-        """INSERT INTO workflow_runs(id,tenant_id,title,definition,status,idempotency_key,fingerprint)
-           VALUES (%s,%s,%s,%s,'queued',%s,%s)""",
-        (run_id, tenant_id, title, Jsonb(definition), idempotency_key, fingerprint),
+        """INSERT INTO workflow_runs
+           (id,tenant_id,title,definition,status,idempotency_key,fingerprint,workflow_version_id,definition_hash)
+           VALUES (%s,%s,%s,%s,'queued',%s,%s,%s,%s)""",
+        (run_id, tenant_id, title, Jsonb(definition), idempotency_key, fingerprint,
+         workflow_version_id, definition_hash or _definition_fingerprint(title, steps)),
     )
     conn.execute(
         "INSERT INTO tasks(id,tenant_id,run_id,max_attempts,request_id) VALUES (%s,%s,%s,%s,%s)",
         (task_id, tenant_id, run_id, MAX_ATTEMPTS, request_id),
     )
     emit_event(conn, tenant_id, "workflow.created", run_id=run_id, task_id=task_id,
-               request_id=request_id, data={"title": title, "steps": len(steps)})
-    return {"id": run_id, "task_id": task_id, "status": "queued", "created": True}
+               request_id=request_id, data={"title": title, "steps": len(steps),
+                                            "workflow_version_id": workflow_version_id})
+    return {"id": run_id, "task_id": task_id, "status": "queued", "created": True,
+            "workflow_version_id": workflow_version_id}
 
 
 def ingest_business_event(
@@ -384,7 +1136,8 @@ def execute_step(conn: Connection, worker_id: str, task: dict[str, Any], request
 
 def run_summary(conn: Connection, tenant_id: str, run_id: str) -> dict[str, Any] | None:
     run = conn.execute(
-        """SELECT w.id,w.title,w.status,w.definition,w.created_at,w.finished_at,
+        """SELECT w.id,w.title,w.status,w.definition,w.workflow_version_id,w.definition_hash,
+                  w.created_at,w.finished_at,
                   t.id AS task_id,t.status AS task_status,t.step_index,t.attempts,t.max_attempts,
                   t.lease_owner,t.lease_until,t.last_error
            FROM workflow_runs w JOIN tasks t ON t.run_id=w.id
@@ -404,7 +1157,7 @@ def run_summary(conn: Connection, tenant_id: str, run_id: str) -> dict[str, Any]
     return run
 
 
-def dashboard(conn: Connection, tenant_id: str) -> dict[str, Any]:
+def dashboard(conn: Connection, tenant_id: str, *, include_workers: bool = False) -> dict[str, Any]:
     counts = conn.execute(
         """SELECT count(*) FILTER (WHERE status IN ('queued','retry_wait')) AS queue_depth,
                   count(*) FILTER (WHERE status='running') AS running,
@@ -422,11 +1175,13 @@ def dashboard(conn: Connection, tenant_id: str) -> dict[str, Any]:
     ).fetchone()
     effects = conn.execute("SELECT count(*) AS count FROM side_effects WHERE tenant_id=%s", (tenant_id,)).fetchone()["count"]
     dlq = conn.execute("SELECT count(*) AS count FROM dead_letters WHERE tenant_id=%s AND replayed_at IS NULL", (tenant_id,)).fetchone()["count"]
-    workers = conn.execute(
-        """SELECT id,pid,host,started_at,heartbeat_at,stopped_at,
-                  heartbeat_at>clock_timestamp()-interval '3 seconds' AND stopped_at IS NULL AS alive
-           FROM workers ORDER BY id"""
-    ).fetchall()
+    workers = []
+    if include_workers:
+        workers = conn.execute(
+            """SELECT id,pid,host,started_at,heartbeat_at,stopped_at,
+                      heartbeat_at>clock_timestamp()-interval '3 seconds' AND stopped_at IS NULL AS alive
+               FROM workers ORDER BY id"""
+        ).fetchall()
     workflows = conn.execute(
         """SELECT w.id,w.title,w.status,w.created_at,t.step_index,t.attempts,t.last_worker,t.lease_owner,t.last_error
            FROM workflow_runs w JOIN tasks t ON t.run_id=w.id

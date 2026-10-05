@@ -4,8 +4,9 @@ import json
 import re
 import uuid
 from typing import Any, Literal
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 
 class WorkflowStep(BaseModel):
@@ -37,11 +38,19 @@ class WorkflowStep(BaseModel):
         return self
 
 
+class WebhookTriggerRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    endpoint_id: UUID
+    event_type: str = Field(min_length=1, max_length=120, pattern=r"^[A-Za-z0-9_.:-]+$")
+
+
 class WorkflowRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     title: str = Field(min_length=1, max_length=120)
     steps: list[WorkflowStep] = Field(min_length=1, max_length=20)
+    trigger: WebhookTriggerRequest | None = None
 
 
 class DuplicateEventRequest(BaseModel):
@@ -57,6 +66,63 @@ class DemoFailureRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     title: str = Field(default="Demo DLQ failure", min_length=1, max_length=120)
+
+
+class WorkspaceCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=100)
+
+    @field_validator("name")
+    @classmethod
+    def workspace_name_is_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Workspace name must contain a visible character.")
+        return value
+
+
+class WorkspaceMemberRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: UUID
+    role: Literal["OWNER", "ADMIN", "DEVELOPER", "VIEWER"]
+
+
+class WebhookCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=100)
+
+    @field_validator("name")
+    @classmethod
+    def webhook_name_is_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Webhook name must contain a visible character.")
+        return value
+
+
+class CredentialCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["github", "slack", "http"]
+    name: str = Field(min_length=1, max_length=100)
+    secret: SecretStr
+
+    @field_validator("name")
+    @classmethod
+    def credential_name_is_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Credential name must contain a visible character.")
+        return value
+
+
+class CredentialRotateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    secret: SecretStr
 
 
 def valid_idempotency_key(value: str) -> str:

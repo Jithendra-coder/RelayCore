@@ -24,6 +24,12 @@ In the dashboard:
 
 The duplicate-event button uses a newly generated event key per click. Reuse an `event_key` through `POST /api/demo/duplicates` to repeat the same business event. Reusing that key with a different payload returns HTTP 409.
 
+## Signed workspace webhooks
+
+After production OIDC is configured, a workspace admin can create an endpoint with `POST /api/workspaces/{workspace_id}/webhooks` and an `Idempotency-Key`. Copy the returned signing secret immediately; the list API never returns it. Rotate with `POST /api/workspaces/{workspace_id}/webhooks/{endpoint_id}/rotate` and revoke with `DELETE` on that endpoint. Configure the sender to POST a JSON object to `/hooks/{endpoint_id}` with `X-RelayCore-Event-ID`, `X-RelayCore-Timestamp` (Unix seconds), and `X-RelayCore-Signature` (`sha256=<hex>`). The hex value is HMAC-SHA256 over `timestamp + newline + event ID + newline + exact request body`. Requests expire after five minutes, are limited to 256 KiB, and deduplicate by endpoint/event ID. `GET /api/events` returns paginated metadata without payloads. In Demo Mode, a workflow definition may trigger on an exact JSON `type`; production workflow creation/actions are still disabled, so production intake does not start runs yet.
+
+Workspace owners and admins can also store bearer credentials with `POST /api/workspaces/{workspace_id}/credentials` (`provider`: `github`, `slack`, or `http`) and an `Idempotency-Key`; list, rotate, and revoke them through the matching `/credentials` routes. Values are Fernet-encrypted and never returned by management APIs. These are storage primitives only: provider OAuth and production actions are not yet implemented.
+
 ## Local development and checks
 
 Python 3.13 and PostgreSQL 18 are the verified runtime. PostgreSQL must use UTF-8. Python 3.12 also fits the declared dependency ranges.
@@ -47,7 +53,7 @@ To run the API without containers, set `DATABASE_URL` to a UTF-8 PostgreSQL data
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-The default database URL is intended only for build verification. Production must provide a managed PostgreSQL URL and rotated API keys through environment or secret-manager configuration.
+The default database URL is intended only for build verification. Production startup requires HTTPS OIDC configuration and a managed PostgreSQL URL; static API keys are rejected outside Demo Mode. The browser signs in through `/auth/login`, creates its first workspace, and sends the selected workspace on each request. See [DEPLOYMENT.md](DEPLOYMENT.md) for the configuration contract. Live OIDC provider interoperability has not been verified because this repository has no provider credentials.
 
 ## Measure it
 
@@ -66,9 +72,9 @@ The runner measures 1, 2, and 4 real worker processes and records throughput, P5
 - Workflow creation, task claim, step effect/progress, cancellation, retries, replay, and their audit events use explicit PostgreSQL transaction boundaries.
 - Demo actions are a fixed allow-list over data payloads. No workflow payload is evaluated as Python or shell code.
 - Queue depth, workflow definitions, step count, per-step payloads, and tenant write rates have explicit limits. Saturation returns HTTP 429.
-- API keys map to a tenant and role (`admin`, `operator`, or `viewer`). Tenant IDs never come from the request body. Keys are supplied through `RELAYCORE_API_KEYS`.
+- Demo API keys map to an isolated sandbox tenant and role (`admin`, `operator`, or `viewer`). Production users are identified by the verified OIDC `(issuer, subject)` pair and receive workspace-scoped `OWNER`, `ADMIN`, `DEVELOPER`, or `VIEWER` permissions. Tenant IDs never come from the request body.
 - The local stack is not a cloud deployment. No cloud account, deploy credentials, TLS endpoint, backups, or running Docker daemon were available as part of this build. Use managed PostgreSQL, TLS, secret rotation, backups, and an ingress policy before a public deployment.
 
-See [docs/architecture.md](docs/architecture.md), [docs/runbook.md](docs/runbook.md), and [PROJECT_STATUS.md](PROJECT_STATUS.md) for invariants, phase evidence, and known limitations.
+See [ARCHITECTURE.md](ARCHITECTURE.md), [SECURITY.md](SECURITY.md), [TESTING.md](TESTING.md), [DEPLOYMENT.md](DEPLOYMENT.md), [BENCHMARKS.md](BENCHMARKS.md), [LIMITATIONS.md](LIMITATIONS.md), [docs/architecture.md](docs/architecture.md), [docs/adr/004-multitenancy.md](docs/adr/004-multitenancy.md), [docs/adr/005-secrets-management.md](docs/adr/005-secrets-management.md), [docs/adr/006-custom-webhook-ingress.md](docs/adr/006-custom-webhook-ingress.md), [docs/adr/007-webhook-trigger-matching.md](docs/adr/007-webhook-trigger-matching.md), [docs/adr/008-workspace-integration-credentials.md](docs/adr/008-workspace-integration-credentials.md), [docs/runbook.md](docs/runbook.md), and [PROJECT_STATUS.md](PROJECT_STATUS.md) for current guarantees and limits.
 
 The measured failure/recovery run, PostgreSQL restart record, and dashboard capture are in [docs/evidence.md](docs/evidence.md). The local measured run uses an isolated database; it is not a public deployment.

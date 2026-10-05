@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 
 import psycopg
 from psycopg.rows import dict_row

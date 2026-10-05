@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import os
 from typing import Any
+from urllib.parse import urlsplit
+
+from cryptography.fernet import Fernet
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres@127.0.0.1:55432/postgres")
 DEMO_MODE = os.environ.get("RELAYCORE_DEMO_MODE", "0").lower() in {"1", "true", "yes"}
@@ -10,7 +13,38 @@ WORKER_COUNT = int(os.environ.get("RELAYCORE_WORKERS", "2"))
 MAX_ATTEMPTS = int(os.environ.get("RELAYCORE_MAX_ATTEMPTS", "3"))
 MAX_QUEUE_DEPTH = int(os.environ.get("RELAYCORE_QUEUE_LIMIT", "1000"))
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("RELAYCORE_RATE_LIMIT_PER_MINUTE", "600"))
+MAX_WEBHOOK_BYTES = 256 * 1024
+WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS = 300
 LEASE_SECONDS = float(os.environ.get("RELAYCORE_LEASE_SECONDS", "4"))
+AUTH_SESSION_SECONDS = int(os.environ.get("RELAYCORE_AUTH_SESSION_SECONDS", "43200"))
+if not 300 <= AUTH_SESSION_SECONDS <= 604800:
+    raise RuntimeError("RELAYCORE_AUTH_SESSION_SECONDS must be between 300 and 604800.")
+
+
+def oidc_settings() -> dict[str, str] | None:
+    names = ("RELAYCORE_OIDC_ISSUER", "RELAYCORE_OIDC_CLIENT_ID",
+             "RELAYCORE_OIDC_CLIENT_SECRET", "RELAYCORE_OIDC_REDIRECT_URI", "RELAYCORE_OIDC_STATE_SECRET")
+    values = {name: os.environ.get(name, "").strip() for name in names}
+    configured = [bool(value) for value in values.values()]
+    if not any(configured):
+        return None
+    if not all(configured):
+        missing = ", ".join(name for name, value in values.items() if not value)
+        raise RuntimeError(f"Incomplete OIDC configuration; missing {missing}.")
+    for name in ("RELAYCORE_OIDC_ISSUER", "RELAYCORE_OIDC_REDIRECT_URI"):
+        parsed = urlsplit(values[name])
+        if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+            raise RuntimeError(f"{name} must be an HTTPS URL without embedded credentials.")
+    if len(values["RELAYCORE_OIDC_STATE_SECRET"]) < 32:
+        raise RuntimeError("RELAYCORE_OIDC_STATE_SECRET must contain at least 32 characters.")
+    values["RELAYCORE_OIDC_DISCOVERY_URL"] = os.environ.get(
+        "RELAYCORE_OIDC_DISCOVERY_URL",
+        f"{values['RELAYCORE_OIDC_ISSUER'].rstrip('/')}/.well-known/openid-configuration",
+    ).strip()
+    discovery = urlsplit(values["RELAYCORE_OIDC_DISCOVERY_URL"])
+    if discovery.scheme != "https" or not discovery.netloc or discovery.username or discovery.password:
+        raise RuntimeError("RELAYCORE_OIDC_DISCOVERY_URL must be an HTTPS URL without embedded credentials.")
+    return values
 
 
 def api_keys() -> dict[str, dict[str, str]]:
@@ -21,6 +55,8 @@ def api_keys() -> dict[str, dict[str, str]]:
         keys: Any = json.loads(raw or "{}")
     except json.JSONDecodeError as exc:
         raise RuntimeError("RELAYCORE_API_KEYS must be a JSON object.") from exc
+    if not DEMO_MODE:
+        raise RuntimeError("Static API keys are permitted only in Demo Mode; configure OIDC for production.")
     if not isinstance(keys, dict) or not keys:
         raise RuntimeError("Set RELAYCORE_API_KEYS before starting RelayCore.")
     for secret, identity in keys.items():
@@ -29,4 +65,20 @@ def api_keys() -> dict[str, dict[str, str]]:
         if identity.get("role") not in {"admin", "operator", "viewer"}:
             raise RuntimeError("API key role must be admin, operator, or viewer.")
     return keys
+
+
+def secret_encryption_key(*, required: bool = False) -> bytes | None:
+    value = os.environ.get("RELAYCORE_SECRET_ENCRYPTION_KEY", "").strip()
+    if not value:
+        if required:
+            raise RuntimeError("RELAYCORE_SECRET_ENCRYPTION_KEY is required for encrypted webhook secret storage.")
+        return None
+    try:
+        Fernet(value.encode())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("RELAYCORE_SECRET_ENCRYPTION_KEY must be a valid Fernet key.") from exc
+    return value.encode()
+
+
+OIDC_SETTINGS = oidc_settings()
 

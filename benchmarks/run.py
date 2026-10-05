@@ -4,7 +4,6 @@ import argparse
 import json
 import os
 import platform
-import statistics
 import sys
 import threading
 import time
@@ -19,10 +18,10 @@ from psycopg_pool import ConnectionPool
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from app.coordinator import run as run_coordinator
-from app.settings import DATABASE_URL, LEASE_SECONDS, MAX_ATTEMPTS
-from app.store import create_workflow, migrate
-from app.supervisor import WorkerSupervisor
+from app.coordinator import run as run_coordinator  # noqa: E402
+from app.settings import DATABASE_URL, LEASE_SECONDS, MAX_ATTEMPTS  # noqa: E402
+from app.store import create_workflow, migrate  # noqa: E402
+from app.supervisor import WorkerSupervisor  # noqa: E402
 
 
 def percentile(samples: list[float], p: float) -> float:

@@ -6,6 +6,7 @@ import time
 import uuid
 
 import pytest
+from cryptography.fernet import Fernet
 
 TEST_TENANT = f"relaycore-test-{uuid.uuid4().hex}"
 OTHER_TENANT = f"relaycore-other-{uuid.uuid4().hex}"
@@ -13,16 +14,17 @@ os.environ.setdefault("DATABASE_URL", "postgresql://postgres@127.0.0.1:55433/pos
 os.environ["RELAYCORE_DEMO_MODE"] = "1"
 os.environ["RELAYCORE_WORKERS"] = "0"
 os.environ["RELAYCORE_LEASE_SECONDS"] = "1.2"
+os.environ.setdefault("RELAYCORE_SECRET_ENCRYPTION_KEY", Fernet.generate_key().decode())
 os.environ["RELAYCORE_API_KEYS"] = json.dumps({
     "demo-key-change-me-32": {"tenant_id": TEST_TENANT, "role": "admin"},
     "viewer-key-change-me-32": {"tenant_id": TEST_TENANT, "role": "viewer"},
     "other-key-change-me-32": {"tenant_id": OTHER_TENANT, "role": "admin"},
 })
 
-from fastapi.testclient import TestClient
+from fastapi.testclient import TestClient  # noqa: E402
 
-from app.main import app
-from app.store import claim_task, execute_step, fail_task, run_summary
+from app.main import app  # noqa: E402
+from app.store import claim_task, execute_step, fail_task, run_summary  # noqa: E402
 
 ADMIN = {"Authorization": "Bearer demo-key-change-me-32"}
 VIEWER = {"Authorization": "Bearer viewer-key-change-me-32"}

@@ -12,8 +12,11 @@ Invariants:
 4. Each step's demo side effect, step advancement, and audit record commit together. A unique `(tenant_id, idempotency_key)` constraint prevents a repeated step from making a second logical effect in this database.
 5. Each state change and administrative action writes an append-only event in the same transaction as that change.
 6. Retry count is bounded. Backoff is deterministic and capped so Demo Mode is repeatable. Exhausted work enters the dead-letter table and the workflow becomes failed.
-7. A tenant is derived from the authenticated API key; request data cannot choose or override it.
+7. A production tenant is derived from the authenticated user's workspace membership; Demo Mode maps its API key to a sandbox tenant. Request data cannot choose or override it.
 8. Queue admission checks a configured bound inside the enqueue transaction. The queue is durable, so accepted work survives API and worker process restarts.
+9. A transaction-scoped PostgreSQL advisory lock serializes workflow idempotency lookup and queue admission per tenant, preventing concurrent submissions from exceeding the configured bound or racing on the same key.
+10. Tenant event writes acquire a transaction-scoped ordering lock before allocating identity values, so a subscriber cursor cannot advance past an event that commits later with a lower ID.
+11. Published workflow versions are immutable rows. Each definition points to its current version; a run stores that version ID, hash, and a full definition snapshot so publishing a later version cannot change work already queued or running.
 
 ## Delivery semantics and transaction boundaries
 
@@ -24,8 +27,8 @@ Cancellation prevents new steps and asks an active worker to stop before committ
 ## Boundaries and flow
 
 ```text
-Untrusted client
-  | HTTPS in a real deployment; bearer API key, request-size/schema/rate limits
+Untrusted browser or webhook sender
+  | OIDC session + workspace selection / timestamped endpoint HMAC + body/rate limits
   v
 FastAPI (one supervisor process; request ID + structured logs)
   | tenant-scoped transactions / role checks
@@ -38,11 +41,13 @@ Coordinator thread -> worker subprocesses (allow-listed actions only)
   +-------+ -> polled SSE / metrics / operations dashboard
 ```
 
-The browser talks only to the API. API keys are supplied by environment configuration and never persisted by the server. DB credentials stay in environment variables. Dashboard data is tenant-scoped. Worker payloads are data; they cannot name a Python function or shell command. The default local Compose port binds to loopback. Production exposure requires TLS termination, secret rotation, backups, and managed database policy.
+The browser talks only to the API. Production browser sessions are opaque and stored as hashes; Demo API keys are supplied by environment configuration and never persisted by the server. Webhook signing keys and workspace integration bearer credentials are encrypted with an application key injected from a secret manager. Credential management is implemented, but the worker has no production provider action that consumes these values. DB credentials stay outside source control. Dashboard data is tenant-scoped. Worker payloads are data; they cannot name a Python function or shell command. The default local Compose port binds to loopback. Production exposure requires TLS termination, secret rotation, backups, and managed database policy.
 
 ## Dependencies and deployment choices
 
-FastAPI provides typed HTTP/OpenAPI validation. Psycopg provides PostgreSQL transactions and row locks. Uvicorn serves the API. PostgreSQL provides both durable state and work claiming, which is simpler than operating a second broker for this measured demo. Redis, Kafka, Celery, Kubernetes, cloud infrastructure, and third-party telemetry exporters are intentionally omitted until load or deployment evidence justifies their operating cost. Python 3.13 is used in the checked runtime and container because Python 3.12 was not installed in the build environment.
+FastAPI provides typed HTTP/OpenAPI validation. Authlib provides OIDC protocol handling; Cryptography/Fernet protects webhook signing keys at rest. Psycopg provides PostgreSQL transactions and row locks. Uvicorn serves the API. PostgreSQL provides both durable state and work claiming, which is simpler than operating a second broker for this measured workload. Redis, Kafka, Celery, Kubernetes, cloud infrastructure, and third-party telemetry exporters are intentionally omitted until load or deployment evidence justifies their operating cost. Python 3.13 is used in the checked runtime and container because Python 3.12 was not installed in the build environment.
+
+Numbered SQL files in `app/migrations/` are applied once, in filename order, under a PostgreSQL transaction lock. Files 001–003 establish and enforce immutable workflow versions; 004 adds OIDC identities, workspaces, memberships and revocable sessions; 005 removes a session constraint that incorrectly prevented natural expiry; 006 adds encrypted webhook secrets and durable inbox rows; 007 adds encrypted workspace credential records and versioned secret values. Applied migration files must be treated as immutable.
 
 ## Phase gates
 
@@ -59,5 +64,7 @@ FastAPI provides typed HTTP/OpenAPI validation. Psycopg provides PostgreSQL tran
 | P8 | Kill a real child worker and exercise deterministic recovery |
 | P9 | Measured load run and PostgreSQL query-plan evidence |
 | P10 | One-command local Demo Mode and reproducible evidence pack |
+| P11 | OIDC sessions, workspace RBAC, cross-workspace denial, fresh/upgrade migration checks |
+| P12 | Signed bounded webhook ingestion, secret rotation, duplicate protection, secret-free event metadata |
 
-Cloud deployment and managed-service security are separate operational work: no cloud account, deployment credentials, or running Docker daemon were present during this build. Local Compose files will be supplied, and deployment status will be reported accurately.
+Cloud deployment and managed-service security are separate operational work: no cloud account, deployment credentials, or running Docker daemon were present during this build. Local Compose files exist, but the runtime was not exercised in the latest identity/webhook verification.

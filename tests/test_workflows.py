@@ -1,14 +1,32 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import hmac
 import json
 import threading
+import time
 import uuid
 
+import pytest
 from psycopg import connect
+from psycopg.errors import RaiseException
 from psycopg.rows import dict_row
+from fastapi import HTTPException
 
 from app.settings import DATABASE_URL
-from app.store import claim_task, ingest_business_event
+from app.auth import SESSION_COOKIE, verified_oidc_profile
+from app.main import event_cursor, same_origin
+from app.store import (
+    QueueFull,
+    claim_task,
+    create_auth_session,
+    create_workflow,
+    emit_event,
+    ingest_business_event,
+    migrate,
+    upsert_oidc_user,
+)
 from tests.conftest import ADMIN, OTHER, TEST_TENANT, VIEWER, drive_run, get_run, make_workflow, random_tenant
 
 
@@ -22,6 +40,468 @@ def test_auth_roles_tenant_boundary_and_request_correlation(client):
     assert client.get(f"/api/workflows/{run_id}", headers=OTHER).status_code == 404
     correlated = client.get("/api/status", headers={**ADMIN, "X-Request-ID": "build-test-001"})
     assert correlated.headers["X-Request-ID"] == "build-test-001"
+
+
+def test_workspace_sessions_rbac_and_cross_workspace_isolation(client):
+    def cookie(token: str, workspace_id: str | None = None, request_id: str | None = None) -> dict[str, str]:
+        headers = {"Cookie": f"{SESSION_COOKIE}={token}"}
+        if workspace_id:
+            headers["X-Workspace-ID"] = workspace_id
+        if request_id:
+            headers["X-Request-ID"] = request_id
+        return headers
+
+    def signed_in(email: str):
+        with client.app.state.pool.connection() as conn, conn.transaction():
+            user = upsert_oidc_user(conn, "https://identity.example", str(uuid.uuid4()), email, email)
+            token = create_auth_session(conn, user["id"], "workspace-auth-test", 3600)
+        return user, token
+
+    owner, owner_token = signed_in("owner@example.test")
+    viewer, viewer_token = signed_in("viewer@example.test")
+    admin, admin_token = signed_in("admin@example.test")
+    outsider, outsider_token = signed_in("outsider@example.test")
+    created = client.post("/api/workspaces", headers=cookie(owner_token, request_id="workspace-create-test"),
+                          json={"name": "  Team Alpha  "})
+    assert created.status_code == 201, created.text
+    workspace_id = created.json()["id"]
+    assert created.json()["name"] == "Team Alpha" and created.json()["role"] == "OWNER"
+    assert client.get("/api/workspaces", headers=cookie(owner_token)).json() == [
+        {"id": workspace_id, "name": "Team Alpha", "role": "OWNER"}
+    ]
+
+    member = client.put(f"/api/workspaces/{workspace_id}/members", headers=cookie(owner_token, workspace_id),
+                        json={"user_id": viewer["id"], "role": "VIEWER"})
+    assert member.status_code == 200, member.text
+    assert client.get("/api/status", headers=cookie(viewer_token, workspace_id)).status_code == 200
+    body = {"title": "viewer write", "steps": [{"name": "record", "action": "record", "payload": {}}]}
+    assert client.post("/api/workflows", headers=cookie(viewer_token, workspace_id), json=body).status_code == 403
+
+    promoted = client.put(f"/api/workspaces/{workspace_id}/members", headers=cookie(owner_token, workspace_id),
+                          json={"user_id": viewer["id"], "role": "DEVELOPER"})
+    assert promoted.status_code == 200
+    run_response = client.post("/api/workflows", headers=cookie(viewer_token, workspace_id), json=body)
+    assert run_response.status_code == 202, run_response.text
+
+    elevated = client.put(f"/api/workspaces/{workspace_id}/members", headers=cookie(owner_token, workspace_id),
+                          json={"user_id": viewer["id"], "role": "ADMIN"})
+    assert elevated.status_code == 200
+    assert client.put(f"/api/workspaces/{workspace_id}/members", headers=cookie(owner_token, workspace_id),
+                      json={"user_id": admin["id"], "role": "ADMIN"}).status_code == 200
+    assert client.put(f"/api/workspaces/{workspace_id}/members", headers=cookie(admin_token, workspace_id),
+                      json={"user_id": owner["id"], "role": "DEVELOPER"}).status_code == 403
+    assert client.delete(f"/api/workspaces/{workspace_id}/members/{owner['id']}",
+                         headers=cookie(admin_token, workspace_id)).status_code == 403
+    self_promotion = client.put(f"/api/workspaces/{workspace_id}/members", headers=cookie(viewer_token, workspace_id),
+                                json={"user_id": viewer["id"], "role": "OWNER"})
+    assert self_promotion.status_code == 403
+    assert client.delete(f"/api/workspaces/{workspace_id}/members/{owner['id']}",
+                         headers=cookie(owner_token, workspace_id)).status_code == 409
+
+    other_workspace = client.post("/api/workspaces", headers=cookie(outsider_token), json={"name": "Team Beta"})
+    assert other_workspace.status_code == 201, other_workspace.text
+    other_id = other_workspace.json()["id"]
+    assert client.post("/api/workspaces", headers=cookie(owner_token), json={"name": "Team Gamma"}).status_code == 201
+    assert client.get("/api/status", headers=cookie(owner_token)).status_code == 400
+    assert client.get("/api/status", headers=cookie(owner_token, workspace_id)).status_code == 200
+    assert client.get("/api/status", headers=cookie(outsider_token, workspace_id)).status_code == 404
+    assert client.get(f"/api/workflows/{run_response.json()['id']}",
+                      headers=cookie(outsider_token, other_id)).status_code == 404
+    assert client.get(f"/api/workspaces/{other_id}/members",
+                      headers=cookie(owner_token, workspace_id)).status_code == 404
+
+    with client.app.state.pool.connection() as conn:
+        fingerprint = hashlib.sha256(owner_token.encode()).hexdigest()
+        assert conn.execute("SELECT 1 FROM auth_sessions WHERE token_hash=%s", (owner_token,)).fetchone() is None
+        assert conn.execute("SELECT 1 FROM auth_sessions WHERE token_hash=%s", (fingerprint,)).fetchone()
+        assert conn.execute(
+            "SELECT count(*) AS n FROM events WHERE tenant_id=%s AND kind LIKE 'workspace.%%'", (workspace_id,)
+        ).fetchone()["n"] >= 3
+
+    assert client.post("/auth/logout", headers=cookie(owner_token)).status_code == 204
+    assert client.get("/api/me", headers=cookie(owner_token)).status_code == 401
+    with client.app.state.pool.connection() as conn:
+        assert conn.execute(
+            "SELECT count(*) AS n FROM identity_events WHERE user_id=%s AND kind IN ('auth.login','auth.logout')",
+            (owner["id"],),
+        ).fetchone()["n"] == 2
+
+
+def test_session_expiry_and_origin_check_fail_closed(client):
+    with client.app.state.pool.connection() as conn, conn.transaction():
+        user = upsert_oidc_user(conn, "https://identity.example", str(uuid.uuid4()),
+                                "expired@example.test", "Expired User")
+        token = create_auth_session(conn, user["id"], "expiry-test", 3600)
+        conn.execute("UPDATE auth_sessions SET expires_at=clock_timestamp()-interval '1 second' WHERE user_id=%s",
+                     (user["id"],))
+    assert client.get("/api/workspaces", headers={"Cookie": f"{SESSION_COOKIE}={token}"}).status_code == 401
+    assert same_origin("https://relay.example.test", "https://relay.example.test/auth/callback")
+    assert not same_origin("https://evil.example.test", "https://relay.example.test/auth/callback")
+    assert not same_origin(None, "https://relay.example.test/auth/callback")
+
+
+def test_workspace_membership_mutations_require_a_real_owner_session(client):
+    response = client.put(f"/api/workspaces/{TEST_TENANT}/members", headers=ADMIN,
+                          json={"user_id": str(uuid.uuid4()), "role": "VIEWER"})
+    assert response.status_code == 403
+
+
+def test_dashboard_uses_session_auth_and_requires_workspace_selection():
+    from pathlib import Path
+
+    html = Path(__file__).parents[1].joinpath("app", "static", "index.html").read_text(encoding="utf-8")
+    assert "href=\"/auth/login\"" in html
+    assert "credentials:'same-origin'" in html
+    assert "X-Workspace-ID" in html
+    assert "headers:{Authorization:'Bearer '+keyInput.value.trim()" not in html
+
+
+def test_oidc_configuration_requires_complete_https_credentials(monkeypatch):
+    import app.settings as settings
+
+    names = ("RELAYCORE_OIDC_ISSUER", "RELAYCORE_OIDC_CLIENT_ID",
+             "RELAYCORE_OIDC_CLIENT_SECRET", "RELAYCORE_OIDC_REDIRECT_URI",
+             "RELAYCORE_OIDC_STATE_SECRET", "RELAYCORE_OIDC_DISCOVERY_URL")
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+    assert settings.oidc_settings() is None
+
+    config = {
+        "RELAYCORE_OIDC_ISSUER": "https://identity.example.test",
+        "RELAYCORE_OIDC_CLIENT_ID": "relaycore",
+        "RELAYCORE_OIDC_CLIENT_SECRET": "client-secret",
+        "RELAYCORE_OIDC_REDIRECT_URI": "https://relay.example.test/auth/callback",
+        "RELAYCORE_OIDC_STATE_SECRET": "s" * 40,
+    }
+    for name, value in config.items():
+        monkeypatch.setenv(name, value)
+    assert settings.oidc_settings()["RELAYCORE_OIDC_DISCOVERY_URL"] == (
+        "https://identity.example.test/.well-known/openid-configuration"
+    )
+    monkeypatch.setenv("RELAYCORE_OIDC_ISSUER", "http://identity.example.test")
+    with pytest.raises(RuntimeError, match="HTTPS"):
+        settings.oidc_settings()
+
+
+def test_oidc_identity_rejects_unverified_or_wrong_issuer_claims():
+    claims = {"iss": "https://identity.example.test", "sub": "subject-1",
+              "email": "user@example.test", "email_verified": True, "name": "Example User"}
+    assert verified_oidc_profile(claims, "https://identity.example.test") == (
+        "https://identity.example.test", "subject-1", "user@example.test", "Example User"
+    )
+    for invalid in ({**claims, "email_verified": False},
+                    {**claims, "email_verified": "true"},
+                    {**claims, "iss": "https://attacker.example.test"},
+                    {**claims, "sub": ""}, {**claims, "email": "invalid"}):
+        with pytest.raises(ValueError):
+            verified_oidc_profile(invalid, "https://identity.example.test")
+
+
+def test_webhook_encryption_key_rejects_invalid_configuration(monkeypatch):
+    from cryptography.fernet import Fernet
+    from app.settings import secret_encryption_key
+
+    generated = Fernet.generate_key().decode()
+    monkeypatch.setenv("RELAYCORE_SECRET_ENCRYPTION_KEY", generated)
+    assert secret_encryption_key() == generated.encode()
+    monkeypatch.setenv("RELAYCORE_SECRET_ENCRYPTION_KEY", "not-a-fernet-key")
+    with pytest.raises(RuntimeError, match="Fernet"):
+        secret_encryption_key()
+    monkeypatch.delenv("RELAYCORE_SECRET_ENCRYPTION_KEY")
+    assert secret_encryption_key() is None
+    with pytest.raises(RuntimeError, match="required"):
+        secret_encryption_key(required=True)
+
+
+def test_workspace_credentials_are_encrypted_scoped_rotatable_and_revocable(client, monkeypatch):
+    from cryptography.fernet import Fernet
+    from app.secretbox import decrypt_secret
+    from app.settings import secret_encryption_key
+    from app.store import workspace_credential_secret
+
+    monkeypatch.setenv("RELAYCORE_SECRET_ENCRYPTION_KEY", Fernet.generate_key().decode())
+    owner_email = "credential-owner@example.test"
+    with client.app.state.pool.connection() as conn, conn.transaction():
+        user = upsert_oidc_user(conn, "https://identity.example", str(uuid.uuid4()), owner_email, owner_email)
+        token = create_auth_session(conn, user["id"], "credential-auth-test", 3600)
+    headers = {"Cookie": f"{SESSION_COOKIE}={token}"}
+    workspace = client.post("/api/workspaces", headers=headers, json={"name": "Credential Team"})
+    assert workspace.status_code == 201, workspace.text
+    workspace_id = workspace.json()["id"]
+    scoped_headers = {**headers, "X-Workspace-ID": workspace_id}
+    path = f"/api/workspaces/{workspace_id}/credentials"
+    first_secret = "ghp_" + "a" * 36
+    rejected_short_secret = client.post(path, headers={**scoped_headers, "Idempotency-Key": "credential:short"},
+                                        json={"provider": "github", "name": "short", "secret": "too-short"})
+    assert rejected_short_secret.status_code == 422
+    assert "too-short" not in rejected_short_secret.text
+    rejected_extra_field = client.post(
+        path, headers={**scoped_headers, "Idempotency-Key": "credential:extra"},
+        json={"provider": "github", "name": "extra", "secret": first_secret, "unexpected": True},
+    )
+    assert rejected_extra_field.status_code == 422
+    assert first_secret not in rejected_extra_field.text
+    create_headers = {**scoped_headers, "Idempotency-Key": "credential:create:one"}
+    created = client.post(path, headers=create_headers,
+                          json={"provider": "github", "name": "build bot", "secret": first_secret})
+    assert created.status_code == 201, created.text
+    credential = created.json()
+    assert credential["created"] is True and "secret" not in credential
+    retried = client.post(path, headers=create_headers,
+                          json={"provider": "github", "name": "build bot", "secret": first_secret})
+    assert retried.status_code == 201 and retried.json()["created"] is False
+    assert client.post(path, headers=create_headers,
+                       json={"provider": "github", "name": "build bot", "secret": "ghp_" + "b" * 36}).status_code == 409
+
+    key = secret_encryption_key(required=True)
+    with client.app.state.pool.connection() as conn:
+        stored = conn.execute(
+            "SELECT encrypted_secret,secret_fingerprint FROM integration_credential_secrets WHERE credential_id=%s",
+            (credential["id"],),
+        ).fetchone()
+        assert stored["encrypted_secret"] != first_secret
+        assert decrypt_secret(stored["encrypted_secret"], key) == first_secret
+        assert workspace_credential_secret(conn, workspace_id, credential["id"], key) == {
+            "provider": "github", "secret": first_secret,
+        }
+        assert workspace_credential_secret(conn, "another-workspace", credential["id"], key) is None
+
+    second_secret = "ghp_" + "c" * 36
+    rotate_headers = {**scoped_headers, "Idempotency-Key": "credential:rotate:one"}
+    rotated = client.post(f"{path}/{credential['id']}/rotate", headers=rotate_headers,
+                          json={"secret": second_secret})
+    assert rotated.status_code == 200 and rotated.json()["version"] == 2
+    assert client.post(f"{path}/{credential['id']}/rotate", headers=rotate_headers,
+                       json={"secret": second_secret}).json()["created"] is False
+    with client.app.state.pool.connection() as conn:
+        assert workspace_credential_secret(conn, workspace_id, credential["id"], key) == {
+            "provider": "github", "secret": second_secret,
+        }
+    listed = client.get(path, headers=scoped_headers)
+    assert listed.status_code == 200
+    assert listed.json()[0]["version"] == 2
+    assert "secret" not in listed.text and first_secret not in listed.text and second_secret not in listed.text
+    assert client.delete(f"{path}/{credential['id']}", headers=scoped_headers).status_code == 204
+    with client.app.state.pool.connection() as conn:
+        assert workspace_credential_secret(conn, workspace_id, credential["id"], key) is None
+        secrets = conn.execute(
+            "SELECT count(*) AS n FROM integration_credential_secrets "
+            "WHERE credential_id=%s AND revoked_at IS NOT NULL", (credential["id"],),
+        ).fetchone()["n"]
+        assert secrets == 2
+
+
+def test_workspace_webhooks_verify_signatures_and_dedupe_replays(client, monkeypatch):
+    from app.secretbox import decrypt_secret
+    from app.settings import secret_encryption_key
+
+    email = "webhook-owner@example.test"
+    with client.app.state.pool.connection() as conn, conn.transaction():
+        user = upsert_oidc_user(conn, "https://identity.example", str(uuid.uuid4()), email, email)
+        session_token = create_auth_session(conn, user["id"], "webhook-auth-test", 3600)
+    headers = {"Cookie": f"{SESSION_COOKIE}={session_token}"}
+    created_workspace = client.post("/api/workspaces", headers=headers, json={"name": "Webhook Team"})
+    assert created_workspace.status_code == 201, created_workspace.text
+    workspace_id = created_workspace.json()["id"]
+    workspace_headers = {**headers, "X-Workspace-ID": workspace_id}
+
+    create_headers = {**workspace_headers, "Idempotency-Key": "webhook:create:one"}
+    created = client.post(f"/api/workspaces/{workspace_id}/webhooks", headers=create_headers,
+                          json={"name": "Build events"})
+    assert created.status_code == 201, created.text
+    endpoint_id, secret = created.json()["id"], created.json()["secret"]
+    retried = client.post(f"/api/workspaces/{workspace_id}/webhooks", headers=create_headers,
+                          json={"name": "Build events"})
+    assert retried.json()["id"] == endpoint_id and retried.json()["secret"] == secret
+    assert retried.json()["created"] is False
+    assert client.post(f"/api/workspaces/{workspace_id}/webhooks", headers=create_headers,
+                       json={"name": "Different name"}).status_code == 409
+    listing = client.get(f"/api/workspaces/{workspace_id}/webhooks", headers=workspace_headers)
+    assert listing.status_code == 200 and len(listing.json()) == 1
+    assert "secret" not in listing.json()[0] and "encrypted_secret" not in listing.json()[0]
+    trigger = {"endpoint_id": endpoint_id, "event_type": "push"}
+    definition_headers = {**workspace_headers, "Idempotency-Key": "webhook-workflow:create"}
+    definition_body = {"title": "Push workflow", "steps": [
+        {"name": "record push", "action": "record", "payload": {"source": "webhook"}},
+    ], "trigger": trigger}
+    definition = client.post("/api/workflow-definitions", headers=definition_headers, json=definition_body)
+    assert definition.status_code == 201, definition.text
+    bad_trigger = {**definition_body, "trigger": {"endpoint_id": str(uuid.uuid4()), "event_type": "push"}}
+    assert client.post("/api/workflow-definitions", headers={**workspace_headers,
+                       "Idempotency-Key": "webhook-workflow:other-tenant"}, json=bad_trigger).status_code == 404
+
+    def signed_headers(event_key: str, body: bytes, signing_secret: str, timestamp: str | None = None):
+        timestamp = timestamp or str(int(time.time()))
+        content = timestamp.encode() + b"\n" + event_key.encode() + b"\n" + body
+        digest = hmac.new(signing_secret.encode(), content, hashlib.sha256).hexdigest()
+        return {"X-RelayCore-Event-ID": event_key, "X-RelayCore-Timestamp": timestamp,
+                "X-RelayCore-Signature": "sha256=" + digest, "Content-Type": "application/json"}
+
+    body = b'{"type":"push","repository":"acme/relay","action":"push"}'
+    endpoint_url = f"/hooks/{endpoint_id}"
+    assert client.post(endpoint_url, content=body, headers=signed_headers("push-1", body, secret,
+                      str(int(time.time()) - 600))).status_code == 401
+    assert client.post(endpoint_url, content=body, headers={**signed_headers("bad-signature", body, secret),
+                      "X-RelayCore-Signature": "sha256=" + "0" * 64}).status_code == 401
+    too_large = b"{" + b" " * (256 * 1024)
+    assert client.post(endpoint_url, content=too_large, headers=signed_headers("large", too_large, secret)).status_code == 413
+    malformed = b"not-json"
+    assert client.post(endpoint_url, content=malformed,
+                       headers=signed_headers("malformed", malformed, secret)).status_code == 400
+    non_object = b"[]"
+    assert client.post(endpoint_url, content=non_object,
+                       headers=signed_headers("non-object", non_object, secret)).status_code == 422
+
+    import app.store as store
+    queued_body = b'{"type":"push","repository":"acme/relay","action":"push"}'
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "MAX_QUEUE_DEPTH", 0)
+        blocked = client.post(endpoint_url, content=queued_body,
+                              headers=signed_headers("queue-full", queued_body, secret))
+        assert blocked.status_code == 429
+    with client.app.state.pool.connection() as conn:
+        assert conn.execute("SELECT 1 FROM incoming_events WHERE endpoint_id=%s AND event_key='queue-full'",
+                            (endpoint_id,)).fetchone() is None
+
+    first = client.post(endpoint_url, content=body, headers=signed_headers("push-1", body, secret))
+    duplicate = client.post(endpoint_url, content=body, headers=signed_headers("push-1", body, secret))
+    assert first.status_code == 202 and first.json()["duplicate"] is False
+    assert len(first.json()["triggered_runs"]) == 1
+    first_run = first.json()["triggered_runs"][0]
+    assert first_run["version"] == 1 and first_run["created"] is True
+    assert duplicate.status_code == 202 and duplicate.json()["duplicate"] is True
+    assert duplicate.json()["triggered_runs"] == []
+    changed_body = b'{"repository":"attacker/changed"}'
+    assert client.post(endpoint_url, content=changed_body,
+                       headers=signed_headers("push-1", changed_body, secret)).status_code == 409
+    assert client.get(f"/api/workflows/{first_run['run_id']}", headers=workspace_headers).json()[
+        "workflow_version_id"] == definition.json()["version_id"]
+
+    version_body = {**definition_body, "title": "Push workflow v2", "trigger": trigger}
+    version = client.post(f"/api/workflow-definitions/{definition.json()['id']}/versions",
+                          headers={**workspace_headers, "Idempotency-Key": "webhook-workflow:version:two"},
+                          json=version_body)
+    assert version.status_code == 201, version.text
+
+    with client.app.state.pool.connection() as conn:
+        row = conn.execute("SELECT encrypted_secret FROM webhook_secrets WHERE endpoint_id=%s AND version=1",
+                           (endpoint_id,)).fetchone()
+        assert row["encrypted_secret"] != secret
+        assert decrypt_secret(row["encrypted_secret"], secret_encryption_key()) == secret
+
+    rotation_headers = {**workspace_headers, "Idempotency-Key": "webhook:rotate:one"}
+    rotated = client.post(f"/api/workspaces/{workspace_id}/webhooks/{endpoint_id}/rotate",
+                          headers=rotation_headers)
+    assert rotated.status_code == 200, rotated.text
+    next_secret = rotated.json()["secret"]
+    assert next_secret != secret and rotated.json()["version"] == 2
+    assert client.post(endpoint_url, content=body, headers=signed_headers("old-secret", body, secret)).status_code == 401
+    retry_rotation = client.post(f"/api/workspaces/{workspace_id}/webhooks/{endpoint_id}/rotate",
+                                 headers=rotation_headers)
+    assert retry_rotation.json()["secret"] == next_secret and retry_rotation.json()["created"] is False
+    unmatched_body = b'{"type":"issue","repository":"acme/relay"}'
+    unmatched = client.post(endpoint_url, content=unmatched_body,
+                             headers=signed_headers("issue-1", unmatched_body, next_secret))
+    assert unmatched.status_code == 202 and unmatched.json()["triggered_runs"] == []
+    accepted = client.post(endpoint_url, content=body, headers=signed_headers("push-2", body, next_secret))
+    assert accepted.status_code == 202 and accepted.json()["duplicate"] is False
+    assert accepted.json()["triggered_runs"][0]["version"] == 2
+    import app.main as main
+    production_body = b'{"type":"push","repository":"acme/relay","action":"push"}'
+    with monkeypatch.context() as patch:
+        patch.setattr(main, "DEMO_MODE", False)
+        production = client.post(endpoint_url, content=production_body,
+                                 headers=signed_headers("production-mode", production_body, next_secret))
+        assert production.status_code == 202 and production.json()["triggered_runs"] == []
+
+    with client.app.state.pool.connection() as conn:
+        assert conn.execute("SELECT count(*) AS n FROM incoming_events WHERE endpoint_id=%s",
+                            (endpoint_id,)).fetchone()["n"] == 4
+        events = conn.execute("SELECT data FROM events WHERE tenant_id=%s AND kind='webhook.received'",
+                              (workspace_id,)).fetchall()
+        assert len(events) == 4
+        assert secret not in json.dumps(events)
+    first_page = client.get("/api/events", headers=workspace_headers, params={"limit": 2})
+    assert first_page.status_code == 200 and len(first_page.json()["items"]) == 2
+    assert first_page.json()["next_cursor"]
+    assert "payload" not in first_page.json()["items"][0]
+    second_page = client.get("/api/events", headers=workspace_headers,
+                             params={"limit": 2, "cursor": first_page.json()["next_cursor"]})
+    assert len(second_page.json()["items"]) == 2 and second_page.json()["next_cursor"] is None
+    assert client.get("/api/events", headers=workspace_headers,
+                      params={"cursor": "invalid"}).status_code == 400
+    assert client.delete(f"/api/workspaces/{workspace_id}/webhooks/{endpoint_id}",
+                         headers=workspace_headers).status_code == 204
+    assert client.post(endpoint_url, content=body,
+                       headers=signed_headers("after-revoke", body, next_secret)).status_code == 404
+
+
+def test_workflow_versions_are_immutable_and_runs_pin_the_selected_version(client):
+    headers = {**ADMIN, "Idempotency-Key": f"definition:{uuid.uuid4()}",
+               "X-Request-ID": "version-create-test"}
+    first = client.post("/api/workflow-definitions", headers=headers, json={
+        "title": "versioned flow",
+        "steps": [{"name": "record value", "action": "record", "payload": {"value": 1}}],
+    })
+    assert first.status_code == 201, first.text
+    workflow_id = first.json()["id"]
+    assert first.headers["X-Request-ID"] == "version-create-test"
+    assert client.post("/api/workflow-definitions", headers=headers, json={
+        "title": "versioned flow",
+        "steps": [{"name": "record value", "action": "record", "payload": {"value": 1}}],
+    }).json()["created"] is False
+
+    second = client.post(f"/api/workflow-definitions/{workflow_id}/versions",
+                         headers={**ADMIN, "Idempotency-Key": f"version:{uuid.uuid4()}",
+                                  "X-Request-ID": "version-publish-test"}, json={
+        "title": "versioned flow",
+        "steps": [{"name": "record value", "action": "record", "payload": {"value": 2}}],
+    })
+    assert second.status_code == 201, second.text
+    with client.app.state.pool.connection() as conn:
+        assert conn.execute(
+            "SELECT request_id FROM events WHERE kind='workflow.version_published' AND data->>'workflow_id'=%s ORDER BY sequence",
+            (workflow_id,),
+        ).fetchall() == [
+            {"request_id": "version-create-test"}, {"request_id": "version-publish-test"}
+        ]
+    version_id = second.json()["id"]
+
+    run_key = f"version-run:{uuid.uuid4()}"
+    run_response = client.post(f"/api/workflow-definitions/{workflow_id}/runs",
+                               headers={**ADMIN, "Idempotency-Key": run_key})
+    assert run_response.status_code == 202, run_response.text
+    run_id = run_response.json()["id"]
+    run_hash = get_run(client, run_id)["definition_hash"]
+
+    third = client.post(f"/api/workflow-definitions/{workflow_id}/versions",
+                        headers={**ADMIN, "Idempotency-Key": f"version:{uuid.uuid4()}"}, json={
+        "title": "versioned flow",
+        "steps": [{"name": "record value", "action": "record", "payload": {"value": 3}}],
+    })
+    assert third.status_code == 201, third.text
+    retried = client.post(f"/api/workflow-definitions/{workflow_id}/runs",
+                          headers={**ADMIN, "Idempotency-Key": run_key})
+    assert retried.status_code == 202, retried.text
+    assert retried.json()["id"] == run_id and retried.json()["created"] is False
+
+    run = get_run(client, run_id)
+    assert run["workflow_version_id"] == version_id
+    assert run["definition"]["steps"][0]["payload"]["value"] == 2
+    assert run["definition_hash"] == run_hash
+    drive_run(client)
+    assert get_run(client, run_id)["side_effects"][0]["result"]["value"] == 2
+    with connect(DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.transaction():
+            with pytest.raises(RaiseException, match="workflow versions are immutable"):
+                conn.execute("UPDATE workflow_versions SET version_number=99 WHERE id=%s", (version_id,))
+        with conn.transaction():
+            with pytest.raises(RaiseException, match="workflow versions are immutable"):
+                conn.execute("DELETE FROM workflow_versions WHERE id=%s", (version_id,))
+    versions = client.get(f"/api/workflow-definitions/{workflow_id}", headers=ADMIN).json()["versions"]
+    assert [version["version_number"] for version in versions] == [1, 2, 3]
+    assert "author_credential_fingerprint" not in versions[0]
+    assert client.get(f"/api/workflow-definitions/{workflow_id}", headers=OTHER).status_code == 404
 
 
 def test_idempotent_workflow_creation_and_durable_history(client):
@@ -176,3 +656,218 @@ def test_concurrent_duplicate_delivery_creates_one_logical_event(client):
         event = conn.execute("SELECT received_count FROM business_events WHERE tenant_id=%s AND event_key=%s",
                              (tenant, key)).fetchone()
         assert event["received_count"] == 2
+
+
+def test_concurrent_workflow_idempotency_returns_one_run(client):
+    tenant, key = random_tenant(), f"same-request-{uuid.uuid4()}"
+    barrier = threading.Barrier(2)
+    results = []
+
+    def submit():
+        with connect(DATABASE_URL, row_factory=dict_row) as conn, conn.transaction():
+            barrier.wait()
+            results.append(create_workflow(
+                conn, tenant, "same workflow", [{"name": "record", "action": "record", "payload": {}}], key, "race"
+            ))
+
+    threads = [threading.Thread(target=submit) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert len(results) == 2
+    assert sum(result["created"] for result in results) == 1
+    assert len({result["id"] for result in results}) == 1
+
+
+def test_concurrent_admissions_respect_tenant_queue_limit(client, monkeypatch):
+    import app.store as store
+
+    tenant = random_tenant()
+    monkeypatch.setattr(store, "MAX_QUEUE_DEPTH", 1)
+    barrier = threading.Barrier(2)
+    outcomes = []
+
+    def submit(index):
+        try:
+            with connect(DATABASE_URL, row_factory=dict_row) as conn, conn.transaction():
+                barrier.wait()
+                outcomes.append(create_workflow(
+                    conn, tenant, f"workflow {index}",
+                    [{"name": "record", "action": "record", "payload": {}}],
+                    f"capacity-{index}-{uuid.uuid4()}", "race",
+                ))
+        except QueueFull:
+            outcomes.append("full")
+
+    threads = [threading.Thread(target=submit, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert len(outcomes) == 2
+    assert sum(outcome == "full" for outcome in outcomes) == 1
+
+
+def test_event_cursor_resumes_after_last_event_id():
+    assert event_cursor(None, "42") == 42
+    assert event_cursor(50, "42") == 50
+    with pytest.raises(HTTPException) as error:
+        event_cursor(None, "not-a-sequence")
+    assert error.value.status_code == 400
+    with pytest.raises(HTTPException):
+        event_cursor(None, "-1")
+
+
+def test_event_stream_reads_and_advances_cursor(client):
+    import app.main as main
+    from app.auth import Principal
+
+    class DisconnectAfterOneChunk:
+        disconnected = False
+
+        async def is_disconnected(self):
+            if self.disconnected:
+                return True
+            self.disconnected = True
+            return False
+
+    response = asyncio.run(main.event_stream(
+        DisconnectAfterOneChunk(), after=0, last_event_id=None,
+        user=Principal(TEST_TENANT, "admin", "sse-test"), pool=client.app.state.pool,
+    ))
+
+    async def read_stream():
+        return [chunk async for chunk in response.body_iterator]
+
+    chunks = asyncio.run(read_stream())
+    assert chunks and any("event: workflow" in chunk or "keepalive" in chunk for chunk in chunks)
+
+
+def test_non_demo_mode_hides_worker_metadata_and_rejects_simulated_actions(client, monkeypatch):
+    import app.main as main
+
+    monkeypatch.setattr(main, "DEMO_MODE", False)
+    status = client.get("/api/status", headers=ADMIN)
+    assert status.status_code == 200
+    assert status.json()["workers"] == []
+    response = make_workflow(client)
+    assert response.status_code == 501
+
+
+def test_tenant_event_ids_follow_transaction_commit_order(client):
+    tenant = random_tenant()
+    first_inserted, allow_first_commit = threading.Event(), threading.Event()
+    second_started, second_inserted = threading.Event(), threading.Event()
+
+    def write_first():
+        with connect(DATABASE_URL, row_factory=dict_row) as conn, conn.transaction():
+            emit_event(conn, tenant, "ordered.first")
+            first_inserted.set()
+            assert allow_first_commit.wait(5)
+
+    def write_second():
+        first_inserted.wait(5)
+        second_started.set()
+        with connect(DATABASE_URL, row_factory=dict_row) as conn, conn.transaction():
+            emit_event(conn, tenant, "ordered.second")
+            second_inserted.set()
+
+    first = threading.Thread(target=write_first)
+    second = threading.Thread(target=write_second)
+    first.start()
+    second.start()
+    try:
+        assert first_inserted.wait(5)
+        assert second_started.wait(5)
+        assert not second_inserted.wait(0.2)
+    finally:
+        allow_first_commit.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+    assert not first.is_alive() and not second.is_alive()
+
+    with client.app.state.pool.connection() as conn:
+        kinds = conn.execute(
+            "SELECT kind FROM events WHERE tenant_id=%s ORDER BY sequence", (tenant,)
+        ).fetchall()
+    assert [row["kind"] for row in kinds] == ["ordered.first", "ordered.second"]
+
+
+def test_versioned_migrations_bootstrap_and_skip_applied_files():
+    schema = f"migration_test_{uuid.uuid4().hex}"
+    with connect(DATABASE_URL, autocommit=True, row_factory=dict_row) as conn:
+        conn.execute(f'CREATE SCHEMA "{schema}"')
+        try:
+            conn.execute(f'SET search_path TO "{schema}"')
+            migrate(conn)
+            migrate(conn)
+            assert conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall() == [
+                {"version": "001"}, {"version": "002"}, {"version": "003"},
+                {"version": "004"}, {"version": "005"}, {"version": "006"}, {"version": "007"}
+            ]
+            assert conn.execute("SELECT count(*) AS n FROM tasks").fetchone()["n"] == 0
+            tables = conn.execute(
+                """SELECT table_name FROM information_schema.tables
+                   WHERE table_schema=current_schema() AND table_name=ANY(%s) ORDER BY table_name""",
+                (["users", "workspaces", "workspace_members", "auth_sessions", "identity_events"],),
+            ).fetchall()
+            assert len(tables) == 5
+            webhook_tables = conn.execute(
+                """SELECT table_name FROM information_schema.tables
+                   WHERE table_schema=current_schema() AND table_name=ANY(%s)""",
+                (["webhook_endpoints", "webhook_secrets", "incoming_events"],),
+            ).fetchall()
+            assert len(webhook_tables) == 3
+            credential_tables = conn.execute(
+                """SELECT table_name FROM information_schema.tables
+                   WHERE table_schema=current_schema() AND table_name=ANY(%s)""",
+                (["integration_credentials", "integration_credential_secrets"],),
+            ).fetchall()
+            assert len(credential_tables) == 2
+            assert conn.execute(
+                """SELECT column_name FROM information_schema.columns
+                   WHERE table_schema=current_schema() AND table_name='workflow_versions'
+                     AND column_name='author_user_id'"""
+            ).fetchone() == {"column_name": "author_user_id"}
+        finally:
+            conn.execute("SET search_path TO public")
+            conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
+
+
+def test_workflow_version_migration_upgrades_an_existing_001_database():
+    from pathlib import Path
+
+    schema = f"migration_upgrade_{uuid.uuid4().hex}"
+    initial = Path(__file__).parents[1] / "app" / "migrations" / "001_initial.sql"
+    with connect(DATABASE_URL, autocommit=True, row_factory=dict_row) as conn:
+        conn.execute(f'CREATE SCHEMA "{schema}"')
+        try:
+            conn.execute(f'SET search_path TO "{schema}"')
+            conn.execute(initial.read_text(encoding="utf-8"), prepare=False)
+            conn.execute("""CREATE TABLE schema_migrations (
+                           version TEXT PRIMARY KEY,
+                           applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp())""")
+            conn.execute("INSERT INTO schema_migrations(version) VALUES ('001')")
+            migrate(conn)
+            assert conn.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            ).fetchall() == [
+                {"version": "001"}, {"version": "002"}, {"version": "003"},
+                {"version": "004"}, {"version": "005"}, {"version": "006"}, {"version": "007"}
+            ]
+            columns = conn.execute(
+                """SELECT column_name FROM information_schema.columns
+                   WHERE table_schema=%s AND table_name='workflow_runs' AND column_name='workflow_version_id'""",
+                (schema,),
+            ).fetchall()
+            assert columns == [{"column_name": "workflow_version_id"}]
+            assert conn.execute(
+                """SELECT 1 FROM information_schema.tables
+                   WHERE table_schema=%s AND table_name='workspace_members'""", (schema,)
+            ).fetchone()
+        finally:
+            conn.execute("SET search_path TO public")
+            conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
