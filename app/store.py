@@ -49,6 +49,10 @@ class WebhookEndpointNotFound(Exception):
     pass
 
 
+class GithubInstallationConflict(Exception):
+    pass
+
+
 def migrate(conn: Connection) -> None:
     from pathlib import Path
 
@@ -146,6 +150,170 @@ def workspace_membership(conn: Connection, workspace_id: str, user_id: str) -> d
            WHERE m.workspace_id=%s AND m.user_id=%s""",
         (workspace_id, user_id),
     ).fetchone()
+
+
+def create_github_oauth_state(
+    conn: Connection, workspace_id: str, user_id: str, state_hash: str, verifier_encrypted: str,
+) -> None:
+    conn.execute("DELETE FROM github_oauth_states WHERE expires_at<=clock_timestamp()")
+    conn.execute(
+        """INSERT INTO github_oauth_states(state_hash,workspace_id,user_id,verifier_encrypted)
+           VALUES (%s,%s,%s,%s)""", (state_hash, workspace_id, user_id, verifier_encrypted),
+    )
+
+
+def github_oauth_state(conn: Connection, state_hash: str) -> dict[str, Any] | None:
+    return conn.execute(
+        """SELECT state_hash,workspace_id,user_id,installation_id,verifier_encrypted
+           FROM github_oauth_states WHERE state_hash=%s AND expires_at>clock_timestamp()""",
+        (state_hash,),
+    ).fetchone()
+
+
+def discard_github_oauth_state(conn: Connection, state_hash: str) -> None:
+    conn.execute("DELETE FROM github_oauth_states WHERE state_hash=%s", (state_hash,))
+
+
+def bind_github_oauth_installation(conn: Connection, state_hash: str, installation_id: int) -> bool:
+    return bool(conn.execute(
+        """UPDATE github_oauth_states SET installation_id=%s
+           WHERE state_hash=%s AND expires_at>clock_timestamp()
+             AND (installation_id IS NULL OR installation_id=%s) RETURNING state_hash""",
+        (installation_id, state_hash, installation_id),
+    ).fetchone())
+
+
+def finish_github_installation(
+    conn: Connection, state_hash: str, user_id: str, installation_id: int,
+    account_id: int, account_login: str, account_type: str, request_id: str, encryption_key: bytes,
+) -> dict[str, Any] | None:
+    state = conn.execute(
+        """SELECT workspace_id,user_id,installation_id FROM github_oauth_states
+           WHERE state_hash=%s AND expires_at>clock_timestamp() FOR UPDATE""", (state_hash,),
+    ).fetchone()
+    if not state or state["user_id"] != user_id or state["installation_id"] != installation_id:
+        return None
+    member = workspace_membership(conn, state["workspace_id"], user_id)
+    if not member or member["role"] not in {"OWNER", "ADMIN"}:
+        return None
+    conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                 (f"relaycore:github-workspace:{state['workspace_id']}",))
+    conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                 (f"relaycore:github-installation:{installation_id}",))
+    existing = conn.execute(
+        "SELECT installation_id,workspace_id,endpoint_id,status FROM github_installations WHERE installation_id=%s FOR UPDATE",
+        (installation_id,),
+    ).fetchone()
+    if existing and existing["workspace_id"] != state["workspace_id"]:
+        raise GithubInstallationConflict
+    other = conn.execute(
+        "SELECT installation_id,endpoint_id,status FROM github_installations WHERE workspace_id=%s FOR UPDATE",
+        (state["workspace_id"],),
+    ).fetchone()
+    if other and other["installation_id"] != installation_id and other["status"] != "revoked":
+        raise GithubInstallationConflict
+    current = existing or other
+    if current and current["status"] != "revoked":
+        conn.execute("DELETE FROM github_oauth_states WHERE state_hash=%s", (state_hash,))
+        return {"installation_id": installation_id, "endpoint_id": current["endpoint_id"],
+                "status": current["status"], "account_login": account_login, "created": False}
+
+    endpoint_id, secret = str(uuid.uuid4()), secrets.token_urlsafe(32)
+    endpoint_name = ("GitHub: " + account_login)[:100]
+    conn.execute(
+        """INSERT INTO webhook_endpoints
+           (id,workspace_id,name,created_by,creation_key,creation_fingerprint,source)
+           VALUES (%s,%s,%s,%s,%s,%s,'github')""",
+        (endpoint_id, state["workspace_id"], endpoint_name, user_id, str(uuid.uuid4()),
+         hashlib.sha256(endpoint_name.encode()).hexdigest()),
+    )
+    conn.execute(
+        """INSERT INTO webhook_secrets(endpoint_id,version,encrypted_secret,idempotency_key)
+           VALUES (%s,1,%s,'github-internal')""", (endpoint_id, encrypt_secret(secret, encryption_key)),
+    )
+    if current:
+        conn.execute(
+            """UPDATE github_installations SET installation_id=%s,endpoint_id=%s,account_id=%s,
+                      account_login=%s,account_type=%s,status='active',linked_by=%s,
+                      updated_at=clock_timestamp() WHERE installation_id=%s""",
+            (installation_id, endpoint_id, account_id, account_login, account_type, user_id,
+             current["installation_id"]),
+        )
+    else:
+        conn.execute(
+            """INSERT INTO github_installations
+               (installation_id,workspace_id,endpoint_id,account_id,account_login,account_type,linked_by)
+               VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+            (installation_id, state["workspace_id"], endpoint_id, account_id, account_login,
+             account_type, user_id),
+        )
+    conn.execute("DELETE FROM github_oauth_states WHERE state_hash=%s", (state_hash,))
+    emit_event(conn, state["workspace_id"], "github.installation_linked", request_id=request_id,
+               data={"installation_id": installation_id, "account_login": account_login,
+                     "actor_user_id": user_id})
+    return {"installation_id": installation_id, "endpoint_id": endpoint_id,
+            "status": "active", "account_login": account_login, "created": True}
+
+
+def github_installation_for_workspace(conn: Connection, workspace_id: str) -> dict[str, Any] | None:
+    return conn.execute(
+        """SELECT installation_id,endpoint_id,account_id,account_login,account_type,status,created_at
+           FROM github_installations WHERE workspace_id=%s ORDER BY created_at DESC LIMIT 1""",
+        (workspace_id,),
+    ).fetchone()
+
+
+def github_installation_for_delivery(conn: Connection, installation_id: int) -> dict[str, Any] | None:
+    return conn.execute(
+        """SELECT g.workspace_id,g.endpoint_id,g.status,s.version
+           FROM github_installations g JOIN webhook_secrets s ON s.endpoint_id=g.endpoint_id
+           JOIN webhook_endpoints e ON e.id=g.endpoint_id
+           WHERE g.installation_id=%s AND s.revoked_at IS NULL AND e.revoked_at IS NULL
+           FOR UPDATE OF g""",
+        (installation_id,),
+    ).fetchone()
+
+
+def update_github_installation_status(conn: Connection, installation_id: int, action: str,
+                                     request_id: str) -> bool:
+    statuses = {"suspend": "suspended", "unsuspend": "active", "deleted": "revoked"}
+    status = statuses.get(action)
+    if not status:
+        return False
+    row = conn.execute(
+        """UPDATE github_installations SET status=%s,updated_at=clock_timestamp()
+           WHERE installation_id=%s AND status<>'revoked' AND status IS DISTINCT FROM %s
+           RETURNING workspace_id,endpoint_id,status""",
+        (status, installation_id, status),
+    ).fetchone()
+    if not row:
+        return False
+    if status == "revoked":
+        conn.execute("UPDATE webhook_endpoints SET revoked_at=clock_timestamp() WHERE id=%s AND revoked_at IS NULL",
+                     (row["endpoint_id"],))
+        conn.execute("UPDATE webhook_secrets SET revoked_at=clock_timestamp() WHERE endpoint_id=%s AND revoked_at IS NULL",
+                     (row["endpoint_id"],))
+    emit_event(conn, row["workspace_id"], "github.installation_status_changed",
+               request_id=request_id, data={"installation_id": installation_id, "status": status})
+    return True
+
+
+def revoke_github_installation(conn: Connection, workspace_id: str, request_id: str) -> bool:
+    row = conn.execute(
+        """UPDATE github_installations SET status='revoked',updated_at=clock_timestamp()
+           WHERE workspace_id=%s AND status<>'revoked' RETURNING installation_id,endpoint_id""",
+        (workspace_id,),
+    ).fetchone()
+    if not row:
+        return False
+    conn.execute("UPDATE webhook_endpoints SET revoked_at=clock_timestamp() WHERE id=%s AND revoked_at IS NULL",
+                 (row["endpoint_id"],))
+    conn.execute("UPDATE webhook_secrets SET revoked_at=clock_timestamp() WHERE endpoint_id=%s AND revoked_at IS NULL",
+                 (row["endpoint_id"],))
+    conn.execute("DELETE FROM github_oauth_states WHERE workspace_id=%s", (workspace_id,))
+    emit_event(conn, workspace_id, "github.installation_disconnected", request_id=request_id,
+               data={"installation_id": row["installation_id"]})
+    return True
 
 
 def create_workspace(conn: Connection, user_id: str, name: str, request_id: str) -> dict[str, Any]:
@@ -304,7 +472,7 @@ def create_webhook_endpoint(
 def list_webhook_endpoints(conn: Connection, workspace_id: str) -> list[dict[str, Any]]:
     return conn.execute(
         """SELECT id,name,created_at,revoked_at,last_received_at
-           FROM webhook_endpoints WHERE workspace_id=%s ORDER BY created_at DESC""",
+           FROM webhook_endpoints WHERE workspace_id=%s AND source='custom' ORDER BY created_at DESC""",
         (workspace_id,),
     ).fetchall()
 
@@ -455,10 +623,10 @@ def rotate_webhook_secret(
     request_id: str, encryption_key: bytes,
 ) -> dict[str, Any] | None:
     endpoint = conn.execute(
-        """SELECT id,revoked_at FROM webhook_endpoints
+        """SELECT id,revoked_at,source FROM webhook_endpoints
            WHERE id=%s AND workspace_id=%s FOR UPDATE""", (endpoint_id, workspace_id)
     ).fetchone()
-    if not endpoint or endpoint["revoked_at"]:
+    if not endpoint or endpoint["revoked_at"] or endpoint["source"] != "custom":
         return None
     previous = conn.execute(
         """SELECT version,encrypted_secret,revoked_at FROM webhook_secrets
@@ -496,7 +664,7 @@ def revoke_webhook_endpoint(
 ) -> bool:
     endpoint = conn.execute(
         """UPDATE webhook_endpoints SET revoked_at=clock_timestamp()
-           WHERE id=%s AND workspace_id=%s AND revoked_at IS NULL RETURNING id""",
+           WHERE id=%s AND workspace_id=%s AND source='custom' AND revoked_at IS NULL RETURNING id""",
         (endpoint_id, workspace_id),
     ).fetchone()
     if not endpoint:
@@ -512,7 +680,7 @@ def revoke_webhook_endpoint(
 
 def webhook_signing_info(conn: Connection, endpoint_id: str) -> dict[str, Any] | None:
     return conn.execute(
-        """SELECT e.workspace_id,s.version,s.encrypted_secret
+        """SELECT e.workspace_id,e.source,s.version,s.encrypted_secret
            FROM webhook_endpoints e JOIN webhook_secrets s ON s.endpoint_id=e.id
            WHERE e.id=%s AND e.revoked_at IS NULL AND s.revoked_at IS NULL""", (endpoint_id,)
     ).fetchone()

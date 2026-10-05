@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 import uuid
@@ -26,6 +27,19 @@ from starlette.concurrency import run_in_threadpool
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.auth import Identity, Principal, SESSION_COOKIE, authenticated_identity, authorize, principal, verified_oidc_profile
+from app.github import (
+    GitHubError,
+    app_installation,
+    authorization_url,
+    exchange_code,
+    github_settings,
+    installation_url,
+    normalize_pull_request,
+    pkce_challenge,
+    pkce_pair,
+    user_installation,
+    verify_webhook,
+)
 from app.http_action import has_event_references, validate_http_target
 from app.coordinator import run as run_coordinator
 from app.models import (
@@ -54,6 +68,7 @@ from app.settings import (
 )
 from app.store import (
     IdempotencyConflict,
+    GithubInstallationConflict,
     LastWorkspaceOwner,
     QueueFull,
     RateLimited,
@@ -68,6 +83,7 @@ from app.store import (
     create_workspace,
     create_webhook_endpoint,
     create_workspace_credential,
+    create_github_oauth_state,
     active_workspace_credential,
     dashboard,
     emit_event,
@@ -92,9 +108,18 @@ from app.store import (
     workspace_members,
     webhook_signing_info,
     persist_webhook_event,
+    github_oauth_state,
+    bind_github_oauth_installation,
+    finish_github_installation,
+    github_installation_for_workspace,
+    github_installation_for_delivery,
+    update_github_installation_status,
+    revoke_github_installation,
+    workspace_membership,
+    discard_github_oauth_state,
     WorkspaceOwnerActionForbidden,
 )
-from app.secretbox import SecretStorageError, decrypt_secret
+from app.secretbox import SecretStorageError, decrypt_secret, encrypt_secret
 from app.supervisor import WorkerSupervisor
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(message)s")
@@ -510,6 +535,209 @@ def webhooks(workspace_id: str, user: Principal = Depends(principal),
         return list_webhook_endpoints(conn, workspace_id)
 
 
+def configured_github():
+    try:
+        config = github_settings()
+    except RuntimeError as exc:
+        raise HTTPException(503, "GitHub App configuration is invalid.") from exc
+    if not config:
+        raise HTTPException(503, "GitHub App integration is not configured.")
+    return config
+
+
+@app.post("/api/workspaces/{workspace_id}/github/install", status_code=201)
+def start_github_installation(
+    workspace_id: str, request: Request, user: Principal = Depends(principal),
+    pool: ConnectionPool = Depends(pool_for),
+) -> dict[str, str]:
+    if user.tenant_id != workspace_id:
+        raise HTTPException(404, "Workspace not found.")
+    authorize(user, "admin")
+    if user.user_id is None or not user.session_token_hash:
+        raise HTTPException(403, "GitHub App linking requires a signed-in workspace administrator.")
+    config = configured_github()
+    state = secrets.token_urlsafe(32)
+    verifier, _challenge = pkce_pair()
+    try:
+        with pool.connection() as conn, conn.transaction():
+            admit_rate_limit(conn, workspace_id)
+            create_github_oauth_state(conn, workspace_id, user.user_id, hashlib.sha256(state.encode()).hexdigest(),
+                                      encrypt_secret(verifier, webhook_encryption_key()))
+    except RateLimited as exc:
+        raise HTTPException(429, "Workspace integration rate limit reached.") from exc
+    except SecretStorageError as exc:
+        raise HTTPException(503, "GitHub authorization state storage is unavailable.") from exc
+    return {"install_url": installation_url(config, state)}
+
+
+@app.get("/integrations/github/setup", include_in_schema=False)
+def github_install_setup(
+    installation_id: int = Query(gt=0, le=9223372036854775807),
+    state: str = Query(min_length=32, max_length=128),
+    pool: ConnectionPool = Depends(pool_for),
+) -> Response:
+    config = configured_github()
+    state_hash = hashlib.sha256(state.encode()).hexdigest()
+    with pool.connection() as conn, conn.transaction():
+        record = github_oauth_state(conn, state_hash)
+        if not record or not bind_github_oauth_installation(conn, state_hash, installation_id):
+            raise HTTPException(400, "GitHub installation setup has expired or is invalid.")
+    try:
+        verifier = decrypt_secret(record["verifier_encrypted"], webhook_encryption_key())
+    except SecretStorageError as exc:
+        raise HTTPException(503, "GitHub authorization state storage is unavailable.") from exc
+    return RedirectResponse(authorization_url(config, state, pkce_challenge(verifier)), status_code=302)
+
+
+@app.get("/integrations/github/callback", include_in_schema=False)
+def github_install_callback(
+    request: Request,
+    code: str | None = Query(default=None, min_length=1, max_length=1024),
+    error: str | None = Query(default=None, max_length=100),
+    state: str = Query(min_length=32, max_length=128),
+    identity: Identity = Depends(authenticated_identity), pool: ConnectionPool = Depends(pool_for),
+) -> Response:
+    config = configured_github()
+    if identity.user_id is None:
+        raise HTTPException(403, "GitHub App linking requires a signed-in workspace administrator.")
+    state_hash = hashlib.sha256(state.encode()).hexdigest()
+    if error:
+        with pool.connection() as conn, conn.transaction():
+            discard_github_oauth_state(conn, state_hash)
+        return RedirectResponse("/?github=cancelled", status_code=303)
+    if not code:
+        raise HTTPException(400, "GitHub did not return an authorization code.")
+    with pool.connection() as conn:
+        record = github_oauth_state(conn, state_hash)
+        membership = (workspace_membership(conn, record["workspace_id"], identity.user_id)
+                      if record and record["user_id"] == identity.user_id else None)
+    if not record or not record["installation_id"] or not membership or membership["role"] not in {"OWNER", "ADMIN"}:
+        raise HTTPException(403, "GitHub authorization state does not match this workspace administrator.")
+    try:
+        verifier = decrypt_secret(record["verifier_encrypted"], webhook_encryption_key())
+        token = exchange_code(config, code, verifier)
+        installation_id = record["installation_id"]
+        user_info = user_installation(config, token, installation_id)
+        app_info = app_installation(config, installation_id)
+    except SecretStorageError as exc:
+        raise HTTPException(503, "GitHub authorization state storage is unavailable.") from exc
+    except GitHubError as exc:
+        logger.warning('{"event":"github.installation_validation_failed","request_id":"%s"}', request_id(request))
+        raise HTTPException(502, "GitHub could not verify this installation. Restart the linking flow.") from exc
+    account = app_info.get("account")
+    account_id = account.get("id") if isinstance(account, dict) else None
+    account_login = account.get("login") if isinstance(account, dict) else None
+    account_type = account.get("type") if isinstance(account, dict) else None
+    if (type(user_info.get("id")) is not int or user_info.get("id") != installation_id
+            or type(app_info.get("id")) is not int or app_info.get("id") != installation_id
+            or type(app_info.get("app_id")) is not int or app_info.get("app_id") != config["app_id"]
+            or app_info.get("suspended_at") is not None
+            or type(account_id) is not int or not 0 < account_id <= 9223372036854775807
+            or not isinstance(account_login, str) or not account_login
+            or account_type not in {"User", "Organization"}):
+        raise HTTPException(403, "The selected installation is not accessible to this user and GitHub App.")
+    try:
+        with pool.connection() as conn, conn.transaction():
+            result = finish_github_installation(
+                conn, state_hash, identity.user_id, installation_id, account_id, account_login,
+                account_type, request_id(request), webhook_encryption_key(),
+            )
+    except GithubInstallationConflict as exc:
+        raise HTTPException(409, "This GitHub installation or workspace already has a different active link.") from exc
+    except SecretStorageError as exc:
+        raise HTTPException(503, "GitHub integration secret storage is unavailable.") from exc
+    if not result:
+        raise HTTPException(403, "GitHub authorization state expired or workspace access changed.")
+    return RedirectResponse("/?github=connected", status_code=303)
+
+
+@app.get("/api/workspaces/{workspace_id}/github")
+def github_connection(workspace_id: str, user: Principal = Depends(principal),
+                      pool: ConnectionPool = Depends(pool_for)) -> dict[str, Any]:
+    if user.tenant_id != workspace_id:
+        raise HTTPException(404, "Workspace not found.")
+    with pool.connection() as conn:
+        result = github_installation_for_workspace(conn, workspace_id)
+    if not result:
+        return {"connected": False}
+    return {"connected": result["status"] != "revoked", **result}
+
+
+@app.delete("/api/workspaces/{workspace_id}/github", status_code=204)
+def disconnect_github(workspace_id: str, request: Request, user: Principal = Depends(principal),
+                      pool: ConnectionPool = Depends(pool_for)) -> Response:
+    if user.tenant_id != workspace_id:
+        raise HTTPException(404, "Workspace not found.")
+    authorize(user, "admin")
+    if user.user_id is None:
+        raise HTTPException(403, "GitHub integration changes require a signed-in workspace administrator.")
+    with pool.connection() as conn, conn.transaction():
+        revoke_github_installation(conn, workspace_id, request_id(request))
+    return Response(status_code=204)
+
+
+@app.post("/integrations/github/webhook", status_code=202, include_in_schema=False)
+async def receive_github_webhook(
+    request: Request,
+    signature: str | None = Header(default=None, alias="X-Hub-Signature-256"),
+    delivery: str | None = Header(default=None, alias="X-GitHub-Delivery"),
+    event_name: str | None = Header(default=None, alias="X-GitHub-Event"),
+    pool: ConnectionPool = Depends(pool_for),
+) -> dict[str, Any]:
+    config = configured_github()
+    if not delivery or not event_name or not re.fullmatch(r"[a-z_]{1,64}", event_name):
+        raise HTTPException(400, "GitHub delivery headers are missing or invalid.")
+    try:
+        event_key = str(uuid.UUID(delivery))
+    except (ValueError, AttributeError) as exc:
+        raise HTTPException(400, "X-GitHub-Delivery must be a UUID.") from exc
+    raw_body, payload = await read_webhook_payload(request)
+    if not verify_webhook(raw_body, signature, config["webhook_secret"]):
+        raise HTTPException(401, "GitHub webhook signature did not match the request body.")
+    if event_name == "installation":
+        installation = payload.get("installation")
+        action = payload.get("action")
+        installation_id = installation.get("id") if isinstance(installation, dict) else None
+        if type(installation_id) is int and installation_id > 0 and action in {"suspend", "unsuspend", "deleted"}:
+            with pool.connection() as conn, conn.transaction():
+                update_github_installation_status(conn, installation_id, action, request_id(request))
+        return {"accepted": True, "ignored": True}
+    try:
+        normalized = normalize_pull_request(payload, event_name)
+    except ValueError:
+        normalized = None
+    if not normalized:
+        return {"accepted": True, "ignored": True}
+    installation_id = normalized["installation"]["id"]
+    with pool.connection() as conn:
+        integration = github_installation_for_delivery(conn, installation_id)
+    if not integration or integration["status"] != "active":
+        return {"accepted": True, "ignored": True}
+    try:
+        with pool.connection() as conn, conn.transaction():
+            admit_rate_limit(conn, integration["workspace_id"])
+    except RateLimited as exc:
+        raise HTTPException(429, "Workspace GitHub webhook rate limit reached.") from exc
+    try:
+        with pool.connection() as conn, conn.transaction():
+            current = github_installation_for_delivery(conn, installation_id)
+            if not current or current["status"] != "active":
+                return {"accepted": True, "ignored": True}
+            result = persist_webhook_event(
+                conn, current["workspace_id"], current["endpoint_id"], current["version"], event_key,
+                request_id(request), raw_body, normalized,
+                allow_workflow_triggers=DEMO_MODE, allow_http_workflow_triggers=not DEMO_MODE,
+            )
+    except IdempotencyConflict as exc:
+        raise HTTPException(409, "This GitHub delivery ID was already used with a different payload.") from exc
+    except WebhookSecretRotated as exc:
+        raise HTTPException(401, "GitHub integration changed during delivery handling; retry the delivery.") from exc
+    except QueueFull as exc:
+        raise HTTPException(429, "Workspace workflow queue is full; retry this GitHub delivery later.") from exc
+    return {"accepted": True, "duplicate": result["duplicate"],
+            "triggered_runs": result.get("triggered_runs", [])}
+
+
 @app.post("/api/workspaces/{workspace_id}/webhooks", status_code=201)
 def new_webhook(workspace_id: str, body: WebhookCreateRequest, request: Request,
                 idempotency_key: str = Header(default_factory=lambda: str(uuid.uuid4()), alias="Idempotency-Key"),
@@ -620,7 +848,7 @@ async def receive_webhook(
 
     with pool.connection() as conn:
         endpoint = webhook_signing_info(conn, endpoint_id)
-    if not endpoint:
+    if not endpoint or endpoint["source"] != "custom":
         raise HTTPException(404, "Webhook endpoint not found.")
     encryption_key = webhook_encryption_key()
     try:

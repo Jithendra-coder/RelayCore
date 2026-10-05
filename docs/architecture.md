@@ -50,6 +50,8 @@ FastAPI provides typed HTTP/OpenAPI validation. Authlib provides OIDC protocol h
 
 Numbered SQL files in `app/migrations/` are applied once, in filename order, under a PostgreSQL transaction lock. Files 001–003 establish and enforce immutable workflow versions; 004 adds OIDC identities, workspaces, memberships and revocable sessions; 005 removes a session constraint that incorrectly prevented natural expiry; 006 adds encrypted webhook secrets and durable inbox rows; 007 adds encrypted workspace credential records and versioned secret values; 008 binds generic HTTP credentials to one exact host; 009 associates triggered runs with their source webhook event. Applied migration files must be treated as immutable.
 
+Migration 010 adds source-scoped internal GitHub endpoints, short-lived OAuth state, and one GitHub App installation per workspace. The OAuth state is stored by hash and its PKCE verifier is encrypted. Installation ownership is verified with both the user access token and an App JWT before the workspace link commits. GitHub pull-request deliveries are signature-checked over their raw body and normalized into the same durable inbox and trigger transaction used by custom webhooks.
+
 ## Phase gates
 
 | Phase | Evidence gate |
@@ -69,5 +71,6 @@ Numbered SQL files in `app/migrations/` are applied once, in filename order, und
 | P12 | Signed bounded webhook ingestion, secret rotation, duplicate protection, secret-free event metadata |
 | P13 | Constrained production HTTP action, per-credential host binding, outbound request/response bounds, status-aware retry and no-network security tests |
 | P14 | Production exact-match webhook triggers for HTTP-only versions, safe request-body event references, duplicate delivery, source-event retention, and version pinning |
+| P15 | GitHub App workspace linking, user/App installation verification, signed PR events, installation status, dedupe, trigger path, and mocked API integration checks |
 
-Cloud deployment and managed-service security are separate operational work: no cloud account, deployment credentials, or running Docker daemon were present during this build. Local Compose files exist, but the runtime was not exercised in the latest identity/webhook verification.
+Cloud deployment and managed-service security are separate operational work: no cloud account, deployment credentials, or running Docker daemon were present during this build. GitHub tests mock provider responses; live GitHub App setup has not been exercised. Local Compose files exist, but the runtime was not exercised in the latest identity/webhook verification.
