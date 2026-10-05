@@ -11,7 +11,8 @@ import pytest
 
 from app.auth import SESSION_COOKIE
 from app.settings import secret_encryption_key
-from app.slack import (authorization_url, exchange_code, normalize_event, slack_settings, verify_request)
+from app.slack import (authorization_url, exchange_code, normalize_event, post_message, slack_settings,
+                       validate_message_step, verify_request)
 from app.store import create_auth_session, upsert_oidc_user, workspace_credential_secret
 
 
@@ -46,7 +47,7 @@ def create_workspace(client, email: str) -> tuple[str, str, dict[str, str]]:
 
 def grant(team_id="T123TEST", token=BOT_TOKEN) -> dict:
     return {"ok": True, "app_id": APP_ID, "token_type": "bot", "access_token": token,
-            "scope": "app_mentions:read", "bot_user_id": "U123TEST",
+            "scope": "app_mentions:read,chat:write", "bot_user_id": "U123TEST",
             "team": {"id": team_id, "name": "Relay Team"}}
 
 
@@ -73,7 +74,7 @@ def connect_slack(client, monkeypatch, headers, grant_data=None):
     assert start.status_code == 201, start.text
     query = parse_qs(urlsplit(start.json()["install_url"]).query)
     state = query["state"][0]
-    assert query["scope"] == ["app_mentions:read"]
+    assert query["scope"] == ["app_mentions:read,chat:write"]
     assert query["redirect_uri"] == ["https://relay.example.test/integrations/slack/callback"]
     with monkeypatch.context() as patch:
         patch.setattr(main, "slack_exchange_code", lambda *_args: grant_data or grant())
@@ -90,7 +91,7 @@ def test_slack_configuration_oauth_and_signature(monkeypatch):
     query = parse_qs(urlsplit(authorization_url(config, "state-token")).query)
     assert query["client_id"] == [config["client_id"]]
     assert query["state"] == ["state-token"]
-    assert query["scope"] == ["app_mentions:read"]
+    assert query["scope"] == ["app_mentions:read,chat:write"]
     monkeypatch.setenv("RELAYCORE_SLACK_APP_ID", "invalid")
     with pytest.raises(RuntimeError, match="APP_ID"):
         slack_settings()
@@ -260,3 +261,108 @@ def test_slack_team_cannot_be_linked_to_two_active_workspaces(client, monkeypatc
     assert response.status_code == 409
     assert client.get(f"/api/workspaces/{second_workspace}/slack",
                       headers=second_headers).json() == {"connected": False}
+
+
+def test_slack_message_action_uses_connected_workspace_token(client, monkeypatch):
+    configure_slack(monkeypatch)
+    _, workspace_id, headers = create_workspace(client, f"slack-action-{uuid.uuid4()}@example.test")
+    import app.main as main
+    import app.slack as slack
+    import app.store as store
+
+    monkeypatch.setattr(main, "DEMO_MODE", False)
+    monkeypatch.setattr(store, "DEMO_MODE", False)
+    steps = [{"name": "announce", "action": "slack_message",
+              "payload": {"channel": "C123TEST", "text": "Build finished."}}]
+    missing = client.post("/api/workflow-definitions", headers={**headers, "Idempotency-Key": "slack:no-install"},
+                          json={"title": "Slack notice", "steps": steps})
+    assert missing.status_code == 422 and "active Slack App connection" in missing.text
+    connect_slack(client, monkeypatch, headers, grant("T" + uuid.uuid4().hex[:12].upper()))
+    definition = client.post("/api/workflow-definitions", headers={**headers, "Idempotency-Key": "slack:action"},
+                            json={"title": "Slack notice", "steps": steps})
+    assert definition.status_code == 201, definition.text
+
+    calls = []
+    monkeypatch.setattr(slack, "post_message", lambda payload, token, *, timeout_seconds: (
+        calls.append((payload, token, timeout_seconds))
+        or {"channel": payload["channel"], "message_ts": "1710000000.000100"}
+    ))
+    run = client.post(f"/api/workflow-definitions/{definition.json()['id']}/runs",
+                      headers={**headers, "Idempotency-Key": "slack:action:run"})
+    assert run.status_code == 202, run.text
+    from tests.conftest import drive_run, get_run
+    drive_run(client, workspace_id, worker_id="slack-message-test-worker")
+    completed = get_run(client, run.json()["id"], workspace_id)
+    assert completed["status"] == "completed"
+    assert completed["side_effects"][0]["result"] == {
+        "channel": "C123TEST", "message_ts": "1710000000.000100",
+    }
+    assert calls == [(steps[0]["payload"], BOT_TOKEN, 0.6)]
+    assert BOT_TOKEN not in json.dumps(completed, default=str)
+
+
+def test_slack_message_api_is_bounded_and_honors_rate_limit(monkeypatch):
+    import io
+    import app.slack as slack
+    from app.http_action import RetryableActionError
+
+    class Response(io.BytesIO):
+        def __init__(self, body: bytes, status: int, headers=None):
+            super().__init__(body)
+            self.status = status
+            self.code = status
+            self.headers = headers or {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+    payload = {"channel": "C123TEST", "text": "Build finished."}
+    calls = []
+
+    class Opener:
+        def __init__(self, response):
+            self.response = response
+
+        def open(self, request, timeout):
+            calls.append((request, timeout))
+            return self.response
+
+    monkeypatch.setattr(slack, "build_opener", lambda handler: (
+        calls.append(("redirect_handler", handler)) or Opener(Response(
+            b'{"ok":true,"channel":"C123TEST","ts":"1710000000.000100"}', 200,
+        ))
+    ))
+    assert post_message(payload, BOT_TOKEN) == {"channel": "C123TEST", "message_ts": "1710000000.000100"}
+    request, timeout = calls[-1]
+    assert request.full_url == "https://slack.com/api/chat.postMessage" and timeout == 1
+    assert request.get_header("Authorization") == f"Bearer {BOT_TOKEN}"
+    assert json.loads(request.data) == payload
+    assert calls[0] == ("redirect_handler", slack._NoRedirect)
+
+    monkeypatch.setattr(slack, "build_opener", lambda *_args: Opener(Response(b"{}", 429, {"Retry-After": "2"})))
+    with pytest.raises(RetryableActionError, match="rate limited") as error:
+        post_message(payload, BOT_TOKEN)
+    assert error.value.retry_after == 2
+
+    monkeypatch.setattr(slack, "build_opener", lambda *_args: Opener(Response(b"{}", 429, {})))
+    with pytest.raises(RetryableActionError, match="rate limited") as error:
+        post_message(payload, BOT_TOKEN)
+    assert error.value.retry_after is None
+
+    monkeypatch.setattr(slack, "build_opener", lambda *_args: Opener(Response(b"{}", 500, {})))
+    with pytest.raises(RetryableActionError, match="status 500"):
+        post_message(payload, BOT_TOKEN)
+
+    monkeypatch.setattr(slack, "build_opener", lambda *_args: Opener(Response(b"{}", 302, {})))
+    from app.http_action import PermanentActionError
+    with pytest.raises(PermanentActionError, match="redirects"):
+        post_message(payload, BOT_TOKEN)
+
+    for invalid in ({"channel": "#general", "text": "hi"},
+                    {"channel": "C123TEST", "text": "\x00"},
+                    {"channel": "C123TEST", "text": "hello", "extra": True}):
+        with pytest.raises(ValueError):
+            validate_message_step(invalid)

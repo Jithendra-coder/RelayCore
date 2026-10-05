@@ -154,6 +154,8 @@ def test_dashboard_uses_session_auth_and_requires_workspace_selection():
     assert "credentials:'same-origin'" in html
     assert "X-Workspace-ID" in html
     assert "headers:{Authorization:'Bearer '+keyInput.value.trim()" not in html
+    assert "$('slackConnect').textContent=connected?'Reconnect':'Connect'" in html
+    assert "$('slackConnect').classList.toggle('hidden',!admin)" in html
 
 
 def test_oidc_configuration_requires_complete_https_credentials(monkeypatch):
@@ -482,6 +484,28 @@ def test_permanent_provider_action_errors_dead_letter_without_retry(client):
         letters = conn.execute("SELECT attempts FROM dead_letters WHERE task_id=%s", (task["id"],)).fetchall()
     assert row == {"status": "dead", "attempts": 1, "max_attempts": 3}
     assert letters == [{"attempts": 1}]
+
+
+def test_provider_retry_after_sets_the_durable_retry_delay(client):
+    from app.http_action import RetryableActionError
+    from app.store import fail_task
+
+    tenant = random_tenant()
+    with client.app.state.pool.connection() as conn, conn.transaction():
+        run = create_workflow(conn, tenant, "Rate-limited action",
+                              [{"name": "record", "action": "record", "payload": {}}],
+                              f"retry-after:{uuid.uuid4()}", "retry-after-test")
+    with client.app.state.pool.connection() as conn:
+        task = claim_task(conn, "retry-after-test-worker", 1.2, tenant_id=tenant)
+        assert task and task["run_id"] == run["id"]
+        fail_task(conn, task, "retry-after-test-worker",
+                  RetryableActionError("rate limited", retry_after=2), task["request_id"])
+        state = conn.execute(
+            """SELECT status,EXTRACT(EPOCH FROM (available_at-clock_timestamp())) AS retry_seconds
+               FROM tasks WHERE id=%s""", (task["id"],),
+        ).fetchone()
+    assert state["status"] == "retry_wait"
+    assert state["retry_seconds"] >= 1.8
 
 
 def test_production_worker_dead_letters_sandbox_actions_without_effect(client, monkeypatch):

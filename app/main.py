@@ -89,6 +89,7 @@ from app.store import (
     create_github_oauth_state,
     create_slack_oauth_state,
     active_workspace_credential,
+    slack_action_credential_id,
     dashboard,
     emit_event,
     get_workflow_definition,
@@ -449,14 +450,18 @@ def credential_secret_value(secret: Any) -> str:
 def validate_workflow_actions(conn, workspace_id: str, steps: list[dict[str, Any]], trigger: Any = None) -> None:
     actions = {step["action"] for step in steps}
     if DEMO_MODE:
-        if "http" in actions:
-            raise HTTPException(422, "Outbound HTTP actions are disabled in Demo Mode.")
+        if actions & {"http", "slack_message"}:
+            raise HTTPException(422, "Provider actions are disabled in Demo Mode.")
         return
-    if actions != {"http"}:
-        raise HTTPException(422, "Production workflows currently support only allowlisted HTTP actions.")
+    if actions - {"http", "slack_message"}:
+        raise HTTPException(422, "Production workflows support only allowlisted HTTP and Slack message actions.")
+    if "slack_message" in actions and not slack_action_credential_id(conn, workspace_id):
+        raise HTTPException(422, "Slack message actions require an active Slack App connection in this workspace.")
     if not trigger and any(has_event_references(step["payload"].get("body")) for step in steps):
         raise HTTPException(422, "HTTP body event references require a webhook trigger.")
     for step in steps:
+        if step["action"] != "http":
+            continue
         host, _, _ = validate_http_target(step["payload"]["url"])
         if not active_workspace_credential(conn, workspace_id, step["payload"]["credential_id"], "http", host):
             raise HTTPException(422, "Each HTTP action must reference an active HTTP credential in this workspace.")
@@ -628,7 +633,8 @@ def slack_install_callback(
             or not isinstance(team_id, str) or not re.fullmatch(r"[A-Z0-9]{1,64}", team_id)
             or not isinstance(team_name, str) or not team_name.strip() or len(team_name) > 100
             or not isinstance(bot_user_id, str) or not re.fullmatch(r"[A-Z0-9]{1,64}", bot_user_id)
-            or not isinstance(scopes, str) or "app_mentions:read" not in scopes.split(",")):
+            or not isinstance(scopes, str)
+            or not {"app_mentions:read", "chat:write"} <= set(scopes.split(","))):
         raise HTTPException(403, "Slack did not grant the expected app, workspace, bot token, and event scope.")
     try:
         with pool.connection() as conn, conn.transaction():

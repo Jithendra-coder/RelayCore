@@ -12,6 +12,14 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from app.http_action import PermanentActionError, RetryableActionError
+
+
+MAX_MESSAGE_RESPONSE_BYTES = 64 * 1024
+MAX_MESSAGE_TIMEOUT_SECONDS = 1.0
+_CHANNEL_ID = re.compile(r"^[CGD][A-Z0-9]{1,64}$")
+_MESSAGE_TS = re.compile(r"^[0-9]{1,20}\.[0-9]{1,9}$")
+
 
 class SlackError(Exception):
     pass
@@ -45,8 +53,69 @@ def slack_settings() -> dict[str, str] | None:
 def authorization_url(config: dict[str, str], state: str) -> str:
     return "https://slack.com/oauth/v2/authorize?" + urlencode({
         "client_id": config["client_id"], "redirect_uri": config["callback_url"],
-        "scope": "app_mentions:read", "state": state,
+        "scope": "app_mentions:read,chat:write", "state": state,
     })
+
+
+def validate_message_step(payload: dict[str, Any]) -> None:
+    if set(payload) != {"channel", "text"}:
+        raise ValueError("Slack message steps require only channel and text.")
+    channel, message = payload["channel"], payload["text"]
+    if not isinstance(channel, str) or not _CHANNEL_ID.fullmatch(channel):
+        raise ValueError("Slack message channel must be a conversation ID.")
+    if (not isinstance(message, str) or not message.strip() or len(message) > 4000
+            or any((ord(char) < 32 and char not in "\n\r\t") or ord(char) == 127 for char in message)):
+        raise ValueError("Slack message text must contain 1–4000 printable characters.")
+
+
+def post_message(payload: dict[str, Any], bot_token: str, *, timeout_seconds: float = MAX_MESSAGE_TIMEOUT_SECONDS
+                  ) -> dict[str, Any]:
+    validate_message_step(payload)
+    if (not isinstance(bot_token, str) or not bot_token.startswith("xoxb-")
+            or not 16 <= len(bot_token) <= 4096
+            or any(ord(char) < 32 or ord(char) == 127 for char in bot_token)):
+        raise PermanentActionError("Slack app credential is invalid.")
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
+    request = Request("https://slack.com/api/chat.postMessage", data=body,
+                      headers={"Accept": "application/json", "Authorization": f"Bearer {bot_token}",
+                               "Content-Type": "application/json", "User-Agent": "RelayCore/0.1"},
+                      method="POST")
+    try:
+        response = build_opener(_NoRedirect).open(request, timeout=timeout_seconds)
+    except HTTPError as exc:
+        response = exc
+    except (URLError, TimeoutError, OSError) as exc:
+        raise RetryableActionError("Slack message request failed or timed out.") from exc
+    with response:
+        status = response.getcode() if hasattr(response, "getcode") else getattr(response, "status", 0)
+        retry_after = response.headers.get("Retry-After")
+        if status == 429:
+            try:
+                retry_after = max(0.0, min(float(retry_after), 3600.0))
+            except (TypeError, ValueError):
+                retry_after = None
+            raise RetryableActionError("Slack message was rate limited.", retry_after=retry_after)
+        if status >= 500:
+            raise RetryableActionError(f"Slack returned status {status}.")
+        if 300 <= status < 400:
+            raise PermanentActionError("Slack message redirects are not followed.")
+        if not 200 <= status < 300:
+            raise PermanentActionError(f"Slack returned status {status}.")
+        raw = response.read(MAX_MESSAGE_RESPONSE_BYTES + 1)
+    if len(raw) > MAX_MESSAGE_RESPONSE_BYTES:
+        raise PermanentActionError("Slack message response exceeded the size limit.")
+    try:
+        result = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PermanentActionError("Slack message response could not be verified.") from exc
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        if isinstance(result, dict) and result.get("error") in {"ratelimited", "rate_limited"}:
+            raise RetryableActionError("Slack message was rate limited.")
+        raise PermanentActionError("Slack rejected the message action.")
+    channel, message_ts = result.get("channel"), result.get("ts")
+    if channel != payload["channel"] or not isinstance(message_ts, str) or not _MESSAGE_TS.fullmatch(message_ts):
+        raise PermanentActionError("Slack message response could not be verified.")
+    return {"channel": channel, "message_ts": message_ts}
 
 
 class _NoRedirect(HTTPRedirectHandler):

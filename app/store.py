@@ -13,7 +13,7 @@ from psycopg import Connection
 from psycopg.types.json import Jsonb
 
 from app.secretbox import decrypt_secret, encrypt_secret
-from app.http_action import PermanentActionError
+from app.http_action import PermanentActionError, RetryableActionError
 from app.settings import DEMO_MODE, MAX_ATTEMPTS, MAX_QUEUE_DEPTH, RATE_LIMIT_PER_MINUTE
 
 
@@ -417,6 +417,18 @@ def slack_installation_for_workspace(conn: Connection, workspace_id: str) -> dic
         """SELECT team_id,team_name,endpoint_id,status,created_at FROM slack_installations
            WHERE workspace_id=%s ORDER BY created_at DESC LIMIT 1""", (workspace_id,),
     ).fetchone()
+
+
+def slack_action_credential_id(conn: Connection, workspace_id: str) -> str | None:
+    row = conn.execute(
+        """SELECT s.credential_id FROM slack_installations s
+           JOIN integration_credentials c ON c.id=s.credential_id
+           JOIN integration_credential_secrets v ON v.credential_id=c.id
+           WHERE s.workspace_id=%s AND s.status='active' AND c.provider='slack'
+             AND c.revoked_at IS NULL AND v.revoked_at IS NULL""",
+        (workspace_id,),
+    ).fetchone()
+    return row["credential_id"] if row else None
 
 
 def slack_installation_for_delivery(conn: Connection, team_id: str) -> dict[str, Any] | None:
@@ -1406,6 +1418,8 @@ def fail_task(conn: Connection, task: dict[str, Any], worker_id: str, error: Exc
             kind = "task.dead_lettered"
         else:
             delay = min(30, 0.25 * (2 ** max(0, row["attempts"] - 1)))
+            if isinstance(error, RetryableActionError) and error.retry_after is not None:
+                delay = max(delay, error.retry_after)
             conn.execute(
                 """UPDATE tasks SET status='retry_wait',available_at=clock_timestamp()+(%s * interval '1 second'),
                           lease_owner=NULL,lease_until=NULL,last_error=%s,updated_at=clock_timestamp()
@@ -1435,10 +1449,10 @@ def execute_step(conn: Connection, worker_id: str, task: dict[str, Any], request
 
     step = steps[index]
     action, payload = step["action"], step["payload"]
-    if (DEMO_MODE and action == "http") or (not DEMO_MODE and action != "http"):
+    external_actions = {"http", "slack_message"}
+    if (DEMO_MODE and action in external_actions) or (not DEMO_MODE and action not in external_actions):
         raise PermanentActionError("Workflow action is not allowed in the current execution mode.")
-    if action == "http":
-        from app.http_action import execute_http_action
+    if action in external_actions:
         from app.settings import LEASE_SECONDS, secret_encryption_key
 
         active = conn.execute(
@@ -1454,16 +1468,30 @@ def execute_step(conn: Connection, worker_id: str, task: dict[str, Any], request
                 conn.execute("""UPDATE tasks SET status='cancelled',lease_owner=NULL,lease_until=NULL,
                               updated_at=clock_timestamp() WHERE id=%s AND lease_owner=%s""",
                              (task["id"], worker_id))
-                emit_event(conn, task["tenant_id"], "task.cancelled_before_http_action", run_id=task["run_id"],
+                kind = "task.cancelled_before_http_action" if action == "http" else "task.cancelled_before_slack_action"
+                emit_event(conn, task["tenant_id"], kind, run_id=task["run_id"],
                            task_id=task["id"], worker_id=worker_id, request_id=request_id)
             return
         heartbeat(conn, worker_id, task["id"], LEASE_SECONDS)
         key = secret_encryption_key(required=True)
-        credential = workspace_credential_secret(conn, task["tenant_id"], payload["credential_id"], key)
-        if not credential or credential["provider"] != "http":
-            raise PermanentActionError("HTTP action credential is unavailable or has the wrong provider.")
-        result = execute_http_action(payload, credential["secret"], f"{task['run_id']}:{index}",
-                                     credential["allowed_host"], task.get("trigger_payload"))
+        if action == "http":
+            from app.http_action import execute_http_action
+
+            credential = workspace_credential_secret(conn, task["tenant_id"], payload["credential_id"], key)
+            if not credential or credential["provider"] != "http":
+                raise PermanentActionError("HTTP action credential is unavailable or has the wrong provider.")
+            result = execute_http_action(payload, credential["secret"], f"{task['run_id']}:{index}",
+                                         credential["allowed_host"], task.get("trigger_payload"))
+        else:
+            from app.slack import post_message
+
+            credential_id = slack_action_credential_id(conn, task["tenant_id"])
+            credential = (workspace_credential_secret(conn, task["tenant_id"], credential_id, key)
+                          if credential_id else None)
+            if not credential or credential["provider"] != "slack":
+                raise PermanentActionError("Slack App credential is unavailable.")
+            result = post_message(payload, credential["secret"],
+                                  timeout_seconds=min(1.0, LEASE_SECONDS / 2))
         heartbeat(conn, worker_id, task["id"], LEASE_SECONDS)
     else:
         from app.sandbox import execute_sandbox_action
@@ -1485,7 +1513,7 @@ def execute_step(conn: Connection, worker_id: str, task: dict[str, Any], request
             return
         effect_key = f"{task['run_id']}:{index}"
         if locked["status"] == "cancelled":
-            if action == "http":
+            if action in external_actions:
                 created = conn.execute(
                     """INSERT INTO side_effects(id,tenant_id,run_id,idempotency_key,step_index,result)
                        VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT(tenant_id,idempotency_key) DO NOTHING

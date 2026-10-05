@@ -8,7 +8,7 @@ Audit snapshot: 2026-10-05, repository commit `58fe95a`, before the production w
 - Worker subprocesses claim work with PostgreSQL row locks, renew leases, retry failures, and recover expired work. The API supervisor currently also manages workers.
 - Production OIDC sessions and workspace membership/roles; Demo Mode also exposes fixed API-key tenants and simulated actions.
 - Signed custom webhook intake with encrypted rotating secrets, raw-body HMAC verification, event deduplication, bounded payloads, and metadata history. Exact-match workflow triggers currently execute only in Demo Mode.
-- Workspace-scoped encrypted credentials and a constrained outbound HTTP action. Production workflows can be created and manually run when every step uses an HTTP credential bound to one operator-allowlisted host.
+- Workspace-scoped encrypted credentials and constrained outbound HTTP plus Slack message actions. Production workflows can be created and manually run when HTTP credentials are bound to an operator-allowlisted host or a Slack installation is active in the workspace.
 - Browser dashboard, polling-backed SSE, Prometheus text metrics, Docker Compose files, CI checks, operational docs, local benchmark and recovery evidence.
 
 ## B. Strong parts to preserve
