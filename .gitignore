@@ -10,6 +10,8 @@ __pycache__/
 htmlcov/
 *.log
 data/
+*.dump
+*.backup
 build/
 dist/
 *.egg-info/

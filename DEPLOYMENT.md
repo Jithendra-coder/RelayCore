@@ -31,4 +31,4 @@ For separate deployment roles, set `RELAYCORE_WORKERS=0` on the API and run one 
 
 ## Deployment status
 
-There is no staging or production infrastructure, Terraform, image publishing, migration rollout, rollback automation, or cloud smoke test yet. A production release is blocked until provider-backed workflow actions and those deployment controls are implemented and verified. See [LIMITATIONS.md](LIMITATIONS.md).
+There is no staging or production infrastructure, Terraform, image publishing, migration rollout, rollback automation, or cloud smoke test yet. PostgreSQL logical backup/restore scripts exist, but managed retention and disaster recovery are unverified. A production release is blocked until provider-backed workflow actions and deployment controls are verified. See [LIMITATIONS.md](LIMITATIONS.md).

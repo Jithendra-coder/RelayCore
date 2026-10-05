@@ -40,6 +40,13 @@
 
 For separate deployment roles, set API `RELAYCORE_WORKERS=0` and run `python -m app.worker` in the worker service. Worker IDs default to hostname plus process ID; if hostnames are shared across replicas, configure a unique `RELAYCORE_WORKER_ID` on each. The database claim remains safe across competing workers through `SKIP LOCKED`. The regular Demo Mode Compose stack keeps API-managed workers so its failure-injection controls can terminate and restart workers.
 
+## Backup and restore
+
+- Set `DATABASE_URL` through the deployment secret manager, then run `scripts/backup.ps1 -Destination <path-outside-repository>`. It creates a PostgreSQL custom-format logical archive, refuses to overwrite, writes to a temporary file, and validates the archive before publishing it at the destination. It does not include cluster roles or ownership grants.
+- Store backups in access-controlled encrypted storage. The script does not encrypt the archive. Keep retention and encryption policy in the storage layer.
+- Restore only into a newly created empty database. Set `RELAYCORE_RESTORE_DATABASE_URL` to that database URL and run `scripts/restore.ps1 -BackupPath <archive> -TargetDatabaseUrl $env:RELAYCORE_RESTORE_DATABASE_URL`. PowerShell prompts before writing; `-WhatIf` previews the action. Restore uses one transaction, aborts on error, and never drops existing objects. Create DB roles and grants separately.
+- After a restore, start RelayCore against the restored database and verify `/healthz`, migrations, and an authorized workflow read before directing traffic. A successful local restore is not evidence of managed-cloud backup retention or disaster recovery.
+
 ## Operational guarantees and limits
 
 PostgreSQL is the only durable coordination dependency. Heartbeats and leases are database rows, so API/worker process restart does not discard an accepted task. The coordinator retries an expired lease with capped exponential backoff and stores terminal work in the DLQ. In the default local stack, an API restart starts configured worker children and a deliberately killed worker stays stopped until a human restarts it. In separate-role deployments, the orchestrator restarts worker containers according to its policy.
