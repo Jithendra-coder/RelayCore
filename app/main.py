@@ -40,6 +40,8 @@ from app.github import (
     user_installation,
     verify_webhook,
 )
+from app.slack import SlackError, authorization_url as slack_authorization_url, exchange_code as slack_exchange_code
+from app.slack import normalize_event as normalize_slack_event, slack_settings, verify_request as verify_slack_request
 from app.http_action import has_event_references, validate_http_target
 from app.coordinator import run as run_coordinator
 from app.models import (
@@ -69,6 +71,7 @@ from app.settings import (
 from app.store import (
     IdempotencyConflict,
     GithubInstallationConflict,
+    SlackInstallationConflict,
     LastWorkspaceOwner,
     QueueFull,
     RateLimited,
@@ -84,6 +87,7 @@ from app.store import (
     create_webhook_endpoint,
     create_workspace_credential,
     create_github_oauth_state,
+    create_slack_oauth_state,
     active_workspace_credential,
     dashboard,
     emit_event,
@@ -109,6 +113,7 @@ from app.store import (
     webhook_signing_info,
     persist_webhook_event,
     github_oauth_state,
+    slack_oauth_state,
     bind_github_oauth_installation,
     finish_github_installation,
     github_installation_for_workspace,
@@ -117,6 +122,12 @@ from app.store import (
     revoke_github_installation,
     workspace_membership,
     discard_github_oauth_state,
+    discard_slack_oauth_state,
+    finish_slack_installation,
+    slack_installation_for_workspace,
+    slack_installation_for_delivery,
+    update_slack_installation_status,
+    revoke_slack_installation,
     WorkspaceOwnerActionForbidden,
 )
 from app.secretbox import SecretStorageError, decrypt_secret, encrypt_secret
@@ -545,6 +556,120 @@ def configured_github():
     return config
 
 
+def configured_slack():
+    try:
+        config = slack_settings()
+    except RuntimeError as exc:
+        raise HTTPException(503, "Slack App configuration is invalid.") from exc
+    if not config:
+        raise HTTPException(503, "Slack App integration is not configured.")
+    return config
+
+
+@app.post("/api/workspaces/{workspace_id}/slack/install", status_code=201)
+def start_slack_installation(
+    workspace_id: str, request: Request, user: Principal = Depends(principal),
+    pool: ConnectionPool = Depends(pool_for),
+) -> dict[str, str]:
+    if user.tenant_id != workspace_id:
+        raise HTTPException(404, "Workspace not found.")
+    authorize(user, "admin")
+    if user.user_id is None or not user.session_token_hash:
+        raise HTTPException(403, "Slack App linking requires a signed-in workspace administrator.")
+    config = configured_slack()
+    state = secrets.token_urlsafe(32)
+    try:
+        with pool.connection() as conn, conn.transaction():
+            admit_rate_limit(conn, workspace_id)
+            create_slack_oauth_state(conn, workspace_id, user.user_id, hashlib.sha256(state.encode()).hexdigest())
+    except RateLimited as exc:
+        raise HTTPException(429, "Workspace integration rate limit reached.") from exc
+    return {"install_url": slack_authorization_url(config, state)}
+
+
+@app.get("/integrations/slack/callback", include_in_schema=False)
+def slack_install_callback(
+    request: Request,
+    code: str | None = Query(default=None, min_length=1, max_length=1024),
+    error: str | None = Query(default=None, max_length=100),
+    state: str = Query(min_length=32, max_length=128),
+    identity: Identity = Depends(authenticated_identity), pool: ConnectionPool = Depends(pool_for),
+) -> Response:
+    config = configured_slack()
+    if identity.user_id is None:
+        raise HTTPException(403, "Slack App linking requires a signed-in workspace administrator.")
+    state_hash = hashlib.sha256(state.encode()).hexdigest()
+    if error:
+        with pool.connection() as conn, conn.transaction():
+            discard_slack_oauth_state(conn, state_hash)
+        return RedirectResponse("/?slack=cancelled", status_code=303)
+    if not code:
+        raise HTTPException(400, "Slack did not return an authorization code.")
+    with pool.connection() as conn:
+        record = slack_oauth_state(conn, state_hash)
+        membership = (workspace_membership(conn, record["workspace_id"], identity.user_id)
+                      if record and record["user_id"] == identity.user_id else None)
+    if not record or not membership or membership["role"] not in {"OWNER", "ADMIN"}:
+        raise HTTPException(403, "Slack authorization state does not match this workspace administrator.")
+    try:
+        grant = slack_exchange_code(config, code)
+    except SlackError as exc:
+        logger.warning('{"event":"slack.installation_validation_failed","request_id":"%s"}', request_id(request))
+        raise HTTPException(502, "Slack could not verify this installation. Restart the linking flow.") from exc
+    team = grant.get("team")
+    team_id = team.get("id") if isinstance(team, dict) else None
+    team_name = team.get("name") if isinstance(team, dict) else None
+    bot_token = grant.get("access_token")
+    bot_user_id = grant.get("bot_user_id")
+    scopes = grant.get("scope", "")
+    if (grant.get("app_id") != config["app_id"] or grant.get("token_type") != "bot"
+            or not isinstance(bot_token, str) or not 16 <= len(bot_token) <= 4096
+            or not bot_token.startswith("xoxb-") or any(ord(char) < 32 or ord(char) == 127 for char in bot_token)
+            or not isinstance(team_id, str) or not re.fullmatch(r"[A-Z0-9]{1,64}", team_id)
+            or not isinstance(team_name, str) or not team_name.strip() or len(team_name) > 100
+            or not isinstance(bot_user_id, str) or not re.fullmatch(r"[A-Z0-9]{1,64}", bot_user_id)
+            or not isinstance(scopes, str) or "app_mentions:read" not in scopes.split(",")):
+        raise HTTPException(403, "Slack did not grant the expected app, workspace, bot token, and event scope.")
+    try:
+        with pool.connection() as conn, conn.transaction():
+            result = finish_slack_installation(
+                conn, state_hash, identity.user_id, team_id, team_name.strip(), bot_user_id,
+                bot_token, request_id(request), credential_encryption_key(),
+            )
+    except SlackInstallationConflict as exc:
+        raise HTTPException(409, "This Slack workspace or RelayCore workspace already has a different active link.") from exc
+    except SecretStorageError as exc:
+        raise HTTPException(503, "Slack integration secret storage is unavailable.") from exc
+    if not result:
+        raise HTTPException(403, "Slack authorization state expired or workspace access changed.")
+    return RedirectResponse("/?slack=connected", status_code=303)
+
+
+@app.get("/api/workspaces/{workspace_id}/slack")
+def slack_connection(workspace_id: str, user: Principal = Depends(principal),
+                     pool: ConnectionPool = Depends(pool_for)) -> dict[str, Any]:
+    if user.tenant_id != workspace_id:
+        raise HTTPException(404, "Workspace not found.")
+    with pool.connection() as conn:
+        result = slack_installation_for_workspace(conn, workspace_id)
+    if not result:
+        return {"connected": False}
+    return {"connected": result["status"] == "active", **result}
+
+
+@app.delete("/api/workspaces/{workspace_id}/slack", status_code=204)
+def disconnect_slack(workspace_id: str, request: Request, user: Principal = Depends(principal),
+                     pool: ConnectionPool = Depends(pool_for)) -> Response:
+    if user.tenant_id != workspace_id:
+        raise HTTPException(404, "Workspace not found.")
+    authorize(user, "admin")
+    if user.user_id is None:
+        raise HTTPException(403, "Slack integration changes require a signed-in workspace administrator.")
+    with pool.connection() as conn, conn.transaction():
+        revoke_slack_installation(conn, workspace_id, request_id(request))
+    return Response(status_code=204)
+
+
 @app.post("/api/workspaces/{workspace_id}/github/install", status_code=201)
 def start_github_installation(
     workspace_id: str, request: Request, user: Principal = Depends(principal),
@@ -734,6 +859,66 @@ async def receive_github_webhook(
         raise HTTPException(401, "GitHub integration changed during delivery handling; retry the delivery.") from exc
     except QueueFull as exc:
         raise HTTPException(429, "Workspace workflow queue is full; retry this GitHub delivery later.") from exc
+    return {"accepted": True, "duplicate": result["duplicate"],
+            "triggered_runs": result.get("triggered_runs", [])}
+
+
+@app.post("/integrations/slack/events", include_in_schema=False)
+async def receive_slack_event(
+    request: Request,
+    timestamp: str | None = Header(default=None, alias="X-Slack-Request-Timestamp"),
+    signature: str | None = Header(default=None, alias="X-Slack-Signature"),
+    pool: ConnectionPool = Depends(pool_for),
+) -> dict[str, Any]:
+    config = configured_slack()
+    raw_body, payload = await read_webhook_payload(request)
+    if not verify_slack_request(raw_body, timestamp, signature, config["signing_secret"]):
+        raise HTTPException(401, "Slack request signature is invalid or expired.")
+    if payload.get("type") == "url_verification":
+        challenge = payload.get("challenge")
+        if not isinstance(challenge, str) or not 1 <= len(challenge) <= 256:
+            raise HTTPException(400, "Slack URL verification challenge is invalid.")
+        return {"challenge": challenge}
+    if payload.get("api_app_id") != config["app_id"]:
+        raise HTTPException(401, "Slack event is addressed to a different app.")
+    try:
+        normalized = normalize_slack_event(payload)
+    except ValueError as exc:
+        raise HTTPException(400, "Slack event payload is invalid.") from exc
+    if not normalized:
+        return {"accepted": True, "ignored": True}
+    team_id = normalized["team"]["id"]
+    if normalized["type"] == "slack.app_uninstalled":
+        with pool.connection() as conn, conn.transaction():
+            update_slack_installation_status(conn, team_id, request_id(request))
+        return {"accepted": True, "ignored": True}
+    event_key = payload["event_id"]
+    stored_body = json.dumps(normalized, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    with pool.connection() as conn:
+        integration = slack_installation_for_delivery(conn, team_id)
+    if not integration:
+        return {"accepted": True, "ignored": True}
+    try:
+        with pool.connection() as conn, conn.transaction():
+            admit_rate_limit(conn, integration["workspace_id"])
+    except RateLimited as exc:
+        raise HTTPException(429, "Workspace Slack event rate limit reached.") from exc
+    try:
+        with pool.connection() as conn, conn.transaction():
+            current = slack_installation_for_delivery(conn, team_id)
+            if not current:
+                return {"accepted": True, "ignored": True}
+            result = persist_webhook_event(
+                conn, current["workspace_id"], current["endpoint_id"], current["version"], event_key,
+                request_id(request), stored_body, normalized,
+                allow_workflow_triggers=DEMO_MODE, allow_http_workflow_triggers=not DEMO_MODE,
+            )
+    except IdempotencyConflict as exc:
+        raise HTTPException(409, "This Slack event ID was already used with a different payload.") from exc
+    except WebhookSecretRotated as exc:
+        raise HTTPException(401, "Slack integration changed during event handling; retry the event.") from exc
+    except QueueFull as exc:
+        raise HTTPException(429, "Workspace workflow queue is full; retry this Slack event later.") from exc
     return {"accepted": True, "duplicate": result["duplicate"],
             "triggered_runs": result.get("triggered_runs", [])}
 

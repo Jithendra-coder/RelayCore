@@ -53,6 +53,10 @@ class GithubInstallationConflict(Exception):
     pass
 
 
+class SlackInstallationConflict(Exception):
+    pass
+
+
 def migrate(conn: Connection) -> None:
     from pathlib import Path
 
@@ -313,6 +317,153 @@ def revoke_github_installation(conn: Connection, workspace_id: str, request_id: 
     conn.execute("DELETE FROM github_oauth_states WHERE workspace_id=%s", (workspace_id,))
     emit_event(conn, workspace_id, "github.installation_disconnected", request_id=request_id,
                data={"installation_id": row["installation_id"]})
+    return True
+
+
+def create_slack_oauth_state(conn: Connection, workspace_id: str, user_id: str, state_hash: str) -> None:
+    conn.execute("DELETE FROM slack_oauth_states WHERE expires_at<=clock_timestamp()")
+    conn.execute(
+        "INSERT INTO slack_oauth_states(state_hash,workspace_id,user_id) VALUES (%s,%s,%s)",
+        (state_hash, workspace_id, user_id),
+    )
+
+
+def slack_oauth_state(conn: Connection, state_hash: str) -> dict[str, Any] | None:
+    return conn.execute(
+        """SELECT workspace_id,user_id FROM slack_oauth_states
+           WHERE state_hash=%s AND expires_at>clock_timestamp()""", (state_hash,),
+    ).fetchone()
+
+
+def discard_slack_oauth_state(conn: Connection, state_hash: str) -> None:
+    conn.execute("DELETE FROM slack_oauth_states WHERE state_hash=%s", (state_hash,))
+
+
+def finish_slack_installation(
+    conn: Connection, state_hash: str, user_id: str, team_id: str, team_name: str, bot_user_id: str,
+    bot_token: str, request_id: str, encryption_key: bytes,
+) -> dict[str, Any] | None:
+    state = conn.execute(
+        """SELECT workspace_id,user_id FROM slack_oauth_states
+           WHERE state_hash=%s AND expires_at>clock_timestamp() FOR UPDATE""", (state_hash,),
+    ).fetchone()
+    if not state or state["user_id"] != user_id:
+        return None
+    member = workspace_membership(conn, state["workspace_id"], user_id)
+    if not member or member["role"] not in {"OWNER", "ADMIN"}:
+        return None
+    conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                 (f"relaycore:slack-workspace:{state['workspace_id']}",))
+    conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                 (f"relaycore:slack-team:{team_id}",))
+    active = conn.execute(
+        """SELECT id,workspace_id,team_id,endpoint_id,credential_id
+           FROM slack_installations WHERE status='active'
+             AND (workspace_id=%s OR team_id=%s) FOR UPDATE""",
+        (state["workspace_id"], team_id),
+    ).fetchall()
+    current = next((row for row in active if row["workspace_id"] == state["workspace_id"]
+                    and row["team_id"] == team_id), None)
+    if active and (len(active) != 1 or current is None):
+        raise SlackInstallationConflict
+    if current:
+        rotated = rotate_workspace_credential(
+            conn, state["workspace_id"], current["credential_id"], user_id, bot_token,
+            f"slack-oauth:{state_hash}", request_id, encryption_key,
+        )
+        if not rotated:
+            raise SlackInstallationConflict
+        conn.execute("""UPDATE slack_installations SET team_name=%s,bot_user_id=%s,linked_by=%s,
+                          updated_at=clock_timestamp() WHERE id=%s""",
+                     (team_name, bot_user_id, user_id, current["id"]))
+        endpoint_id = current["endpoint_id"]
+        emit_event(conn, state["workspace_id"], "slack.installation_reconnected", request_id=request_id,
+                   data={"team_id": team_id, "actor_user_id": user_id})
+    else:
+        credential = create_workspace_credential(
+            conn, state["workspace_id"], user_id, "slack", ("Slack · " + team_name)[:100],
+            bot_token, None, f"slack-install:{state_hash}", request_id, encryption_key,
+        )
+        endpoint_id = str(uuid.uuid4())
+        endpoint_name = ("Slack: " + team_name)[:100]
+        conn.execute(
+            """INSERT INTO webhook_endpoints
+               (id,workspace_id,name,created_by,creation_key,creation_fingerprint,source)
+               VALUES (%s,%s,%s,%s,%s,%s,'slack')""",
+            (endpoint_id, state["workspace_id"], endpoint_name, user_id, str(uuid.uuid4()),
+             hashlib.sha256(endpoint_name.encode()).hexdigest()),
+        )
+        conn.execute(
+            """INSERT INTO webhook_secrets(endpoint_id,version,encrypted_secret,idempotency_key)
+               VALUES (%s,1,%s,'slack-internal')""",
+            (endpoint_id, encrypt_secret(secrets.token_urlsafe(32), encryption_key)),
+        )
+        conn.execute(
+            """INSERT INTO slack_installations
+               (id,team_id,workspace_id,endpoint_id,credential_id,team_name,bot_user_id,linked_by)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (str(uuid.uuid4()), team_id, state["workspace_id"], endpoint_id, credential["id"],
+             team_name, bot_user_id, user_id),
+        )
+        emit_event(conn, state["workspace_id"], "slack.installation_linked", request_id=request_id,
+                   data={"team_id": team_id, "team_name": team_name, "actor_user_id": user_id})
+    conn.execute("DELETE FROM slack_oauth_states WHERE state_hash=%s", (state_hash,))
+    return {"team_id": team_id, "team_name": team_name, "endpoint_id": endpoint_id,
+            "status": "active", "created": current is None}
+
+
+def slack_installation_for_workspace(conn: Connection, workspace_id: str) -> dict[str, Any] | None:
+    return conn.execute(
+        """SELECT team_id,team_name,endpoint_id,status,created_at FROM slack_installations
+           WHERE workspace_id=%s ORDER BY created_at DESC LIMIT 1""", (workspace_id,),
+    ).fetchone()
+
+
+def slack_installation_for_delivery(conn: Connection, team_id: str) -> dict[str, Any] | None:
+    return conn.execute(
+        """SELECT s.workspace_id,s.endpoint_id,s.credential_id,w.version
+           FROM slack_installations s JOIN webhook_secrets w ON w.endpoint_id=s.endpoint_id
+           JOIN webhook_endpoints e ON e.id=s.endpoint_id
+           WHERE s.team_id=%s AND s.status='active' AND w.revoked_at IS NULL AND e.revoked_at IS NULL
+           FOR UPDATE OF s""", (team_id,),
+    ).fetchone()
+
+
+def _revoke_slack_installation(conn: Connection, row: dict[str, Any], request_id: str) -> None:
+    conn.execute("UPDATE webhook_endpoints SET revoked_at=clock_timestamp() WHERE id=%s AND revoked_at IS NULL",
+                 (row["endpoint_id"],))
+    conn.execute("""UPDATE webhook_secrets SET revoked_at=clock_timestamp()
+                   WHERE endpoint_id=%s AND revoked_at IS NULL""", (row["endpoint_id"],))
+    conn.execute("""UPDATE integration_credentials SET revoked_at=clock_timestamp()
+                   WHERE id=%s AND revoked_at IS NULL""", (row["credential_id"],))
+    conn.execute("""UPDATE integration_credential_secrets SET revoked_at=clock_timestamp()
+                   WHERE credential_id=%s AND revoked_at IS NULL""", (row["credential_id"],))
+    emit_event(conn, row["workspace_id"], "slack.installation_disconnected", request_id=request_id,
+               data={"team_id": row["team_id"]})
+
+
+def update_slack_installation_status(conn: Connection, team_id: str, request_id: str) -> bool:
+    row = conn.execute(
+        """UPDATE slack_installations SET status='revoked',updated_at=clock_timestamp()
+           WHERE team_id=%s AND status='active'
+           RETURNING workspace_id,team_id,endpoint_id,credential_id""", (team_id,),
+    ).fetchone()
+    if not row:
+        return False
+    _revoke_slack_installation(conn, row, request_id)
+    return True
+
+
+def revoke_slack_installation(conn: Connection, workspace_id: str, request_id: str) -> bool:
+    row = conn.execute(
+        """UPDATE slack_installations SET status='revoked',updated_at=clock_timestamp()
+           WHERE workspace_id=%s AND status='active'
+           RETURNING workspace_id,team_id,endpoint_id,credential_id""", (workspace_id,),
+    ).fetchone()
+    if not row:
+        return False
+    _revoke_slack_installation(conn, row, request_id)
+    conn.execute("DELETE FROM slack_oauth_states WHERE workspace_id=%s", (workspace_id,))
     return True
 
 

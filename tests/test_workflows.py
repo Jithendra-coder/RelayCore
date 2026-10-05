@@ -1027,7 +1027,7 @@ def test_versioned_migrations_bootstrap_and_skip_applied_files():
             assert conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall() == [
                 {"version": "001"}, {"version": "002"}, {"version": "003"},
                 {"version": "004"}, {"version": "005"}, {"version": "006"}, {"version": "007"},
-                {"version": "008"}, {"version": "009"}, {"version": "010"}
+                {"version": "008"}, {"version": "009"}, {"version": "010"}, {"version": "011"}
             ]
             assert conn.execute("SELECT count(*) AS n FROM tasks").fetchone()["n"] == 0
             assert conn.execute(
@@ -1052,6 +1052,12 @@ def test_versioned_migrations_bootstrap_and_skip_applied_files():
                 (["github_oauth_states", "github_installations"],),
             ).fetchall()
             assert len(github_tables) == 2
+            slack_tables = conn.execute(
+                """SELECT table_name FROM information_schema.tables
+                   WHERE table_schema=current_schema() AND table_name=ANY(%s)""",
+                (["slack_oauth_states", "slack_installations"],),
+            ).fetchall()
+            assert len(slack_tables) == 2
             credential_tables = conn.execute(
                 """SELECT table_name FROM information_schema.tables
                    WHERE table_schema=current_schema() AND table_name=ANY(%s)""",
@@ -1093,7 +1099,7 @@ def test_workflow_version_migration_upgrades_an_existing_001_database():
             ).fetchall() == [
                 {"version": "001"}, {"version": "002"}, {"version": "003"},
                 {"version": "004"}, {"version": "005"}, {"version": "006"}, {"version": "007"},
-                {"version": "008"}, {"version": "009"}, {"version": "010"}
+                {"version": "008"}, {"version": "009"}, {"version": "010"}, {"version": "011"}
             ]
             columns = conn.execute(
                 """SELECT column_name FROM information_schema.columns

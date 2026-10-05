@@ -18,6 +18,7 @@ Invariants:
 10. Tenant event writes acquire a transaction-scoped ordering lock before allocating identity values, so a subscriber cursor cannot advance past an event that commits later with a lower ID.
 11. Published workflow versions are immutable rows. Each definition points to its current version; a run stores that version ID, hash, and a full definition snapshot so publishing a later version cannot change work already queued or running.
 12. Production webhook intake stores the accepted event, matches the active exact endpoint/type trigger, and admits its HTTP-only run in one transaction. The run references the event row; a worker loads payload only when the event workspace matches the run tenant. A duplicate endpoint/event key cannot create a second run.
+13. GitHub and Slack provider deliveries verify their provider signatures before resolving an active workspace installation. Normalized events reuse the webhook transaction so event deduplication and matching run admission stay atomic. Slack's OAuth bot token is stored in the existing encrypted credential tables and revoked locally on disconnect or uninstall.
 
 ## Delivery semantics and transaction boundaries
 
