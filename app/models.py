@@ -8,12 +8,14 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
+from app.http_action import validate_http_host, validate_http_step
+
 
 class WorkflowStep(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(min_length=1, max_length=80, pattern=r"^[\w .:-]+$")
-    action: Literal["record", "charge", "sleep", "fail_once", "fail_until_replay"]
+    action: Literal["record", "charge", "sleep", "fail_once", "fail_until_replay", "http"]
     payload: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("payload")
@@ -25,6 +27,8 @@ class WorkflowStep(BaseModel):
 
     @model_validator(mode="after")
     def validate_action_payload(self) -> "WorkflowStep":
+        if self.action == "http":
+            validate_http_step(self.payload)
         if self.action == "sleep":
             seconds = self.payload.get("seconds", 0)
             if not isinstance(seconds, (int, float)) or isinstance(seconds, bool) or not 0 <= seconds <= 30:
@@ -109,6 +113,7 @@ class CredentialCreateRequest(BaseModel):
     provider: Literal["github", "slack", "http"]
     name: str = Field(min_length=1, max_length=100)
     secret: SecretStr
+    allowed_host: str | None = None
 
     @field_validator("name")
     @classmethod
@@ -117,6 +122,16 @@ class CredentialCreateRequest(BaseModel):
         if not value:
             raise ValueError("Credential name must contain a visible character.")
         return value
+
+    @model_validator(mode="after")
+    def credential_host_matches_provider(self) -> "CredentialCreateRequest":
+        if self.provider == "http":
+            if self.allowed_host is None:
+                raise ValueError("HTTP credentials require an allowlisted allowed_host.")
+            self.allowed_host = validate_http_host(self.allowed_host)
+        elif self.allowed_host is not None:
+            raise ValueError("allowed_host is only valid for generic HTTP credentials.")
+        return self
 
 
 class CredentialRotateRequest(BaseModel):

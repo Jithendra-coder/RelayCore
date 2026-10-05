@@ -71,7 +71,7 @@ def secret_encryption_key(*, required: bool = False) -> bytes | None:
     value = os.environ.get("RELAYCORE_SECRET_ENCRYPTION_KEY", "").strip()
     if not value:
         if required:
-            raise RuntimeError("RELAYCORE_SECRET_ENCRYPTION_KEY is required for encrypted webhook secret storage.")
+            raise RuntimeError("RELAYCORE_SECRET_ENCRYPTION_KEY is required for encrypted secret storage.")
         return None
     try:
         Fernet(value.encode())

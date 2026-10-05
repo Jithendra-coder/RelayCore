@@ -14,6 +14,7 @@ from psycopg import Connection
 from psycopg.types.json import Jsonb
 
 from app.secretbox import decrypt_secret, encrypt_secret
+from app.http_action import PermanentActionError
 from app.settings import MAX_ATTEMPTS, MAX_QUEUE_DEPTH, RATE_LIMIT_PER_MINUTE
 
 
@@ -311,28 +312,31 @@ def list_webhook_endpoints(conn: Connection, workspace_id: str) -> list[dict[str
 
 def create_workspace_credential(
     conn: Connection, workspace_id: str, actor_id: str, provider: str, name: str, secret: str,
+    allowed_host: str | None,
     idempotency_key: str, request_id: str, encryption_key: bytes,
 ) -> dict[str, Any]:
     fingerprint_key = hashlib.sha256(encryption_key).digest()
-    fingerprint = hmac.new(fingerprint_key, f"{provider}\0{name}\0{secret}".encode(), hashlib.sha256).hexdigest()
+    fingerprint = hmac.new(fingerprint_key, f"{provider}\0{name}\0{allowed_host or ''}\0{secret}".encode(),
+                           hashlib.sha256).hexdigest()
     conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                  (f"relaycore:credential-create:{workspace_id}:{idempotency_key}",))
     existing = conn.execute(
-        """SELECT id,provider,name,creation_fingerprint,created_at,revoked_at
+        """SELECT id,provider,name,allowed_host,creation_fingerprint,created_at,revoked_at
            FROM integration_credentials WHERE workspace_id=%s AND creation_key=%s FOR UPDATE""",
         (workspace_id, idempotency_key),
     ).fetchone()
     if existing:
         if existing["creation_fingerprint"] != fingerprint or existing["revoked_at"]:
             raise IdempotencyConflict
-        return {key: existing[key] for key in ("id", "provider", "name", "created_at")} | {"created": False}
+        return {key: existing[key] for key in ("id", "provider", "name", "allowed_host", "created_at")} | {
+            "created": False}
 
     credential_id = str(uuid.uuid4())
     created_at = conn.execute(
         """INSERT INTO integration_credentials
-           (id,workspace_id,provider,name,created_by,creation_key,creation_fingerprint)
-           VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING created_at""",
-        (credential_id, workspace_id, provider, name, actor_id, idempotency_key, fingerprint),
+           (id,workspace_id,provider,name,allowed_host,created_by,creation_key,creation_fingerprint)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING created_at""",
+        (credential_id, workspace_id, provider, name, allowed_host, actor_id, idempotency_key, fingerprint),
     ).fetchone()
     conn.execute(
         """INSERT INTO integration_credential_secrets
@@ -342,13 +346,13 @@ def create_workspace_credential(
     )
     emit_event(conn, workspace_id, "credential.created", request_id=request_id,
                data={"credential_id": credential_id, "provider": provider, "actor_user_id": actor_id})
-    return {"id": credential_id, "provider": provider, "name": name, "created_at": created_at["created_at"],
-            "created": True}
+    return {"id": credential_id, "provider": provider, "name": name, "allowed_host": allowed_host,
+            "created_at": created_at["created_at"], "created": True}
 
 
 def list_workspace_credentials(conn: Connection, workspace_id: str) -> list[dict[str, Any]]:
     return conn.execute(
-        """SELECT id,provider,name,created_at,revoked_at,
+        """SELECT id,provider,name,allowed_host,created_at,revoked_at,
                   (SELECT max(version) FROM integration_credential_secrets s WHERE s.credential_id=c.id) AS version
            FROM integration_credentials c WHERE workspace_id=%s ORDER BY created_at DESC""",
         (workspace_id,),
@@ -360,14 +364,17 @@ def rotate_workspace_credential(
     idempotency_key: str, request_id: str, encryption_key: bytes,
 ) -> dict[str, Any] | None:
     credential = conn.execute(
-        """SELECT id,provider,name,revoked_at FROM integration_credentials
+        """SELECT id,provider,name,allowed_host,revoked_at FROM integration_credentials
            WHERE id=%s AND workspace_id=%s FOR UPDATE""", (credential_id, workspace_id)
     ).fetchone()
     if not credential or credential["revoked_at"]:
         return None
     fingerprint_key = hashlib.sha256(encryption_key).digest()
-    fingerprint = hmac.new(fingerprint_key, f"{credential['provider']}\0{credential['name']}\0{secret}".encode(),
-                           hashlib.sha256).hexdigest()
+    fingerprint = hmac.new(
+        fingerprint_key,
+        f"{credential['provider']}\0{credential['name']}\0{credential['allowed_host'] or ''}\0{secret}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
     previous = conn.execute(
         """SELECT version,secret_fingerprint,revoked_at FROM integration_credential_secrets
            WHERE credential_id=%s AND idempotency_key=%s FOR UPDATE""", (credential_id, idempotency_key)
@@ -419,16 +426,29 @@ def revoke_workspace_credential(
 
 def workspace_credential_secret(
     conn: Connection, workspace_id: str, credential_id: str, encryption_key: bytes,
-) -> dict[str, str] | None:
+) -> dict[str, Any] | None:
     row = conn.execute(
-        """SELECT c.provider,s.encrypted_secret FROM integration_credentials c
+        """SELECT c.provider,c.allowed_host,s.encrypted_secret FROM integration_credentials c
            JOIN integration_credential_secrets s ON s.credential_id=c.id
            WHERE c.id=%s AND c.workspace_id=%s AND c.revoked_at IS NULL AND s.revoked_at IS NULL""",
         (credential_id, workspace_id),
     ).fetchone()
     if not row:
         return None
-    return {"provider": row["provider"], "secret": decrypt_secret(row["encrypted_secret"], encryption_key)}
+    return {"provider": row["provider"], "allowed_host": row["allowed_host"],
+            "secret": decrypt_secret(row["encrypted_secret"], encryption_key)}
+
+
+def active_workspace_credential(conn: Connection, workspace_id: str, credential_id: str,
+                                provider: str, allowed_host: str | None = None) -> bool:
+    return bool(conn.execute(
+        """SELECT 1 FROM integration_credentials c
+           JOIN integration_credential_secrets s ON s.credential_id=c.id
+           WHERE c.id=%s AND c.workspace_id=%s AND c.provider=%s
+             AND c.allowed_host IS NOT DISTINCT FROM %s
+             AND c.revoked_at IS NULL AND s.revoked_at IS NULL""",
+        (credential_id, workspace_id, provider, allowed_host),
+    ).fetchone())
 
 
 def rotate_webhook_secret(
@@ -552,6 +572,8 @@ def persist_webhook_event(
             (workspace_id, endpoint_id, event_type),
         ).fetchall()
         for match in matches:
+            if any(step["action"] == "http" for step in match["definition"]["steps"]):
+                continue
             seed = f"{endpoint_id}:{event_key}:{match['version_id']}".encode()
             run_key = "webhook-trigger:" + hashlib.sha256(seed).hexdigest()
             definition = match["definition"]
@@ -912,22 +934,27 @@ def ingest_business_event(
     return {"event_key": event_key, "received": received_count, "workflow_id": run["id"], "created": created}
 
 
-def claim_task(conn: Connection, worker_id: str, lease_seconds: float) -> dict[str, Any] | None:
+def claim_task(conn: Connection, worker_id: str, lease_seconds: float,
+               *, tenant_id: str | None = None) -> dict[str, Any] | None:
     with conn.transaction():
+        tenant_filter = "AND t.tenant_id=%s" if tenant_id else ""
         selection = """SELECT t.id,t.tenant_id,t.run_id,t.step_index,t.attempts,t.max_attempts,
                           t.last_worker,t.request_id,w.title,w.definition
                    FROM tasks t JOIN workflow_runs w ON w.id=t.run_id
                    WHERE t.status IN ('queued','retry_wait') AND t.available_at<=clock_timestamp()
                      AND t.last_worker IS DISTINCT FROM %s
                      AND w.status NOT IN ('cancelled','completed','failed')
+                     {tenant_filter}
                    ORDER BY t.available_at,t.created_at
                    FOR UPDATE OF t SKIP LOCKED LIMIT 1"""
-        task = conn.execute(selection, (worker_id,)).fetchone()
+        selection = selection.format(tenant_filter=tenant_filter)
+        parameters = (worker_id, tenant_id) if tenant_id else (worker_id,)
+        task = conn.execute(selection, parameters).fetchone()
         if not task:
             # If this worker is the only available capacity, allow it to continue its prior run.
-            task = conn.execute(
-                selection.replace("AND t.last_worker IS DISTINCT FROM %s", ""), ()
-            ).fetchone()
+            fallback_parameters = (tenant_id,) if tenant_id else ()
+            task = conn.execute(selection.replace("AND t.last_worker IS DISTINCT FROM %s", ""),
+                                fallback_parameters).fetchone()
         if not task:
             return None
         conn.execute(
@@ -972,12 +999,22 @@ def recover_expired_leases(conn: Connection, request_id: str = "coordinator") ->
     recovered = 0
     with conn.transaction():
         expired = conn.execute(
-            """SELECT id,tenant_id,run_id,attempts,max_attempts,last_worker,request_id
-               FROM tasks WHERE status='running' AND lease_until<clock_timestamp()
-               FOR UPDATE SKIP LOCKED"""
+            """SELECT t.id,t.tenant_id,t.run_id,t.attempts,t.max_attempts,t.last_worker,t.request_id,
+                      w.status AS run_status
+               FROM tasks t JOIN workflow_runs w ON w.id=t.run_id
+               WHERE t.status='running' AND t.lease_until<clock_timestamp()
+               FOR UPDATE OF t SKIP LOCKED"""
         ).fetchall()
         for task in expired:
             recovered += 1
+            if task["run_status"] == "cancelled":
+                conn.execute(
+                    """UPDATE tasks SET status='cancelled',lease_owner=NULL,lease_until=NULL,
+                              updated_at=clock_timestamp() WHERE id=%s""", (task["id"],)
+                )
+                emit_event(conn, task["tenant_id"], "task.cancelled_after_lease_expiry", run_id=task["run_id"],
+                           worker_id=task["last_worker"], request_id=task["request_id"])
+                continue
             if task["attempts"] >= task["max_attempts"]:
                 error = {"kind": "lease_expired", "detail": "Worker lease expired; retry budget exhausted."}
                 conn.execute(
@@ -1012,12 +1049,20 @@ def fail_task(conn: Connection, task: dict[str, Any], worker_id: str, error: Exc
     data = {"kind": type(error).__name__, "detail": str(error)[:500]}
     with conn.transaction():
         row = conn.execute(
-            "SELECT tenant_id,run_id,attempts,max_attempts FROM tasks WHERE id=%s AND lease_owner=%s FOR UPDATE",
+            """SELECT t.tenant_id,t.run_id,t.attempts,t.max_attempts,w.status AS run_status
+               FROM tasks t JOIN workflow_runs w ON w.id=t.run_id
+               WHERE t.id=%s AND t.lease_owner=%s FOR UPDATE OF t,w""",
             (task["id"], worker_id),
         ).fetchone()
         if not row:
             return
-        if row["attempts"] >= row["max_attempts"]:
+        if row["run_status"] == "cancelled":
+            conn.execute("""UPDATE tasks SET status='cancelled',lease_owner=NULL,lease_until=NULL,
+                          updated_at=clock_timestamp() WHERE id=%s""", (task["id"],))
+            emit_event(conn, row["tenant_id"], "task.cancelled_after_action_failure", run_id=row["run_id"],
+                       task_id=task["id"], worker_id=worker_id, request_id=request_id)
+            return
+        if row["attempts"] >= row["max_attempts"] or isinstance(error, PermanentActionError):
             conn.execute(
                 """UPDATE tasks SET status='dead',lease_owner=NULL,lease_until=NULL,last_error=%s,
                    updated_at=clock_timestamp() WHERE id=%s""",
@@ -1088,7 +1133,36 @@ def execute_step(conn: Connection, worker_id: str, task: dict[str, Any], request
                                  (task["id"],))
                 return
 
-    result = {"action": action, **payload}
+    if action == "http":
+        from app.http_action import execute_http_action, PermanentActionError
+        from app.settings import LEASE_SECONDS, secret_encryption_key
+
+        active = conn.execute(
+            """SELECT w.status FROM tasks t JOIN workflow_runs w ON w.id=t.run_id
+               WHERE t.id=%s AND t.status='running' AND t.lease_owner=%s
+                 AND t.lease_until>clock_timestamp()""",
+            (task["id"], worker_id),
+        ).fetchone()
+        if not active:
+            return
+        if active["status"] == "cancelled":
+            with conn.transaction():
+                conn.execute("""UPDATE tasks SET status='cancelled',lease_owner=NULL,lease_until=NULL,
+                              updated_at=clock_timestamp() WHERE id=%s AND lease_owner=%s""",
+                             (task["id"], worker_id))
+                emit_event(conn, task["tenant_id"], "task.cancelled_before_http_action", run_id=task["run_id"],
+                           task_id=task["id"], worker_id=worker_id, request_id=request_id)
+            return
+        heartbeat(conn, worker_id, task["id"], LEASE_SECONDS)
+        key = secret_encryption_key(required=True)
+        credential = workspace_credential_secret(conn, task["tenant_id"], payload["credential_id"], key)
+        if not credential or credential["provider"] != "http":
+            raise PermanentActionError("HTTP action credential is unavailable or has the wrong provider.")
+        result = execute_http_action(payload, credential["secret"], f"{task['run_id']}:{index}",
+                                     credential["allowed_host"])
+        heartbeat(conn, worker_id, task["id"], LEASE_SECONDS)
+    else:
+        result = {"action": action, **payload}
     with conn.transaction():
         locked = conn.execute(
             """SELECT t.tenant_id,t.run_id,t.step_index,w.definition,w.status
@@ -1097,11 +1171,25 @@ def execute_step(conn: Connection, worker_id: str, task: dict[str, Any], request
                  AND t.status='running' FOR UPDATE OF t,w""",
             (task["id"], worker_id),
         ).fetchone()
-        if not locked or locked["status"] == "cancelled":
+        if not locked:
             return
         if locked["step_index"] != index:
             return
         effect_key = f"{task['run_id']}:{index}"
+        if locked["status"] == "cancelled":
+            if action == "http":
+                created = conn.execute(
+                    """INSERT INTO side_effects(id,tenant_id,run_id,idempotency_key,step_index,result)
+                       VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT(tenant_id,idempotency_key) DO NOTHING
+                       RETURNING id""",
+                    (str(uuid.uuid4()), task["tenant_id"], task["run_id"], effect_key, index, Jsonb(result)),
+                ).fetchone()
+                emit_event(conn, task["tenant_id"], "side_effect.completed_after_cancel", run_id=task["run_id"],
+                           task_id=task["id"], worker_id=worker_id, request_id=request_id,
+                           data={"step_index": index, "recorded": bool(created)})
+            conn.execute("""UPDATE tasks SET status='cancelled',lease_owner=NULL,lease_until=NULL,
+                          updated_at=clock_timestamp() WHERE id=%s""", (task["id"],))
+            return
         created = conn.execute(
             """INSERT INTO side_effects(id,tenant_id,run_id,idempotency_key,step_index,result)
                VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT(tenant_id,idempotency_key) DO NOTHING

@@ -262,7 +262,7 @@ def test_workspace_credentials_are_encrypted_scoped_rotatable_and_revocable(clie
         assert stored["encrypted_secret"] != first_secret
         assert decrypt_secret(stored["encrypted_secret"], key) == first_secret
         assert workspace_credential_secret(conn, workspace_id, credential["id"], key) == {
-            "provider": "github", "secret": first_secret,
+            "provider": "github", "allowed_host": None, "secret": first_secret,
         }
         assert workspace_credential_secret(conn, "another-workspace", credential["id"], key) is None
 
@@ -275,7 +275,7 @@ def test_workspace_credentials_are_encrypted_scoped_rotatable_and_revocable(clie
                        json={"secret": second_secret}).json()["created"] is False
     with client.app.state.pool.connection() as conn:
         assert workspace_credential_secret(conn, workspace_id, credential["id"], key) == {
-            "provider": "github", "secret": second_secret,
+            "provider": "github", "allowed_host": None, "secret": second_secret,
         }
     listed = client.get(path, headers=scoped_headers)
     assert listed.status_code == 200
@@ -289,6 +289,141 @@ def test_workspace_credentials_are_encrypted_scoped_rotatable_and_revocable(clie
             "WHERE credential_id=%s AND revoked_at IS NOT NULL", (credential["id"],),
         ).fetchone()["n"]
         assert secrets == 2
+
+
+def test_production_workflow_runs_only_allowlisted_http_steps(client, monkeypatch):
+    import app.http_action as http_action
+    import app.main as main
+
+    monkeypatch.setenv("RELAYCORE_HTTP_ALLOWED_HOSTS", "hooks.example.com,other.example.com")
+    owner_email = "production-http-owner@example.test"
+    with client.app.state.pool.connection() as conn, conn.transaction():
+        user = upsert_oidc_user(conn, "https://identity.example", str(uuid.uuid4()), owner_email, owner_email)
+        token = create_auth_session(conn, user["id"], "production-http-auth-test", 3600)
+    headers = {"Cookie": f"{SESSION_COOKIE}={token}"}
+    workspace = client.post("/api/workspaces", headers=headers, json={"name": "Production HTTP Team"})
+    assert workspace.status_code == 201, workspace.text
+    workspace_id = workspace.json()["id"]
+    scoped_headers = {**headers, "X-Workspace-ID": workspace_id}
+    credentials_path = f"/api/workspaces/{workspace_id}/credentials"
+    stored_secret = "http-bearer-" + "x" * 24
+    missing_host = client.post(credentials_path,
+                               headers={**scoped_headers, "Idempotency-Key": "http:credential:no-host"},
+                               json={"provider": "http", "name": "unbound", "secret": stored_secret})
+    assert missing_host.status_code == 422 and stored_secret not in missing_host.text
+    stored = client.post(credentials_path, headers={**scoped_headers, "Idempotency-Key": "http:credential"},
+                         json={"provider": "http", "name": "build service", "secret": stored_secret,
+                               "allowed_host": "hooks.example.com"})
+    assert stored.status_code == 201, stored.text
+
+    monkeypatch.setattr(main, "DEMO_MODE", False)
+    steps = [{"name": "notify build service", "action": "http", "payload": {
+        "method": "POST", "url": "https://hooks.example.com/v1/events",
+        "credential_id": stored.json()["id"], "body": {"event": "build.completed"},
+    }}]
+    definition = client.post("/api/workflow-definitions", headers={**scoped_headers,
+                            "Idempotency-Key": "http:workflow:create"},
+                             json={"title": "Notify build service", "steps": steps})
+    assert definition.status_code == 201, definition.text
+    wrong_host = client.post("/api/workflow-definitions", headers={**scoped_headers,
+                             "Idempotency-Key": "http:workflow:wrong-host"}, json={
+        "title": "Credential host mismatch", "steps": [{"name": "exfiltrate", "action": "http", "payload": {
+            "method": "POST", "url": "https://other.example.com/v1/events",
+            "credential_id": stored.json()["id"], "body": {"event": "build.completed"},
+        }}],
+    })
+    assert wrong_host.status_code == 422
+
+    calls = []
+
+    def send(payload, credential, idempotency_key, allowed_host):
+        calls.append((payload, credential, idempotency_key, allowed_host))
+        return {"status_code": 202, "response_bytes": 0, "content_type": "application/json"}
+
+    monkeypatch.setattr(http_action, "execute_http_action", send)
+    run_headers = {**scoped_headers, "Idempotency-Key": "http:workflow:run"}
+    run = client.post(f"/api/workflow-definitions/{definition.json()['id']}/runs", headers=run_headers)
+    assert run.status_code == 202, run.text
+    drive_run(client, workspace_id, worker_id="production-http-test-worker")
+    completed = get_run(client, run.json()["id"], workspace_id)
+    assert completed["status"] == "completed"
+    assert completed["side_effects"][0]["result"]["status_code"] == 202
+    assert calls == [(steps[0]["payload"], stored_secret, f"{run.json()['id']}:0", "hooks.example.com")]
+    repeated = client.post(f"/api/workflow-definitions/{definition.json()['id']}/runs", headers=run_headers)
+    assert repeated.status_code == 202 and repeated.json()["created"] is False
+
+    sandbox_actions = client.post("/api/workflows", headers={**scoped_headers,
+                                   "Idempotency-Key": "http:sandbox-action"}, json={
+        "title": "Sandbox action", "steps": [{"name": "fake", "action": "record", "payload": {}}],
+    })
+    assert sandbox_actions.status_code == 422
+    webhook_trigger = client.post("/api/workflow-definitions", headers={**scoped_headers,
+                                "Idempotency-Key": "http:trigger"}, json={
+        "title": "Not enabled", "steps": steps,
+        "trigger": {"endpoint_id": str(uuid.uuid4()), "event_type": "push"},
+    })
+    assert webhook_trigger.status_code == 501
+
+    cancelled_run = client.post(f"/api/workflow-definitions/{definition.json()['id']}/runs",
+                                headers={**scoped_headers, "Idempotency-Key": "http:workflow:cancel"})
+    assert cancelled_run.status_code == 202, cancelled_run.text
+    started, release = threading.Event(), threading.Event()
+
+    def slow_send(_payload, _credential, _idempotency_key, _allowed_host):
+        started.set()
+        assert release.wait(5)
+        return {"status_code": 202, "response_bytes": 0, "content_type": "application/json"}
+
+    monkeypatch.setattr(http_action, "execute_http_action", slow_send)
+    with client.app.state.pool.connection() as conn:
+        task = claim_task(conn, "http-cancel-test-worker", 5, tenant_id=workspace_id)
+    assert task and task["run_id"] == cancelled_run.json()["id"]
+
+    from app.store import execute_step, fail_task
+
+    def execute_in_worker():
+        with connect(DATABASE_URL, row_factory=dict_row, autocommit=True) as conn:
+            try:
+                execute_step(conn, "http-cancel-test-worker", task, task["request_id"])
+            except Exception as exc:
+                fail_task(conn, task, "http-cancel-test-worker", exc, task["request_id"])
+
+    worker = threading.Thread(target=execute_in_worker)
+    worker.start()
+    try:
+        assert started.wait(3)
+        cancelled = client.post(f"/api/workflows/{cancelled_run.json()['id']}/cancel", headers=scoped_headers)
+        assert cancelled.status_code == 200
+        with client.app.state.pool.connection() as conn:
+            task_state = conn.execute("SELECT status FROM tasks WHERE id=%s", (task["id"],)).fetchone()
+            assert task_state["status"] == "running"
+        release.set()
+    finally:
+        release.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    after_cancel = get_run(client, cancelled_run.json()["id"], workspace_id)
+    assert after_cancel["status"] == "cancelled"
+    assert after_cancel["task_status"] == "cancelled"
+    assert after_cancel["side_effects"][0]["result"]["status_code"] == 202
+    assert any(event["kind"] == "side_effect.completed_after_cancel" for event in after_cancel["events"])
+
+
+def test_permanent_provider_action_errors_dead_letter_without_retry(client):
+    from app.http_action import PermanentActionError
+    from app.store import fail_task
+
+    response = make_workflow(client, steps=[{"name": "provider action", "action": "record", "payload": {}}])
+    assert response.status_code == 202
+    with client.app.state.pool.connection() as conn:
+        task = claim_task(conn, "permanent-action-test-worker", 1.2, tenant_id=TEST_TENANT)
+        assert task
+        fail_task(conn, task, "permanent-action-test-worker", PermanentActionError("bad request"),
+                  task["request_id"])
+        row = conn.execute("SELECT status,attempts,max_attempts FROM tasks WHERE id=%s", (task["id"],)).fetchone()
+        letters = conn.execute("SELECT attempts FROM dead_letters WHERE task_id=%s", (task["id"],)).fetchall()
+    assert row == {"status": "dead", "attempts": 1, "max_attempts": 3}
+    assert letters == [{"attempts": 1}]
 
 
 def test_workspace_webhooks_verify_signatures_and_dedupe_replays(client, monkeypatch):
@@ -754,7 +889,7 @@ def test_non_demo_mode_hides_worker_metadata_and_rejects_simulated_actions(clien
     assert status.status_code == 200
     assert status.json()["workers"] == []
     response = make_workflow(client)
-    assert response.status_code == 501
+    assert response.status_code == 422
 
 
 def test_tenant_event_ids_follow_transaction_commit_order(client):
@@ -806,7 +941,8 @@ def test_versioned_migrations_bootstrap_and_skip_applied_files():
             migrate(conn)
             assert conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall() == [
                 {"version": "001"}, {"version": "002"}, {"version": "003"},
-                {"version": "004"}, {"version": "005"}, {"version": "006"}, {"version": "007"}
+                {"version": "004"}, {"version": "005"}, {"version": "006"}, {"version": "007"},
+                {"version": "008"}
             ]
             assert conn.execute("SELECT count(*) AS n FROM tasks").fetchone()["n"] == 0
             tables = conn.execute(
@@ -827,6 +963,11 @@ def test_versioned_migrations_bootstrap_and_skip_applied_files():
                 (["integration_credentials", "integration_credential_secrets"],),
             ).fetchall()
             assert len(credential_tables) == 2
+            assert conn.execute(
+                """SELECT column_name FROM information_schema.columns
+                   WHERE table_schema=current_schema() AND table_name='integration_credentials'
+                     AND column_name='allowed_host'"""
+            ).fetchone() == {"column_name": "allowed_host"}
             assert conn.execute(
                 """SELECT column_name FROM information_schema.columns
                    WHERE table_schema=current_schema() AND table_name='workflow_versions'
@@ -856,7 +997,8 @@ def test_workflow_version_migration_upgrades_an_existing_001_database():
                 "SELECT version FROM schema_migrations ORDER BY version"
             ).fetchall() == [
                 {"version": "001"}, {"version": "002"}, {"version": "003"},
-                {"version": "004"}, {"version": "005"}, {"version": "006"}, {"version": "007"}
+                {"version": "004"}, {"version": "005"}, {"version": "006"}, {"version": "007"},
+                {"version": "008"}
             ]
             columns = conn.execute(
                 """SELECT column_name FROM information_schema.columns
@@ -867,6 +1009,11 @@ def test_workflow_version_migration_upgrades_an_existing_001_database():
             assert conn.execute(
                 """SELECT 1 FROM information_schema.tables
                    WHERE table_schema=%s AND table_name='workspace_members'""", (schema,)
+            ).fetchone()
+            assert conn.execute(
+                """SELECT 1 FROM information_schema.columns
+                   WHERE table_schema=%s AND table_name='integration_credentials' AND column_name='allowed_host'""",
+                (schema,),
             ).fetchone()
         finally:
             conn.execute("SET search_path TO public")

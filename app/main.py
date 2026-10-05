@@ -26,6 +26,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.auth import Identity, Principal, SESSION_COOKIE, authenticated_identity, authorize, principal, verified_oidc_profile
+from app.http_action import validate_http_target
 from app.coordinator import run as run_coordinator
 from app.models import (
     DemoFailureRequest,
@@ -67,6 +68,7 @@ from app.store import (
     create_workspace,
     create_webhook_endpoint,
     create_workspace_credential,
+    active_workspace_credential,
     dashboard,
     emit_event,
     get_workflow_definition,
@@ -403,9 +405,25 @@ def credential_encryption_key() -> bytes:
 
 def credential_secret_value(secret: Any) -> str:
     value = secret.get_secret_value()
-    if not 16 <= len(value) <= 4096:
+    if not 16 <= len(value) <= 4096 or any(ord(c) < 32 or ord(c) == 127 for c in value):
         raise HTTPException(422, "Credential secret must be between 16 and 4096 characters.")
     return value
+
+
+def validate_workflow_actions(conn, workspace_id: str, steps: list[dict[str, Any]], trigger: Any = None) -> None:
+    actions = {step["action"] for step in steps}
+    if DEMO_MODE:
+        if "http" in actions:
+            raise HTTPException(422, "Outbound HTTP actions are disabled in Demo Mode.")
+        return
+    if trigger:
+        raise HTTPException(501, "Production webhook-triggered workflow dispatch is not implemented yet.")
+    if actions != {"http"}:
+        raise HTTPException(422, "Production workflows currently support only allowlisted HTTP actions.")
+    for step in steps:
+        host, _, _ = validate_http_target(step["payload"]["url"])
+        if not active_workspace_credential(conn, workspace_id, step["payload"]["credential_id"], "http", host):
+            raise HTTPException(422, "Each HTTP action must reference an active HTTP credential in this workspace.")
 
 
 @app.get("/api/workspaces/{workspace_id}/credentials")
@@ -431,8 +449,8 @@ def new_credential(workspace_id: str, body: CredentialCreateRequest, request: Re
         key = valid_idempotency_key(idempotency_key)
         with pool.connection() as conn, conn.transaction():
             return create_workspace_credential(conn, workspace_id, user.user_id, body.provider, body.name,
-                                               credential_secret_value(body.secret), key, request_id(request),
-                                               credential_encryption_key())
+                                               credential_secret_value(body.secret), body.allowed_host, key,
+                                               request_id(request), credential_encryption_key())
     except IdempotencyConflict as exc:
         raise HTTPException(409, "This idempotency key was already used for a different or revoked credential.") from exc
     except SecretStorageError as exc:
@@ -658,13 +676,12 @@ def create(
     pool: ConnectionPool = Depends(pool_for),
 ) -> dict[str, Any]:
     authorize(user, "admin", "operator")
-    if not DEMO_MODE:
-        raise HTTPException(501, "Production workflow actions are not implemented yet. Enable Demo Mode for local simulations.")
     try:
         key = valid_idempotency_key(idempotency_key)
         with pool.connection() as conn:
-            result = create_workflow(conn, user.tenant_id, body.title,
-                                     [step.model_dump() for step in body.steps], key, request_id(request))
+            steps = [step.model_dump(mode="json") for step in body.steps]
+            validate_workflow_actions(conn, user.tenant_id, steps)
+            result = create_workflow(conn, user.tenant_id, body.title, steps, key, request_id(request))
     except (QueueFull, RateLimited, IdempotencyConflict, ValueError) as exc:
         rate_limit_error(exc)
     return result
@@ -686,15 +703,16 @@ def create_definition(
     pool: ConnectionPool = Depends(pool_for),
 ) -> dict[str, Any]:
     authorize(user, "admin", "operator")
-    if not DEMO_MODE:
-        raise HTTPException(501, "Production workflow actions are not implemented yet.")
     try:
         key = valid_idempotency_key(idempotency_key)
         with pool.connection() as conn:
+            steps = [step.model_dump(mode="json") for step in body.steps]
+            trigger = body.trigger.model_dump(mode="json") if body.trigger else None
+            validate_workflow_actions(conn, user.tenant_id, steps, trigger)
             return create_workflow_definition(
-                conn, user.tenant_id, body.title, [step.model_dump() for step in body.steps],
+                conn, user.tenant_id, body.title, steps,
                 key, user.credential_fingerprint, request_id(request), user.user_id,
-                trigger=body.trigger.model_dump(mode="json") if body.trigger else None,
+                trigger=trigger,
             )
     except WebhookEndpointNotFound as exc:
         raise HTTPException(404, "Webhook trigger endpoint not found in this workspace.") from exc
@@ -722,15 +740,16 @@ def publish_workflow_version(
     pool: ConnectionPool = Depends(pool_for),
 ) -> dict[str, Any]:
     authorize(user, "admin", "operator")
-    if not DEMO_MODE:
-        raise HTTPException(501, "Production workflow actions are not implemented yet.")
     try:
         key = valid_idempotency_key(idempotency_key)
         with pool.connection() as conn:
+            steps = [step.model_dump(mode="json") for step in body.steps]
+            trigger = body.trigger.model_dump(mode="json") if body.trigger else None
+            validate_workflow_actions(conn, user.tenant_id, steps, trigger)
             result = add_workflow_version(
-                conn, user.tenant_id, workflow_id, body.title, [step.model_dump() for step in body.steps],
+                conn, user.tenant_id, workflow_id, body.title, steps,
                 key, user.credential_fingerprint, request_id(request), user.user_id,
-                trigger=body.trigger.model_dump(mode="json") if body.trigger else None,
+                trigger=trigger,
             )
     except WebhookEndpointNotFound as exc:
         raise HTTPException(404, "Webhook trigger endpoint not found in this workspace.") from exc
@@ -752,11 +771,14 @@ def run_workflow_definition(
     pool: ConnectionPool = Depends(pool_for),
 ) -> dict[str, Any]:
     authorize(user, "admin", "operator")
-    if not DEMO_MODE:
-        raise HTTPException(501, "Production workflow actions are not implemented yet.")
     try:
         key = valid_idempotency_key(idempotency_key)
         with pool.connection() as conn:
+            definition = get_workflow_definition(conn, user.tenant_id, workflow_id)
+            if definition:
+                latest = max(definition["versions"], key=lambda version: version["version_number"])
+                snapshot = latest["definition"]
+                validate_workflow_actions(conn, user.tenant_id, snapshot["steps"], snapshot.get("trigger"))
             result = trigger_workflow_definition(conn, user.tenant_id, workflow_id, key, request_id(request))
     except WorkflowDisabled as exc:
         raise HTTPException(409, "Workflow is disabled.") from exc
@@ -795,7 +817,10 @@ def cancel(run_id: str, request: Request, user: Principal = Depends(principal),
         if run["status"] in {"completed", "failed", "cancelled"}:
             raise HTTPException(409, f"Workflow is already {run['status']}.")
         conn.execute("UPDATE workflow_runs SET status='cancelled',finished_at=clock_timestamp() WHERE id=%s", (run_id,))
-        conn.execute("UPDATE tasks SET status='cancelled',lease_owner=NULL,lease_until=NULL,updated_at=clock_timestamp() WHERE run_id=%s", (run_id,))
+        conn.execute(
+            """UPDATE tasks SET status='cancelled',lease_owner=NULL,lease_until=NULL,updated_at=clock_timestamp()
+               WHERE run_id=%s AND status IN ('queued','retry_wait')""", (run_id,)
+        )
         emit_event(conn, user.tenant_id, "workflow.cancelled", run_id=run_id, request_id=request_id(request),
                    data={"actor_role": user.role})
     return {"id": run_id, "status": "cancelled"}
