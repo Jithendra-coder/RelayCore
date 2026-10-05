@@ -1,11 +1,57 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import time
+import uuid
 
 import psycopg
 from psycopg.rows import dict_row
 from app.supervisor import WorkerSupervisor
 from tests.conftest import ADMIN, get_run, make_workflow
+
+
+def test_external_worker_has_unique_safe_identity(monkeypatch):
+    import pytest
+    import app.worker as worker
+
+    monkeypatch.delenv("RELAYCORE_WORKER_ID", raising=False)
+    monkeypatch.setattr(worker.socket, "gethostname", lambda: "worker-node")
+    monkeypatch.setattr(worker.os, "getpid", lambda: 1234)
+    assert worker.worker_identifier() == "worker-worker-node-1234"
+    monkeypatch.setenv("RELAYCORE_WORKER_ID", 'bad"\nworker')
+    with pytest.raises(RuntimeError, match="safe identifier"):
+        worker.worker_identifier()
+
+
+def test_external_worker_process_claims_work_without_api_supervisor(client):
+    worker_id = f"external-{uuid.uuid4().hex[:12]}"
+    environment = os.environ.copy()
+    environment["RELAYCORE_WORKER_ID"] = worker_id
+    process = subprocess.Popen([sys.executable, "-m", "app.worker"],
+                               cwd=os.path.dirname(os.path.dirname(__file__)), env=environment,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        response = make_workflow(client, steps=[
+            {"name": "processed by the standalone service", "action": "record", "payload": {"ok": True}},
+        ])
+        run_id = response.json()["id"]
+        deadline = time.monotonic() + 8
+        run = get_run(client, run_id)
+        while run["status"] not in {"completed", "failed", "cancelled"} and time.monotonic() < deadline:
+            time.sleep(0.05)
+            run = get_run(client, run_id)
+        assert run["status"] == "completed"
+        assert any(event["worker_id"] == worker_id for event in run["events"] if event["kind"] == "task.claimed")
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
 
 
 def test_real_worker_process_kill_expires_lease_and_reassigns(client):

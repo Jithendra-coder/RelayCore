@@ -25,6 +25,10 @@ For GitHub App events, set the App's setup and OAuth callback URLs to the config
 
 For Slack, the OAuth callback must return to the signed-in RelayCore admin who started linking. RelayCore verifies Slack's timestamped signature over the raw Events API body, answers URL verification challenges, and currently normalizes only `app_mention`. Slack tokens are encrypted in PostgreSQL and revoked locally when the app is disconnected or uninstalled. Production workflows can post static messages to conversation IDs. After adding or changing Slack scopes, an owner/admin must use **Reconnect** in the dashboard to refresh the installation token; invite the bot to any channel where workflows should post. Delivery remains at least once, so an ambiguous network failure can result in a duplicate post. Live Slack credentials and delivery have not been verified here.
 
+## API and worker processes
+
+For separate deployment roles, set `RELAYCORE_WORKERS=0` on the API and run one or more containers from the same image with `python -m app.worker`. Workers need the same `DATABASE_URL`, `RELAYCORE_DEMO_MODE`, lease settings, encryption key, and HTTP host policy as the API. Each worker defaults to an ID built from its hostname and process ID; set a unique `RELAYCORE_WORKER_ID` if the runtime does not provide unique hostnames. Run at least one worker or accepted runs will remain queued. The local override `compose.workers.yaml` demonstrates this process boundary. Demo kill/restart controls are available only when the API supervises its workers.
+
 ## Deployment status
 
 There is no staging or production infrastructure, Terraform, image publishing, migration rollout, rollback automation, or cloud smoke test yet. A production release is blocked until provider-backed workflow actions and those deployment controls are implemented and verified. See [LIMITATIONS.md](LIMITATIONS.md).

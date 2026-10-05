@@ -156,6 +156,9 @@ def test_dashboard_uses_session_auth_and_requires_workspace_selection():
     assert "headers:{Authorization:'Bearer '+keyInput.value.trim()" not in html
     assert "$('slackConnect').textContent=connected?'Reconnect':'Connect'" in html
     assert "$('slackConnect').classList.toggle('hidden',!admin)" in html
+    assert "if(cfg.worker_count===0)" in html
+    assert "button.remove()" in html
+    assert "managed outside API" in html
 
 
 def test_oidc_configuration_requires_complete_https_credentials(monkeypatch):

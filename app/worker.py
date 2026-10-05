@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import signal
 import socket
 import threading
@@ -16,8 +17,15 @@ logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(message
 logger = logging.getLogger("relaycore.worker")
 
 
+def worker_identifier() -> str:
+    worker_id = os.environ.get("RELAYCORE_WORKER_ID") or f"worker-{socket.gethostname()}-{os.getpid()}"
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", worker_id):
+        raise RuntimeError("RELAYCORE_WORKER_ID must be 1–128 safe identifier characters.")
+    return worker_id
+
+
 def main() -> None:
-    worker_id = os.environ.get("RELAYCORE_WORKER_ID", f"worker-{os.getpid()}")
+    worker_id = worker_identifier()
     stopped = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stopped.set())
     if hasattr(signal, "SIGBREAK"):

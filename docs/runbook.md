@@ -3,6 +3,7 @@
 ## Start and stop
 
 - Start: `scripts/demo.ps1`; Compose binds the HTTP service to `127.0.0.1` only.
+- To run a standalone worker locally, use `docker compose -f compose.yaml -f compose.workers.yaml up --build -d`. The override sets API `RELAYCORE_WORKERS=0` and runs `python -m app.worker` in its own container. The regular Demo Mode keeps API-managed workers so the dashboard can exercise kill/restart controls.
 - On API startup, RelayCore applies pending numbered SQL migrations from `app/migrations/` while holding a PostgreSQL advisory lock. Back up production data before deploying schema changes; applied migration files must remain unchanged.
 - In Demo Mode, create and publish definitions with `POST /api/workflow-definitions` and `POST /api/workflow-definitions/{id}/versions`, then queue the current version with `POST /api/workflow-definitions/{id}/runs`. Each queued run retains its published version and definition hash; local sandbox actions are available only in Demo Mode.
 - For a non-demo deployment, configure every `RELAYCORE_OIDC_*` value documented in `.env.example`, set `RELAYCORE_DEMO_MODE=0`, then visit `/auth/login`. The first signed-in user creates a workspace from the dashboard. API requests must send `X-Workspace-ID` when the user belongs to more than one workspace; the dashboard stores and sends the selected workspace automatically.
@@ -29,7 +30,7 @@
 | `DATABASE_URL` | Compose PostgreSQL service | Durable data and queue |
 | `RELAYCORE_API_KEYS` | `.env.example` demo/viewer keys | Secret-to-tenant/role mapping |
 | `RELAYCORE_DEMO_MODE` | `1` | Enables deterministic failure-injection endpoints |
-| `RELAYCORE_WORKERS` | `2` | Number of child processes supervised by the API |
+| `RELAYCORE_WORKERS` | `2` | Number of child processes supervised by the API; set to `0` when using a separate worker service |
 | `RELAYCORE_QUEUE_LIMIT` | `1000` | Per-tenant active workflow admission bound |
 | `RELAYCORE_RATE_LIMIT_PER_MINUTE` | `600` | Per-tenant mutation bound |
 | `RELAYCORE_LEASE_SECONDS` | `4` | Lease renewed while the step is active |
@@ -37,10 +38,10 @@
 | `RELAYCORE_OIDC_*` | unset | Required for production sign-in; values and HTTPS constraints are in `DEPLOYMENT.md` |
 | `RELAYCORE_SECRET_ENCRYPTION_KEY` | unset | Required in production; Fernet key injected by a secret manager for encrypted webhook keys |
 
-Do not run multiple API supervisor instances with the same worker IDs. For horizontal API scaling, move worker lifecycle supervision into a separately deployed worker service and use unique worker IDs. The database claim remains safe across competing workers through `SKIP LOCKED`.
+For separate deployment roles, set API `RELAYCORE_WORKERS=0` and run `python -m app.worker` in the worker service. Worker IDs default to hostname plus process ID; if hostnames are shared across replicas, configure a unique `RELAYCORE_WORKER_ID` on each. The database claim remains safe across competing workers through `SKIP LOCKED`. The regular Demo Mode Compose stack keeps API-managed workers so its failure-injection controls can terminate and restart workers.
 
 ## Operational guarantees and limits
 
-PostgreSQL is the only durable coordination dependency. Heartbeats and leases are database rows, so API/worker process restart does not discard an accepted task. The coordinator retries an expired lease with capped exponential backoff and stores terminal work in the DLQ. An API restart starts configured worker children; a deliberately killed worker stays stopped until a human restarts it.
+PostgreSQL is the only durable coordination dependency. Heartbeats and leases are database rows, so API/worker process restart does not discard an accepted task. The coordinator retries an expired lease with capped exponential backoff and stores terminal work in the DLQ. In the default local stack, an API restart starts configured worker children and a deliberately killed worker stays stopped until a human restarts it. In separate-role deployments, the orchestrator restarts worker containers according to its policy.
 
 The built-in charge action writes a local effect record, not a real payment. A provider timeout after an external service performed work but before RelayCore recorded the response remains an ambiguous outcome; provider-side idempotency or an outbox/reconciliation flow is needed. This local failure test does not model every network partition or prove multi-region availability.

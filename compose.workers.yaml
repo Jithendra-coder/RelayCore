@@ -1,0 +1,19 @@
+services:
+  api:
+    environment:
+      RELAYCORE_WORKERS: "0"
+
+  worker:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://relaycore:relaycore-local-change-me@db:5432/relaycore}
+      RELAYCORE_DEMO_MODE: ${RELAYCORE_DEMO_MODE:-1}
+      RELAYCORE_LEASE_SECONDS: ${RELAYCORE_LEASE_SECONDS:-4}
+      RELAYCORE_SECRET_ENCRYPTION_KEY: ${RELAYCORE_SECRET_ENCRYPTION_KEY-}
+      RELAYCORE_HTTP_ALLOWED_HOSTS: ${RELAYCORE_HTTP_ALLOWED_HOSTS-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    command: ["python", "-m", "app.worker"]
+    restart: unless-stopped

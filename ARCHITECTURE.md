@@ -12,6 +12,6 @@ Workspace administrators can create HMAC-signed webhook endpoints. Their random 
 
 Delivery is at least once. Database effects are idempotent by tenant and step key. Production workflow steps are limited to bounded HTTP requests bound to one approved host and static Slack messages using the active workspace installation. The database cannot atomically commit an external provider side effect; HTTP actions use provider idempotency keys, while Slack posts may duplicate after an ambiguous response.
 
-The API process starts its own worker supervisor. Do not run multiple API supervisors with duplicate worker IDs against the same database. Horizontal production scaling needs a distinct worker service and unique worker identities.
+The API can start local child workers for Demo Mode. Production can set `RELAYCORE_WORKERS=0` and run `python -m app.worker` as a separate process role; the optional `compose.workers.yaml` shows the boundary. Standalone worker IDs include hostname and process ID unless a unique `RELAYCORE_WORKER_ID` is set.
 
 See [docs/architecture.md](docs/architecture.md), [docs/adr/004-multitenancy.md](docs/adr/004-multitenancy.md), and [PROJECT_STATUS.md](PROJECT_STATUS.md) for detailed invariants and evidence.
