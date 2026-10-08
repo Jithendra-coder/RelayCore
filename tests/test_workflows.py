@@ -1568,7 +1568,29 @@ def test_versioned_migrations_bootstrap_and_skip_applied_files():
                 """SELECT column_default FROM information_schema.columns
                    WHERE table_schema=current_schema() AND table_name='workspace_api_tokens'
                      AND column_name='role_ceiling'"""
-            ).fetchone() == {"column_default": "'admin'::text"}
+            ).fetchone() == {"column_default": "'operator'::text"}
+        finally:
+            conn.execute("SET search_path TO public")
+            conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
+
+
+def test_api_token_role_migration_preserves_legacy_tokens_and_uses_safe_default():
+    from pathlib import Path
+
+    schema = f"api_token_migration_{uuid.uuid4().hex}"
+    migration = Path(__file__).parents[1] / "app" / "migrations" / "017_workspace_api_token_role_ceiling.sql"
+    with connect(DATABASE_URL, autocommit=True, row_factory=dict_row) as conn:
+        conn.execute(f'CREATE SCHEMA "{schema}"')
+        try:
+            conn.execute(f'SET search_path TO "{schema}"')
+            conn.execute("CREATE TABLE workspace_api_tokens (id UUID PRIMARY KEY)")
+            legacy_id, new_id = uuid.uuid4(), uuid.uuid4()
+            conn.execute("INSERT INTO workspace_api_tokens(id) VALUES (%s)", (legacy_id,))
+            conn.execute(migration.read_text(encoding="utf-8"), prepare=False)
+            assert conn.execute("SELECT role_ceiling FROM workspace_api_tokens WHERE id=%s", (legacy_id,)
+                                ).fetchone() == {"role_ceiling": "admin"}
+            assert conn.execute("INSERT INTO workspace_api_tokens(id) VALUES (%s) RETURNING role_ceiling",
+                                (new_id,)).fetchone() == {"role_ceiling": "operator"}
         finally:
             conn.execute("SET search_path TO public")
             conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
