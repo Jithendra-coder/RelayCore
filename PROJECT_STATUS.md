@@ -10,7 +10,7 @@ Identity, workspace authorization, signed durable webhook intake, encrypted work
 |---|---|---|
 | P0 Repository audit and architecture decision | Complete | Preserve the PostgreSQL workflow/worker core; findings and invariants in `docs/architecture.md`. |
 | P1–P5 Durable execution and recovery | Complete locally | Persistent queue, leases, retry/recovery, cancellation, idempotent database effects, DLQ/replay, and process/database restart evidence. |
-| P6–P7 Tenant controls and observability | Complete locally | Demo roles, tenant-scoped authorization, request IDs, structured logs, SSE, Prometheus gauges, hash-only workspace scrape tokens, three Prometheus alert rules, and optional OTLP/HTTP traces with durable W3C context propagation. Live Prometheus/Alertmanager and collector deployments remain unverified. |
+| P6–P7 Tenant controls and observability | Complete locally | Demo roles, tenant-scoped authorization, request IDs, structured logs, SSE, Prometheus gauges, hash-only workspace scrape tokens, three Prometheus alert rules with promtool firing/quiet tests, and optional OTLP/HTTP traces with durable W3C context propagation. Live Prometheus/Alertmanager and collector deployments remain unverified. |
 | P8–P10 Failure tests and measurement | Complete locally | Worker failure, service/database restart, synthetic worker-count benchmark, and query-plan comparison. Evidence is local, not cloud or production proof. |
 | Workflow versioning | Complete locally | Immutable versions, run/hash pinning, publication idempotency, and migration coverage. OIDC authors are recorded by user ID; sandbox authors retain credential fingerprints. |
 | OIDC identity and workspaces | Complete locally; live provider unverified | Authlib callback, verified issuer/subject/email checks, expiring/revocable hashed sessions, workspace creation, role enforcement, origin checks, and cross-workspace tests. |
@@ -33,14 +33,14 @@ Identity, workspace authorization, signed durable webhook intake, encrypted work
 
 ## Latest validation
 
-- PostgreSQL integration suite: **87 passed** on PostgreSQL 18, GitHub Actions run [37776644359](https://github.com/Jithendra-coder/RelayCore/actions/runs/37776644359), with **82% app source coverage**. Tests cover hash-only workspace scrape tokens, viewer-only metric access, revocation, YAML structure for the Prometheus config and rules, trace propagation, schedule concurrency, webhook retention, workspace isolation, and migration upgrades.
+- PostgreSQL integration suite: **87 passed** on PostgreSQL 18, GitHub Actions run [37777852783](https://github.com/Jithendra-coder/RelayCore/actions/runs/37777852783), with **81.57% app source coverage** against an enforced 80% floor. Tests cover hash-only workspace scrape tokens, viewer-only metric access, revocation, Prometheus config/rule structure, trace propagation, schedule concurrency, webhook retention, workspace isolation, and migration upgrades.
 - Ruff, pre-commit, compilation, and `git diff --check` pass. CI enforces at least 80% app source coverage and runs Prometheus `promtool` against the alert rules and config syntax.
-- The latest full source-to-target restore drill passed in run [37776644359](https://github.com/Jithendra-coder/RelayCore/actions/runs/37776644359): the real PowerShell scripts restored all 15 migrations and a known workflow row between disposable PostgreSQL 16 databases. `restore.ps1 -WhatIf` was also used locally to validate an archive without changing a database. This does not verify managed retention or disaster recovery.
+- The latest full source-to-target restore drill passed in run [37777852783](https://github.com/Jithendra-coder/RelayCore/actions/runs/37777852783): the real PowerShell scripts restored all 15 migrations and a known workflow row between disposable PostgreSQL 16 databases. `restore.ps1 -WhatIf` was also used locally to validate an archive without changing a database. This does not verify managed retention or disaster recovery.
 - `python -m compileall -q app tests benchmarks scripts` passes. Runtime limits fail fast when worker count, attempt range, queue/schedule/rate limits, payload retention, or lease duration are invalid.
 - Local live Demo Mode evidence: 10 duplicate deliveries -> 1 workflow -> 3 effects; a killed worker was replaced after lease expiry; DLQ replay completed. Queue depth ended at 0. The recorded P95 includes recovery delay.
 - Synthetic 100-workflow P95: 3,096.99 ms (1 worker), 2,364.86 ms (2), 2,289.27 ms (4); 0/100 failures each. A local 20,000-row query measured 15.411 ms before and 0.126 ms after a partial index in one run. See `BENCHMARKS.md` and `docs/evidence.md`.
 - GitHub Actions run [37770598389](https://github.com/Jithendra-coder/RelayCore/actions/runs/37770598389) passed the retention commit on PostgreSQL 18, including Ruff, pre-commit, the full test suite, both Compose configurations, and the image build. The dependency audit passed in run [37771385684](https://github.com/Jithendra-coder/RelayCore/actions/runs/37771385684). Docker, a live OIDC provider, external integrations, and cloud deployment were not run locally.
-- GitHub Actions dependency audit run [37776644261](https://github.com/Jithendra-coder/RelayCore/actions/runs/37776644261) passed for the current metrics-token and alert-rule commit. The full CI test job also passed Ruff, pre-commit, both Compose validations, and the container image build.
+- GitHub Actions dependency audit run [37777852817](https://github.com/Jithendra-coder/RelayCore/actions/runs/37777852817) passed for the current alert-rule test commit. The full CI test job passed Ruff, pre-commit, both Compose validations, promtool rule/config validation and alert tests, and the container image build.
 
 ## Known limits and technical debt
 
@@ -56,7 +56,7 @@ Identity, workspace authorization, signed durable webhook intake, encrypted work
 
 ## Latest change
 
-Workspace metrics tokens are hashed at rest, scoped to one workspace and `/metrics`, and revocable. Prometheus scrape and queue/lease/dead-letter alert examples are documented and covered by CI parsing and API tests. No production observability stack is deployed.
+Workspace metrics tokens are hashed at rest, scoped to one workspace and `/metrics`, and revocable. Prometheus scrape and alert examples are covered by API tests and promtool tests for firing and quiet thresholds. No production observability stack is deployed.
 
 ## Next milestone
 
