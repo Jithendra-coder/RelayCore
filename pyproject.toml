@@ -24,7 +24,7 @@ pythonpath = ["sdk"]
 [tool.mypy]
 python_version = "3.13"
 platform = "linux"
-files = ["app", "sdk"]
+files = ["app", "sdk", "scripts", "benchmarks"]
 check_untyped_defs = true
 warn_return_any = true
 

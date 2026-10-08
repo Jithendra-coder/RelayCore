@@ -6,6 +6,7 @@ import shutil
 import socket
 import subprocess
 import time
+from typing import Any
 import uuid
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -19,10 +20,12 @@ API_KEY = "relaycore-compose-smoke-admin"
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+        return int(sock.getsockname()[1])
 
 
-def _request_json(base_url: str, path: str, *, method: str = "GET", body: dict | None = None) -> dict:
+def _request_json(
+    base_url: str, path: str, *, method: str = "GET", body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     data = json.dumps(body).encode() if body is not None else None
     headers = {"Authorization": f"Bearer {API_KEY}", "Accept": "application/json"}
     if data is not None:
@@ -30,7 +33,10 @@ def _request_json(base_url: str, path: str, *, method: str = "GET", body: dict |
     request = Request(base_url + path, data=data, headers=headers, method=method)
     try:
         with urlopen(request, timeout=3) as response:
-            return json.load(response)
+            payload = json.load(response)
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"Compose smoke request returned a non-object: {method} {path}")
+            return payload
     except HTTPError as exc:
         raise RuntimeError(f"Compose smoke request returned HTTP {exc.code}: {method} {path}") from exc
 

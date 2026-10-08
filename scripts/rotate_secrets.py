@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import os
+from typing import Any, TypeAlias
 
 import psycopg
 from cryptography.fernet import Fernet
+from psycopg import Connection
 from psycopg.rows import dict_row
 
 from app.settings import DEMO_MODE, validate_database_tls
 from app.secretbox import credential_fingerprint, decrypt_secret, encrypt_secret
+
+DatabaseConnection: TypeAlias = Connection[dict[str, Any]]
 
 
 def _key(name: str) -> bytes:
@@ -21,7 +25,7 @@ def _key(name: str) -> bytes:
     return value.encode()
 
 
-def rotate_secrets(conn: psycopg.Connection, old_key: bytes, new_key: bytes) -> dict[str, int]:
+def rotate_secrets(conn: DatabaseConnection, old_key: bytes, new_key: bytes) -> dict[str, int]:
     if old_key == new_key:
         raise ValueError("The replacement encryption key must differ from the current key.")
 
@@ -32,13 +36,15 @@ def rotate_secrets(conn: psycopg.Connection, old_key: bytes, new_key: bytes) -> 
             "LOCK TABLE github_oauth_states, webhook_secrets, integration_credentials, "
             "integration_credential_secrets IN SHARE ROW EXCLUSIVE MODE"
         )
-        missing_creation_secrets = conn.execute(
+        row = conn.execute(
             """SELECT count(*) AS count FROM integration_credentials c
                WHERE NOT EXISTS (
                    SELECT 1 FROM integration_credential_secrets s
                    WHERE s.credential_id=c.id AND s.version=1
                )"""
-        ).fetchone()["count"]
+        ).fetchone()
+        assert row is not None
+        missing_creation_secrets = row["count"]
         if missing_creation_secrets:
             raise RuntimeError("Cannot rotate credentials without their original secret versions.")
 

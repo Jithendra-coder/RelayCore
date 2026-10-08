@@ -10,8 +10,10 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, TypeAlias
 
 import psycopg
+from psycopg import Connection as PsycopgConnection
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
@@ -23,6 +25,9 @@ from app.settings import DATABASE_URL, LEASE_SECONDS, MAX_ATTEMPTS  # noqa: E402
 from app.store import create_workflow, migrate  # noqa: E402
 from app.supervisor import WorkerSupervisor  # noqa: E402
 
+DatabaseConnection: TypeAlias = PsycopgConnection[dict[str, Any]]
+DatabasePool: TypeAlias = ConnectionPool[DatabaseConnection]
+
 
 def percentile(samples: list[float], p: float) -> float:
     if not samples:
@@ -31,7 +36,7 @@ def percentile(samples: list[float], p: float) -> float:
     return ordered[min(len(ordered) - 1, round((len(ordered) - 1) * p))]
 
 
-def queue_plan(dsn: str, rows: int = 20000) -> dict:
+def queue_plan(dsn: str, rows: int = 20000) -> dict[str, Any]:
     with psycopg.connect(dsn, row_factory=dict_row, autocommit=True) as conn:
         conn.execute("""CREATE TEMP TABLE relaycore_plan_tasks (
             id bigint,tenant_id text,status text,available_at timestamptz,created_at timestamptz)""")
@@ -47,16 +52,20 @@ def queue_plan(dsn: str, rows: int = 20000) -> dict:
                    WHERE status IN ('queued','retry_wait')
                      AND available_at<=clock_timestamp()
                    ORDER BY available_at,created_at LIMIT 1"""
-        before = conn.execute(query).fetchone()["QUERY PLAN"][0]
+        before_row = conn.execute(query).fetchone()
+        assert before_row is not None
+        before = before_row["QUERY PLAN"][0]
         conn.execute("""CREATE INDEX relaycore_plan_ready_idx
                        ON relaycore_plan_tasks(available_at,created_at)
                        WHERE status IN ('queued','retry_wait')""")
         conn.execute("ANALYZE relaycore_plan_tasks")
-        after = conn.execute(query).fetchone()["QUERY PLAN"][0]
+        after_row = conn.execute(query).fetchone()
+        assert after_row is not None
+        after = after_row["QUERY PLAN"][0]
         return {"fixture_rows": rows, "before_index": before, "after_index": after}
 
 
-def load_scenario(pool: ConnectionPool, workers: int, count: int) -> dict:
+def load_scenario(pool: DatabasePool, workers: int, count: int) -> dict[str, Any]:
     tenant = f"bench-{workers}-{uuid.uuid4().hex[:8]}"
     supervisor = WorkerSupervisor(workers)
     stop = threading.Event()
@@ -87,10 +96,12 @@ def load_scenario(pool: ConnectionPool, workers: int, count: int) -> dict:
                     (tenant,),
                 ).fetchall()
                 counts = {row["status"]: row["n"] for row in state}
-                peak_queue = max(peak_queue, conn.execute(
+                queue_row = conn.execute(
                     "SELECT count(*) AS n FROM tasks WHERE tenant_id=%s AND status IN ('queued','retry_wait','running')",
                     (tenant,),
-                ).fetchone()["n"])
+                ).fetchone()
+                assert queue_row is not None
+                peak_queue = max(peak_queue, queue_row["n"])
                 finished = conn.execute(
                     """SELECT extract(epoch FROM (finished_at-created_at))*1000 AS latency_ms
                        FROM workflow_runs WHERE tenant_id=%s AND finished_at IS NOT NULL""", (tenant,)
@@ -102,8 +113,10 @@ def load_scenario(pool: ConnectionPool, workers: int, count: int) -> dict:
             time.sleep(0.05)
         elapsed = time.perf_counter() - started
         with pool.connection() as conn:
-            failed = conn.execute("SELECT count(*) AS n FROM workflow_runs WHERE tenant_id=%s AND status='failed'",
-                                  (tenant,)).fetchone()["n"]
+            failed_row = conn.execute("SELECT count(*) AS n FROM workflow_runs WHERE tenant_id=%s AND status='failed'",
+                                      (tenant,)).fetchone()
+            assert failed_row is not None
+            failed = failed_row["n"]
         completed = len(sample_ms)
         if completed + failed < count:
             raise TimeoutError(f"Only {completed + failed}/{count} benchmark workflows finished.")
@@ -136,16 +149,20 @@ def main() -> None:
     if not 10 <= args.workflows <= 300:
         parser.error("--workflows must be between 10 and 300 (respecting the per-tenant demo rate limit).")
     dsn = os.environ.get("DATABASE_URL", DATABASE_URL)
-    pool = ConnectionPool(dsn, min_size=1, max_size=12, kwargs={"row_factory": dict_row}, open=False)
+    pool: DatabasePool = ConnectionPool(
+        dsn, min_size=1, max_size=12, kwargs={"row_factory": dict_row}, open=False,
+    )
     pool.open(wait=True)
     try:
         with pool.connection() as conn:
             migrate(conn)
             server = conn.execute("SELECT version() AS version, current_setting('server_encoding') AS encoding").fetchone()
+        assert server is not None
         if server["encoding"] != "UTF8":
             raise RuntimeError("RelayCore requires a UTF8 PostgreSQL database.")
         scenarios = [load_scenario(pool, workers, args.workflows) for workers in (1, 2, 4)]
-        report = {
+        database_plan = queue_plan(dsn)
+        report: dict[str, Any] = {
             "classification": "MEASURED",
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "environment": {"python": sys.version.split()[0], "platform": platform.platform(),
@@ -154,7 +171,7 @@ def main() -> None:
                             "max_attempts": MAX_ATTEMPTS,
                             "workload": f"{args.workflows} synthetic two-step workflows for each worker count; record-only demo effects"},
             "worker_scaling": scenarios,
-            "database_query_plan": queue_plan(dsn),
+            "database_query_plan": database_plan,
             "limitations": [
                 "Synthetic local workload and one PostgreSQL instance; results do not predict cloud or external-service performance.",
                 "Workflow side effects are local database records and intentionally have no external network latency.",
@@ -163,8 +180,8 @@ def main() -> None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
         print(json.dumps({"output": str(args.output), "worker_scaling": scenarios,
-                          "database_plan_ms": {"before": report["database_query_plan"]["before_index"]["Execution Time"],
-                                               "after": report["database_query_plan"]["after_index"]["Execution Time"]}}, indent=2))
+                          "database_plan_ms": {"before": database_plan["before_index"]["Execution Time"],
+                                               "after": database_plan["after_index"]["Execution Time"]}}, indent=2))
     finally:
         pool.close()
 

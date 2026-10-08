@@ -53,7 +53,9 @@ def main() -> None:
     with psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row) as conn:
         migrate(conn)
         expected_migrations = len(list((ROOT / "app" / "migrations").glob("[0-9]*_*.sql")))
-        source_migrations = conn.execute("SELECT count(*) AS count FROM schema_migrations").fetchone()["count"]
+        source_count = conn.execute("SELECT count(*) AS count FROM schema_migrations").fetchone()
+        assert source_count is not None
+        source_migrations = source_count["count"]
         if source_migrations != expected_migrations:
             raise AssertionError(f"Expected {expected_migrations} source migrations, found {source_migrations}.")
         run = create_workflow(
@@ -87,7 +89,9 @@ def main() -> None:
         )
 
     with psycopg.connect(os.environ["RELAYCORE_RESTORE_DATABASE_URL"], row_factory=dict_row) as conn:
-        migrations = conn.execute("SELECT count(*) AS count FROM schema_migrations").fetchone()["count"]
+        restored_count = conn.execute("SELECT count(*) AS count FROM schema_migrations").fetchone()
+        assert restored_count is not None
+        migrations = restored_count["count"]
         marker = conn.execute(
             "SELECT status,definition FROM workflow_runs WHERE tenant_id=%s AND idempotency_key=%s",
             ("restore-drill-workspace", "restore-drill:known-record"),
