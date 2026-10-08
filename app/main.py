@@ -15,12 +15,13 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any, NoReturn, TypeAlias
+from typing import Any, NoReturn, TypeAlias, cast
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from pydantic import SecretStr
 from psycopg import Connection as PsycopgConnection
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -171,7 +172,7 @@ DatabasePool: TypeAlias = ConnectionPool[PsycopgConnection[dict[str, Any]]]
 
 
 def pool_for(request: Request) -> DatabasePool:
-    return request.app.state.pool
+    return cast(DatabasePool, request.app.state.pool)
 
 
 def metrics_principal(
@@ -196,7 +197,7 @@ def metrics_principal(
 
 
 def request_id(request: Request) -> str:
-    return request.state.request_id
+    return cast(str, request.state.request_id)
 
 
 def rate_limit_error(exc: Exception) -> NoReturn:
@@ -525,7 +526,7 @@ def credential_encryption_key() -> bytes:
     return key
 
 
-def credential_secret_value(secret: Any) -> str:
+def credential_secret_value(secret: SecretStr) -> str:
     value = secret.get_secret_value()
     if not 16 <= len(value) <= 4096 or any(ord(c) < 32 or ord(c) == 127 for c in value):
         raise HTTPException(422, "Credential secret must be between 16 and 4096 characters.")
@@ -1493,7 +1494,7 @@ def run_workflow_definition(
 def workflows(user: Principal = Depends(principal), pool: DatabasePool = Depends(pool_for)) -> list[dict[str, Any]]:
     with pool.connection() as conn:
         stats = dashboard(conn, user.tenant_id)
-    return stats["workflows"]
+    return cast(list[dict[str, Any]], stats["workflows"])
 
 
 @app.get("/api/workflows/{run_id}")

@@ -52,7 +52,7 @@ def worker_is_healthy() -> bool:
                 (socket.gethostname(),),
             ).fetchone()
             assert row is not None
-            return row[0]
+            return bool(row[0])
     except psycopg.Error:
         return False
 
