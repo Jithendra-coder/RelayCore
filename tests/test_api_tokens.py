@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import uuid
 
 import app.auth as auth
 import app.main as main
 import app.store as store
+import pytest
 from app.auth import SESSION_COOKIE
 from app.store import create_auth_session, upsert_oidc_user
 from tests.conftest import TEST_TENANT
@@ -24,6 +26,79 @@ def create_workspace(client, email: str) -> tuple[str, str, dict[str, str]]:
 def use_production_auth(monkeypatch):
     monkeypatch.setattr(auth, "DEMO_MODE", False)
     monkeypatch.setattr(main, "DEMO_MODE", False)
+
+
+def assert_event_stream_closes_after_revocation(client, principal, workspace_id, revoke):
+    class ConnectedRequest:
+        async def is_disconnected(self):
+            return False
+
+    with client.app.state.pool.connection() as conn:
+        cursor = conn.execute("SELECT coalesce(max(sequence),0) AS sequence FROM events WHERE tenant_id=%s",
+                              (workspace_id,)).fetchone()["sequence"]
+    response = asyncio.run(main.event_stream(
+        ConnectedRequest(), after=cursor, last_event_id=None,
+        user=principal, pool=client.app.state.pool,
+    ))
+
+    async def consume_and_revoke():
+        iterator = response.body_iterator
+        assert "keepalive" in await anext(iterator)
+        revoke()
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(anext(iterator), timeout=2)
+
+    asyncio.run(consume_and_revoke())
+
+
+def test_event_stream_stops_after_session_revocation(client):
+    user_id, workspace_id, session_headers = create_workspace(client, f"stream-session-{uuid.uuid4()}@example.test")
+    raw_session = session_headers["Cookie"].split("=", 1)[1]
+    session_hash = hashlib.sha256(raw_session.encode()).hexdigest()
+    principal = auth.Principal(workspace_id, "admin", session_hash, user_id=user_id,
+                              workspace_role="OWNER", session_token_hash=session_hash)
+
+    def revoke():
+        with client.app.state.pool.connection() as conn, conn.transaction():
+            conn.execute("UPDATE auth_sessions SET revoked_at=clock_timestamp() WHERE token_hash=%s", (session_hash,))
+
+    assert_event_stream_closes_after_revocation(client, principal, workspace_id, revoke)
+
+
+def test_event_stream_stops_after_api_token_revocation(client, monkeypatch):
+    user_id, workspace_id, session_headers = create_workspace(client, f"stream-token-{uuid.uuid4()}@example.test")
+    use_production_auth(monkeypatch)
+    response = client.post(f"/api/workspaces/{workspace_id}/api-tokens", headers=session_headers,
+                           json={"name": "SSE client"})
+    assert response.status_code == 201, response.text
+    token_id, token_hash = response.json()["id"], hashlib.sha256(response.json()["token"].encode()).hexdigest()
+    principal = auth.Principal(workspace_id, "admin", token_hash, user_id=user_id, workspace_role="OWNER")
+
+    def revoke():
+        with client.app.state.pool.connection() as conn, conn.transaction():
+            conn.execute("UPDATE workspace_api_tokens SET revoked_at=clock_timestamp() WHERE id=%s", (token_id,))
+
+    assert_event_stream_closes_after_revocation(client, principal, workspace_id, revoke)
+
+
+def test_event_stream_stops_after_workspace_membership_removal(client):
+    owner_id, workspace_id, _ = create_workspace(client, f"stream-owner-{uuid.uuid4()}@example.test")
+    with client.app.state.pool.connection() as conn, conn.transaction():
+        member = upsert_oidc_user(conn, "https://identity.example", str(uuid.uuid4()),
+                                  f"stream-member-{uuid.uuid4()}@example.test", "Stream member")
+        raw_session = create_auth_session(conn, member["id"], "stream-membership-test", 3600)
+        session_hash = hashlib.sha256(raw_session.encode()).hexdigest()
+        conn.execute("""INSERT INTO workspace_members(workspace_id,user_id,role,created_by)
+                       VALUES (%s,%s,'DEVELOPER',%s)""", (workspace_id, member["id"], owner_id))
+    principal = auth.Principal(workspace_id, "operator", session_hash, user_id=member["id"],
+                              workspace_role="DEVELOPER", session_token_hash=session_hash)
+
+    def revoke():
+        with client.app.state.pool.connection() as conn, conn.transaction():
+            conn.execute("DELETE FROM workspace_members WHERE workspace_id=%s AND user_id=%s",
+                         (workspace_id, member["id"]))
+
+    assert_event_stream_closes_after_revocation(client, principal, workspace_id, revoke)
 
 
 def test_workspace_api_token_is_scoped_hashed_revocable_and_one_time(client, monkeypatch):

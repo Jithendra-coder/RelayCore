@@ -5,6 +5,7 @@ import hmac
 from dataclasses import dataclass
 
 from fastapi import Depends, Header, HTTPException, Request
+from psycopg import Connection
 
 from app.settings import DEMO_MODE, api_keys
 from app.store import auth_session, list_user_workspaces, workspace_api_token, workspace_membership
@@ -119,3 +120,19 @@ def principal_for_identity(
 def authorize(user: Principal, *roles: str) -> None:
     if user.role not in roles:
         raise HTTPException(403, "This identity does not have permission for that action.")
+
+
+def principal_is_current(conn: Connection, user: Principal) -> bool:
+    if user.user_id is None:
+        return True
+    if not workspace_membership(conn, user.tenant_id, user.user_id):
+        return False
+    if user.session_token_hash:
+        return conn.execute(
+            """SELECT 1 FROM auth_sessions s JOIN users u ON u.id=s.user_id
+               WHERE s.token_hash=%s AND s.user_id=%s AND s.revoked_at IS NULL
+                 AND s.expires_at>clock_timestamp() AND u.status='active'""",
+            (user.session_token_hash, user.user_id),
+        ).fetchone() is not None
+    token = workspace_api_token(conn, user.credential_fingerprint)
+    return bool(token and token["workspace_id"] == user.tenant_id and token["user_id"] == user.user_id)

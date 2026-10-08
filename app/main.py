@@ -34,6 +34,7 @@ from app.auth import (
     authenticated_identity,
     authorize,
     principal,
+    principal_is_current,
     principal_for_identity,
     verified_oidc_profile,
 )
@@ -1658,12 +1659,14 @@ def restart_worker(worker_id: str, request: Request, user: Principal = Depends(p
     return {"worker_id": worker_id, "pid": pid, "status": "restarted"}
 
 
-def _events_after(pool: ConnectionPool, tenant_id: str, sequence: int) -> list[dict[str, Any]]:
+def _events_after(pool: ConnectionPool, user: Principal, sequence: int) -> list[dict[str, Any]] | None:
     with pool.connection() as conn:
+        if not principal_is_current(conn, user):
+            return None
         return conn.execute(
             """SELECT sequence,run_id,task_id,worker_id,request_id,kind,data,created_at
                FROM events WHERE tenant_id=%s AND sequence>%s ORDER BY sequence LIMIT 100""",
-            (tenant_id, sequence),
+            (user.tenant_id, sequence),
         ).fetchall()
 
 
@@ -1729,7 +1732,9 @@ async def event_stream(request: Request, after: int | None = None,
     async def stream():
         nonlocal cursor
         while not await request.is_disconnected():
-            rows = await run_in_threadpool(_events_after, pool, user.tenant_id, cursor)
+            rows = await run_in_threadpool(_events_after, pool, user, cursor)
+            if rows is None:
+                return
             for row in rows:
                 cursor = row["sequence"]
                 yield f"id: {cursor}\nevent: workflow\ndata: {json.dumps(row, default=str)}\n\n"
