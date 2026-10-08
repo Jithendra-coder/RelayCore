@@ -18,7 +18,7 @@ The same queue-ready `SELECT ... ORDER BY available_at, created_at LIMIT 1` ran 
 
 ## Correctness and failure checks
 
-The latest acceptance suite completed with **113 passed** on an isolated PostgreSQL 17.9 / UTF-8 database on 2026-10-08; app source coverage was **81.84%** against an enforced 80% floor. Ruff, Python compilation, pre-commit, and `git diff --check` passed for the latest slice. GitHub Actions runs the suite on PostgreSQL 18. It covers:
+The latest acceptance suite completed with **113 passed** on an isolated PostgreSQL 17.9 / UTF-8 database on 2026-10-08; app source coverage was **81.84%** against an enforced 80% floor. Ruff, Python compilation, pre-commit, and `git diff --check` passed for the latest slice. Current PostgreSQL 18 CI also passed **113 tests at 82.64% app coverage**, the PostgreSQL 16 backup/restore drill, both Compose checks, Prometheus validation, and image build in [run 37788306422](https://github.com/Jithendra-coder/RelayCore/actions/runs/37788306422); its dependency audit passed in [run 37788306278](https://github.com/Jithendra-coder/RelayCore/actions/runs/37788306278). It covers:
 
 - API key authentication, role denial, request IDs, and cross-tenant `404` isolation.
 - Idempotent workflow creation, payload conflict, persisted history, step transitions, and fail-once retry.
