@@ -1,11 +1,13 @@
+# syntax=docker/dockerfile:1.7
+
 FROM python:3.13-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /srv/relaycore
 
 RUN useradd --create-home --uid 10001 relaycore
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && rm requirements.txt
+RUN --mount=type=bind,source=requirements.txt,target=/tmp/requirements.txt \
+    pip install --no-cache-dir --requirement /tmp/requirements.txt
 COPY app ./app
 USER relaycore
 EXPOSE 8000
