@@ -21,6 +21,9 @@ tests:
               job: relaycore
               workspace: team-a
               severity: warning
+            exp_annotations:
+              summary: RelayCore has runnable work waiting for too long
+              description: The oldest ready task has been waiting longer than five minutes for at least five minutes.
       - eval_time: 3m
         alertname: RelayCoreExpiredLeases
         exp_alerts:
@@ -28,6 +31,9 @@ tests:
               job: relaycore
               workspace: team-a
               severity: critical
+            exp_annotations:
+              summary: RelayCore has tasks with expired worker leases
+              description: Check worker health and database connectivity for this workspace.
       - eval_time: 3m
         alertname: RelayCoreDeadLettersPresent
         exp_alerts:
@@ -35,6 +41,9 @@ tests:
               job: relaycore
               workspace: team-a
               severity: warning
+            exp_annotations:
+              summary: RelayCore has unreplayed dead letters
+              description: Review failed workflows and replay only after correcting the cause.
   - name: threshold values do not alert
     interval: 1m
     input_series:
