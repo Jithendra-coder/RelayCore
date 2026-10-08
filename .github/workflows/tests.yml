@@ -39,3 +39,33 @@ jobs:
       - run: docker compose config --quiet
       - run: docker compose -f compose.yaml -f compose.workers.yaml config --quiet
       - run: docker build --tag relaycore:ci .
+
+  backup-restore:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/relaycore_restore_source
+      RELAYCORE_RESTORE_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/relaycore_restore_target
+      RELAYCORE_RESTORE_ADMIN_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+      RELAYCORE_RESTORE_DRILL: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m scripts.restore_drill
