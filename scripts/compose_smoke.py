@@ -93,9 +93,9 @@ def main() -> None:
             run = _request_json(base_url, f"/api/workflows/{run_id}")
             if run.get("status") == "completed":
                 effects = len(run.get("side_effects", []))
-                if effects != 3:
-                    raise RuntimeError(f"Compose workflow completed with {effects} effects; expected 3.")
-                print("Compose smoke passed: separate API and worker completed one durable workflow with 3 effects.")
+                if effects != 4:
+                    raise RuntimeError(f"Compose workflow completed with {effects} effects; expected 4.")
+                print("Compose smoke passed: separate API and worker completed one four-step durable workflow.")
                 return
             if run.get("status") in {"failed", "cancelled"}:
                 raise RuntimeError(f"Compose workflow ended with status {run.get('status')}.")
