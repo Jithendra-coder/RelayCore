@@ -51,6 +51,10 @@ For separate deployment roles, set API `RELAYCORE_WORKERS=0` and run `python -m 
 - Restore only into a newly created empty database. Set `RELAYCORE_RESTORE_DATABASE_URL` to that database URL and run `scripts/restore.ps1 -BackupPath <archive> -TargetDatabaseUrl $env:RELAYCORE_RESTORE_DATABASE_URL`. PowerShell prompts before writing; `-WhatIf` previews the action. Restore uses one transaction, aborts on error, and never drops existing objects. Create DB roles and grants separately.
 - After a restore, start RelayCore against the restored database and verify `/healthz`, migrations, and an authorized workflow read before directing traffic. A successful local restore is not evidence of managed-cloud backup retention or disaster recovery.
 
+## Encryption key rotation
+
+Run key rotation as a maintenance operation with all API and worker processes stopped. Back up the database first, then inject `DATABASE_URL`, the current `RELAYCORE_SECRET_ENCRYPTION_KEY`, and a new `RELAYCORE_SECRET_ENCRYPTION_NEW_KEY` from the secret manager and run `python -m scripts.rotate_secrets`. The command re-encrypts stored webhook keys, every integration credential version, and temporary GitHub PKCE verifiers in one transaction. If any value cannot be decrypted, the transaction rolls back. After success, set the active key to the new value on every service before restarting. Keep the old key in restricted escrow until pre-rotation backups expire; those backups still require it.
+
 ## Operational guarantees and limits
 
 PostgreSQL is the only durable coordination dependency. Heartbeats and leases are database rows, so API/worker process restart does not discard an accepted task. The coordinator retries an expired lease with capped exponential backoff and stores terminal work in the DLQ. In the default local stack, an API restart starts configured worker children and a deliberately killed worker stays stopped until a human restarts it. In separate-role deployments, the orchestrator restarts worker containers according to its policy.

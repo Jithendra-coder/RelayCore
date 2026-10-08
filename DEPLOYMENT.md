@@ -28,6 +28,16 @@ For GitHub App events, set the App's setup and OAuth callback URLs to the config
 
 For Slack, the OAuth callback must return to the signed-in RelayCore admin who started linking. RelayCore verifies Slack's timestamped signature over the raw Events API body, answers URL verification challenges, and currently normalizes only `app_mention`. Slack tokens are encrypted in PostgreSQL and revoked locally when the app is disconnected or uninstalled. Production workflows can post static messages to conversation IDs. After adding or changing Slack scopes, an owner/admin must use **Reconnect** in the dashboard to refresh the installation token; invite the bot to any channel where workflows should post. Delivery remains at least once, so an ambiguous network failure can result in a duplicate post. Live Slack credentials and delivery have not been verified here.
 
+## Encryption key rotation
+
+`python -m scripts.rotate_secrets` re-encrypts every stored webhook secret, integration credential version, and temporary GitHub PKCE verifier, and recalculates credential idempotency fingerprints. It performs the updates in one database transaction; corrupt or unreadable ciphertext rolls the transaction back. It takes write locks on affected tables, so use a maintenance window:
+
+1. Create and validate a database backup. Stop every API and worker process so no old-key writer can run after the transaction.
+2. Inject `DATABASE_URL`, the current `RELAYCORE_SECRET_ENCRYPTION_KEY`, and a newly generated `RELAYCORE_SECRET_ENCRYPTION_NEW_KEY` into the maintenance environment from the secret manager. Do not put either key in command history or repository files.
+3. Run `python -m scripts.rotate_secrets`. Resume only after it reports success. On failure, the database transaction is rolled back; restart services with the current key and investigate the unreadable row.
+4. Set `RELAYCORE_SECRET_ENCRYPTION_KEY` to the new key on every API and worker, remove `RELAYCORE_SECRET_ENCRYPTION_NEW_KEY`, then restart the services.
+5. Retain the old key in restricted escrow until every backup containing ciphertext encrypted by it has expired or has itself been re-encrypted. A pre-rotation backup cannot be restored for credential use with only the new key.
+
 ## API and worker processes
 
 For separate deployment roles, set `RELAYCORE_WORKERS=0` on the API and run one or more containers from the same image with `python -m app.worker`. Workers need the same `DATABASE_URL`, `RELAYCORE_DEMO_MODE`, lease settings, encryption key, and HTTP host policy as the API. Each worker defaults to an ID built from its hostname and process ID; set a unique `RELAYCORE_WORKER_ID` if the runtime does not provide unique hostnames. Run at least one worker or accepted runs will remain queued. The local override `compose.workers.yaml` demonstrates this process boundary. Demo kill/restart controls are available only when the API supervises its workers.

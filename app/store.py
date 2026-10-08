@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import os
 import secrets
@@ -12,7 +11,7 @@ from typing import Any
 from psycopg import Connection
 from psycopg.types.json import Jsonb
 
-from app.secretbox import decrypt_secret, encrypt_secret
+from app.secretbox import credential_fingerprint, decrypt_secret, encrypt_secret
 from app.http_action import PermanentActionError, RetryableActionError, has_event_references
 from app.telemetry import current_traceparent
 from app.settings import (DEMO_MODE, MAX_ATTEMPTS, MAX_QUEUE_DEPTH, MAX_SCHEDULES_PER_TENANT,
@@ -698,9 +697,7 @@ def create_workspace_credential(
     allowed_host: str | None,
     idempotency_key: str, request_id: str, encryption_key: bytes,
 ) -> dict[str, Any]:
-    fingerprint_key = hashlib.sha256(encryption_key).digest()
-    fingerprint = hmac.new(fingerprint_key, f"{provider}\0{name}\0{allowed_host or ''}\0{secret}".encode(),
-                           hashlib.sha256).hexdigest()
+    fingerprint = credential_fingerprint(encryption_key, provider, name, allowed_host, secret)
     conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                  (f"relaycore:credential-create:{workspace_id}:{idempotency_key}",))
     existing = conn.execute(
@@ -752,12 +749,9 @@ def rotate_workspace_credential(
     ).fetchone()
     if not credential or credential["revoked_at"]:
         return None
-    fingerprint_key = hashlib.sha256(encryption_key).digest()
-    fingerprint = hmac.new(
-        fingerprint_key,
-        f"{credential['provider']}\0{credential['name']}\0{credential['allowed_host'] or ''}\0{secret}".encode(),
-        hashlib.sha256,
-    ).hexdigest()
+    fingerprint = credential_fingerprint(
+        encryption_key, credential["provider"], credential["name"], credential["allowed_host"], secret,
+    )
     previous = conn.execute(
         """SELECT version,secret_fingerprint,revoked_at FROM integration_credential_secrets
            WHERE credential_id=%s AND idempotency_key=%s FOR UPDATE""", (credential_id, idempotency_key)

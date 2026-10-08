@@ -13,6 +13,6 @@ Accepted.
 
 ## Consequences and limits
 
-- The encryption master key remains a single environment-injected key. Rotation and multi-key decryption are not implemented.
+- The encryption master key remains a single environment-injected key. `python -m scripts.rotate_secrets` re-encrypts all credential versions and rekeys idempotency fingerprints in one maintenance transaction; old keys are still required to restore pre-rotation backups.
 - Credentials are storage primitives only: provider OAuth lifecycles, outbound adapters, permission scopes, token refresh, provider-side revocation, and UI management remain incomplete.
 - Database access without the application key cannot recover plaintext tokens. An application process with key access can decrypt active workspace credentials, so production key access must be limited and audited.
