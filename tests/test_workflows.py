@@ -16,8 +16,11 @@ from psycopg import connect
 from psycopg.errors import RaiseException
 from psycopg.rows import dict_row
 from fastapi import HTTPException
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.trace import get_current_span
 
 from app.settings import DATABASE_URL
+from app.telemetry import trace_context
 from app.auth import SESSION_COOKIE, verified_oidc_profile
 from app.main import event_cursor, same_origin
 from app.store import (
@@ -102,6 +105,30 @@ def test_queue_operational_metrics_report_ready_age_and_tenant_scoped_expired_le
             assert lease_metrics["oldest_ready_seconds"] == 0
             assert lease_metrics["expired_leases"] == 1
             raise RuntimeError("rollback metric fixtures")
+
+
+def test_trace_context_follows_durable_task_to_worker():
+    tenant = random_tenant()
+    provider = TracerProvider()
+    tracer = provider.get_tracer("relaycore.test")
+    try:
+        with pytest.raises(RuntimeError, match="rollback trace fixtures"):
+            with connect(DATABASE_URL, row_factory=dict_row) as conn, conn.transaction():
+                with tracer.start_as_current_span("http.request") as parent:
+                    created = create_workflow(
+                        conn, tenant, "trace propagation", [{"name": "record", "action": "record", "payload": {}}],
+                        f"trace-propagation:{uuid.uuid4()}", "trace-test-request",
+                    )
+                    parent_context = parent.get_span_context()
+                task = claim_task(conn, "trace-test-worker", 1.2)
+                assert task and task["run_id"] == created["id"]
+                assert task["traceparent"]
+                propagated = get_current_span(trace_context(task["traceparent"])).get_span_context()
+                assert propagated.trace_id == parent_context.trace_id
+                assert propagated.span_id == parent_context.span_id
+                raise RuntimeError("rollback trace fixtures")
+    finally:
+        provider.shutdown()
 
 
 def test_workspace_sessions_rbac_and_cross_workspace_isolation(client):

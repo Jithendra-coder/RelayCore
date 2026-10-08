@@ -23,6 +23,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
+from opentelemetry import trace
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -141,9 +142,11 @@ from app.store import (
 )
 from app.secretbox import SecretStorageError, decrypt_secret, encrypt_secret
 from app.supervisor import WorkerSupervisor
+from app.telemetry import configure_tracing, http_request_span, mark_http_span_failed, mark_span_failed
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(message)s")
 logger = logging.getLogger("relaycore.api")
+_tracer = trace.get_tracer("relaycore.api")
 
 
 def pool_for(request: Request) -> ConnectionPool:
@@ -206,14 +209,19 @@ async def lifespan(app: FastAPI):
     app.state.supervisor = supervisor
     if WORKER_COUNT:
         supervisor.start()
-    logger.info('{"event":"api.started","workers":%d,"demo_mode":%s}', WORKER_COUNT, str(DEMO_MODE).lower())
+    tracer_provider = None
     try:
+        tracer_provider = configure_tracing("relaycore-api")
+        logger.info('{"event":"api.started","workers":%d,"demo_mode":%s}',
+                    WORKER_COUNT, str(DEMO_MODE).lower())
         yield
     finally:
         supervisor.close()
         stop.set()
         coordinator.join(timeout=2)
         pool.close()
+        if tracer_provider:
+            tracer_provider.shutdown()
         logger.info('{"event":"api.stopped"}')
 
 
@@ -260,11 +268,26 @@ async def correlate_request(request: Request, call_next):
     rid = supplied[:80] if supplied and all(ch.isalnum() or ch in "._:-" for ch in supplied[:80]) else str(uuid.uuid4())
     request.state.request_id = rid
     started = time.perf_counter()
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = rid
-    logger.info('{"event":"http.request","request_id":"%s","method":"%s","path":"%s","status":%d,"duration_ms":%.2f}',
-                rid, request.method, request.url.path, response.status_code, (time.perf_counter() - started) * 1000)
-    return response
+    with http_request_span(_tracer, request.headers) as span:
+        span.set_attribute("http.request.method", request.method)
+        span.set_attribute("relaycore.request_id", rid)
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            mark_span_failed(span, exc)
+            raise
+        route = request.scope.get("route")
+        if route and getattr(route, "path", None):
+            span.update_name(f"{request.method} {route.path}")
+            span.set_attribute("http.route", route.path)
+        span.set_attribute("http.response.status_code", response.status_code)
+        if response.status_code >= 500:
+            mark_http_span_failed(span)
+        response.headers["X-Request-ID"] = rid
+        logger.info('{"event":"http.request","request_id":"%s","method":"%s","path":"%s","status":%d,"duration_ms":%.2f}',
+                    rid, request.method, request.url.path, response.status_code,
+                    (time.perf_counter() - started) * 1000)
+        return response
 
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)

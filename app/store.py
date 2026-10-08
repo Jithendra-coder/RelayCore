@@ -14,6 +14,7 @@ from psycopg.types.json import Jsonb
 
 from app.secretbox import decrypt_secret, encrypt_secret
 from app.http_action import PermanentActionError, RetryableActionError, has_event_references
+from app.telemetry import current_traceparent
 from app.settings import (DEMO_MODE, MAX_ATTEMPTS, MAX_QUEUE_DEPTH, MAX_SCHEDULES_PER_TENANT,
                           RATE_LIMIT_PER_MINUTE, WEBHOOK_PAYLOAD_RETENTION_DAYS)
 
@@ -1478,8 +1479,8 @@ def create_workflow(
          workflow_version_id, definition_hash or _definition_fingerprint(title, steps), trigger_event_id),
     )
     conn.execute(
-        "INSERT INTO tasks(id,tenant_id,run_id,max_attempts,request_id) VALUES (%s,%s,%s,%s,%s)",
-        (task_id, tenant_id, run_id, MAX_ATTEMPTS, request_id),
+        "INSERT INTO tasks(id,tenant_id,run_id,max_attempts,request_id,traceparent) VALUES (%s,%s,%s,%s,%s,%s)",
+        (task_id, tenant_id, run_id, MAX_ATTEMPTS, request_id, current_traceparent()),
     )
     emit_event(conn, tenant_id, "workflow.created", run_id=run_id, task_id=task_id,
                request_id=request_id, data={"title": title, "steps": len(steps),
@@ -1540,7 +1541,7 @@ def claim_task(conn: Connection, worker_id: str, lease_seconds: float,
     with conn.transaction():
         tenant_filter = "AND t.tenant_id=%s" if tenant_id else ""
         selection = """SELECT t.id,t.tenant_id,t.run_id,t.step_index,t.attempts,t.max_attempts,
-                          t.last_worker,t.request_id,w.title,w.definition,i.payload AS trigger_payload
+                          t.last_worker,t.request_id,t.traceparent,w.title,w.definition,i.payload AS trigger_payload
                    FROM tasks t JOIN workflow_runs w ON w.id=t.run_id
                    LEFT JOIN incoming_events i ON i.id=w.trigger_event_id AND i.workspace_id=w.tenant_id
                    WHERE t.status IN ('queued','retry_wait') AND t.available_at<=clock_timestamp()
