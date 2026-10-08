@@ -1,52 +1,36 @@
-# Existing system audit
+# Current system audit
 
-Audit snapshot: 2026-10-05, repository commit `58fe95a`, before the production webhook-trigger slice. Scope: application source, migrations, tests, CI, local deployment files, and repository documentation. No live identity provider, third-party API, cloud environment, or Docker daemon was available for inspection.
+Audit snapshot: 2026-10-08, based on the current `main` worktree. This file is the current source-based overview; see `PROJECT_STATUS.md` for the latest test and delivery evidence.
 
-## A. What exists
+## Purpose and architecture
 
-- FastAPI API backed by PostgreSQL; database tables hold definitions, immutable workflow versions, runs, tasks, leases, audit events, incoming webhooks, and dead letters.
-- Worker subprocesses claim work with PostgreSQL row locks, renew leases, retry failures, and recover expired work. The API supervisor currently also manages workers.
-- Production OIDC sessions and workspace membership/roles; Demo Mode also exposes fixed API-key tenants and simulated actions.
-- Signed custom webhook intake with encrypted rotating secrets, raw-body HMAC verification, event deduplication, bounded payloads, and metadata history. Exact-match workflow triggers currently execute only in Demo Mode.
-- Workspace-scoped encrypted credentials and constrained outbound HTTP plus Slack message actions. Production workflows can be created and manually run when HTTP credentials are bound to an operator-allowlisted host or a Slack installation is active in the workspace.
-- Browser dashboard, polling-backed SSE, Prometheus text metrics, Docker Compose files, CI checks, operational docs, local benchmark and recovery evidence.
+RelayCore is a self-hostable developer event workflow engine. FastAPI serves the API and dashboard; PostgreSQL stores workflow definitions, immutable versions, incoming events, task state, leases, effects, and dead letters. Independent Python workers claim work from PostgreSQL and execute only registered actions.
 
-## B. Strong parts to preserve
+Custom signed webhooks, GitHub pull-request deliveries, and Slack app mentions can match exact event types and admit version-pinned production runs. Production steps are constrained to host-bound HTTPS requests and fixed Slack messages. Demo actions such as `charge`, delays, and failure injection run only in the local sandbox.
 
-- PostgreSQL is the queue and source of truth; admission, workflow creation, step progress, effects, retries, cancellation, and audit updates use explicit transactions.
-- `FOR UPDATE SKIP LOCKED`, expiring leases, heartbeats, bounded retries, and process/database failure tests form a coherent recovery path.
-- Immutable version rows and run snapshots prevent publishing a new workflow version from changing an existing run.
-- Tenant IDs are resolved from authenticated membership; negative tests cover cross-workspace access.
-- Event deduplication, idempotency constraints, queue bounds, secret encryption/redaction, and webhook freshness checks are tested at their trust boundaries.
-- The current local evidence is measured and labeled synthetic where appropriate; the project does not claim exactly-once delivery or cloud scale.
+## Strong foundations to preserve
 
-## C. Incomplete or weak areas
+- PostgreSQL transactions, constraints, `SKIP LOCKED`, and expiring leases provide durable admission and recovery without a second queue.
+- Immutable workflow versions keep a published run stable when a later version is published.
+- Workspace membership derives tenant access; negative tests cover cross-workspace access.
+- Webhook signatures, delivery deduplication, encrypted credentials, host restrictions, bounded responses, and secret redaction are tested locally.
+- Worker failure, database restart, API restart, migration upgrade, replay, and concurrency have PostgreSQL integration coverage.
 
-- GitHub and Slack credential rows are storage only; there is no OAuth lifecycle, provider webhook registration/verification, event normalization, or provider action.
-- Production webhook intake stores events but does not start workflows. HTTP bodies are static; event and prior-step values cannot yet be mapped into an action.
-- There is no durable scheduler, condition/branch/wait/approval control flow, or provider-aware rate-limit policy.
-- API and worker lifecycle are coupled, so horizontal API replicas could duplicate worker identities. No staged or cloud deployment exists.
-- The UI is an operational dashboard, not a complete connection/workflow/execution/DLQ/audit product surface. There is no SDK or CLI.
-- DNS lookup can outlive the HTTP socket timeout and worker lease. External delivery is at least once and depends on a provider honoring the idempotency key.
-- Webhook body retention is unbounded; encryption-key rotation, edge IP limits, tracing, alerts, dependency scanning, live provider tests, and browser end-to-end tests are absent.
+## Capability boundaries
 
-## D. Demo-only functionality
+| Classification | Current evidence |
+|---|---|
+| **Implemented and locally tested** | Durable workflow execution, retries, lease recovery, cancellation, dead-letter replay, immutable versions, OIDC/session and workspace code, signed webhook intake, HTTP action controls, and event-triggered runs. |
+| **Implemented, provider unverified** | OIDC sign-in, GitHub App installation/webhooks, Slack OAuth/events/message posting, and outbound HTTP. Tests use mocked provider responses or a no-network transport; no live provider credentials are configured. |
+| **Simulated** | Synthetic benchmark traffic and the Demo Mode inventory/payment/shipping story. The `charge` action records a local database effect, not a payment. |
+| **Incomplete** | Durable scheduling, SDK/CLI, cloud deployment, OpenTelemetry traces and alerts, automatic event retention, encryption-key rotation, a full restore drill, and live provider verification. |
 
-| Component | Decision | Reason |
-|---|---|---|
-| Fixed `record`/`charge` database effects | MOVE TO SANDBOX | Useful for local recovery demonstrations; they are not provider actions. Keep the production action allow-list separate. |
-| `sleep`, `fail_once`, and `fail_until_replay` actions | MOVE TO SANDBOX | Deterministic controls for lease, retry, and DLQ evidence only. |
-| Demo API keys and generated duplicate/DLQ endpoints | KEEP | Convenient local sandbox entry points; startup and route guards keep them out of production mode. |
-| Synthetic benchmark workload and captured local evidence | KEEP | Valuable when clearly labeled as local/synthetic and never presented as provider-backed. |
-| PostgreSQL workflow engine, OIDC, webhook intake, HTTP transport, and workspace authorization | KEEP | These are shared product foundations, not display-only fixtures. |
+## Priorities
 
-## E. Prioritized technical debt
+- **Before public use:** define webhook payload retention and prove restore/recovery; add edge request limits and key lifecycle controls.
+- **Before staging:** verify worker health and Compose production settings, exercise a real isolated provider workflow, and deploy API and worker as distinct roles.
+- **After the core is proven:** add durable interval schedules, traces/alerts, type and dependency checks, and a small SDK/CLI if the real user flow benefits from them.
 
-- **P0 — correctness/security:** no known failing invariant in the audited local suite. External HTTP remains at-least-once; resolver stalls and provider idempotency behavior still need integration-level verification.
-- **P1 — product/runtime:** production webhook dispatch and event mapping; real GitHub/Slack OAuth and provider paths; separate worker deployment identity; webhook retention; key rotation; production deployment and recovery controls.
-- **P2 — operability/quality:** OpenTelemetry, alerting, type checking, dependency/security scanning, browser end-to-end coverage, provider contract tests, and a complete execution/connection UI.
-- **P3 — developer experience:** typed Python SDK, API-backed CLI, richer workflow control flow, and a recruiter-facing case study/evidence pack.
+## Architecture decision
 
-## F. Rebuild decision
-
-**Preserve and evolve the existing architecture.** The PostgreSQL workflow, lease, versioning, tenancy, webhook, and audit foundations are already coherent and have failure-oriented tests. Replace or isolate demo actions as production capabilities mature; do not rewrite the durable core or add a broker without measured evidence.
+Preserve and evolve the PostgreSQL-backed modular monolith. Do not add Redis, Kafka, Kubernetes, AI/ML, or a connector catalog until measured workload or a validated user need requires them. The main reliability limit is at-least-once delivery: an external action can repeat after an ambiguous response, so the destination must honor its idempotency key or support reconciliation.

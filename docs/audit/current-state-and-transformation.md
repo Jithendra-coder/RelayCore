@@ -1,11 +1,11 @@
 # RelayCore current-state and transformation assessment
 
-**Assessment date:** 2026-10-05
+**Initial assessment date:** 2026-10-05
 **Target role:** Python Engineer
 **Audited revision:** `dc03e1f` (`main`, remote head confirmed)
-**Scope note:** The audit began from committed revision `dc03e1f`. At the report's initial draft, Slack message actions were still uncommitted and one of 61 tests failed because an assertion JSON-serialized a Python `datetime` without a serializer. The follow-up implementation and verification status is recorded at the end of this document.
+**Scope note:** This is a historical working report. Its first draft predates several shipped features and contains intermediate findings that are no longer current. Use [`existing-system.md`](existing-system.md) for the current source-based overview and [`PROJECT_STATUS.md`](../../PROJECT_STATUS.md) for current validation and blockers.
 
-**Validation evidence for this assessment:** Ruff passed; Python compileall, dashboard JavaScript syntax check, Compose configuration validation, and `git diff --check` passed. PostgreSQL was unavailable at first, then the existing local cluster was recovered and the integration suite ran. OIDC/GitHub/Slack app credential variables were absent from the process environment, so no live provider check was possible. The current in-progress full suite result is recorded above; it is not green.
+The roadmap and design trade-offs below remain useful background, but capability and test claims are historical unless confirmed by the current status file.
 
 ## A. Executive assessment
 
@@ -38,7 +38,7 @@ The repository contains actual OIDC, HTTP, GitHub, and Slack protocol code, but 
 
 ### Current production readiness
 
-The code has meaningful production-oriented controls, but the deployable product is still a prototype. `compose.yaml` is a loopback local/demo setup; Docker Compose parses, but the full stack was not launched in this audit. There is a GitHub Actions workflow with PostgreSQL 18, Python 3.13, Ruff, pre-commit, and pytest. There is no staging environment, cloud deployment, infrastructure-as-code, migration rollback plan, alerting, or real provider smoke test. The top-level `ARCHITECTURE.md`, `docs/runbook.md`, and `TESTING.md` contain older descriptions that conflict with the current implementation/status; the latter still says 48 tests while `PROJECT_STATUS.md` records 59.
+At the initial assessment revision, the deployable product was a prototype without staging, cloud deployment, or live provider checks. Refer to `PROJECT_STATUS.md` for the current test count and infrastructure state.
 
 ## C. Capability inventory
 

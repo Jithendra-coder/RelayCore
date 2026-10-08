@@ -4,6 +4,9 @@ import asyncio
 import hashlib
 import hmac
 import json
+import os
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -28,6 +31,25 @@ from app.store import (
     upsert_oidc_user,
 )
 from tests.conftest import ADMIN, OTHER, TEST_TENANT, VIEWER, drive_run, get_run, make_workflow, random_tenant
+
+
+@pytest.mark.parametrize(("name", "value"), [
+    ("RELAYCORE_WORKERS", "-1"),
+    ("RELAYCORE_MAX_ATTEMPTS", "0"),
+    ("RELAYCORE_MAX_ATTEMPTS", "11"),
+    ("RELAYCORE_QUEUE_LIMIT", "0"),
+    ("RELAYCORE_RATE_LIMIT_PER_MINUTE", "0"),
+    ("RELAYCORE_LEASE_SECONDS", "0"),
+    ("RELAYCORE_LEASE_SECONDS", "nan"),
+])
+def test_invalid_runtime_limits_fail_during_settings_import(name, value):
+    environment = os.environ.copy()
+    environment[name] = value
+    root = os.path.dirname(os.path.dirname(__file__))
+    result = subprocess.run([sys.executable, "-c", "import app.settings"], cwd=root, env=environment,
+                            capture_output=True, text=True, timeout=5)
+    assert result.returncode != 0
+    assert name in result.stderr
 
 
 def test_auth_roles_tenant_boundary_and_request_correlation(client):

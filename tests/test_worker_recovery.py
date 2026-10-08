@@ -25,6 +25,31 @@ def test_external_worker_has_unique_safe_identity(monkeypatch):
         worker.worker_identifier()
 
 
+def test_worker_health_check_requires_a_recent_heartbeat(client, monkeypatch):
+    import app.worker as worker
+
+    host = f"health-{uuid.uuid4().hex}"
+    worker_id = f"health-{uuid.uuid4().hex}"
+    monkeypatch.setattr(worker.socket, "gethostname", lambda: host)
+    try:
+        with client.app.state.pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO workers(id,pid,host) VALUES (%s,%s,%s)",
+                (worker_id, 1, host),
+            )
+
+        assert worker.worker_is_healthy()
+        with client.app.state.pool.connection() as conn:
+            conn.execute(
+                "UPDATE workers SET heartbeat_at=clock_timestamp()-interval '1 minute' WHERE id=%s",
+                (worker_id,),
+            )
+        assert not worker.worker_is_healthy()
+    finally:
+        with client.app.state.pool.connection() as conn:
+            conn.execute("DELETE FROM workers WHERE id=%s", (worker_id,))
+
+
 def test_external_worker_process_claims_work_without_api_supervisor(client):
     worker_id = f"external-{uuid.uuid4().hex[:12]}"
     environment = os.environ.copy()

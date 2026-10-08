@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from typing import Any
 from urllib.parse import urlsplit
@@ -17,6 +18,16 @@ MAX_WEBHOOK_BYTES = 256 * 1024
 WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS = 300
 LEASE_SECONDS = float(os.environ.get("RELAYCORE_LEASE_SECONDS", "4"))
 AUTH_SESSION_SECONDS = int(os.environ.get("RELAYCORE_AUTH_SESSION_SECONDS", "43200"))
+if WORKER_COUNT < 0:
+    raise RuntimeError("RELAYCORE_WORKERS must be zero or greater.")
+if not 1 <= MAX_ATTEMPTS <= 10:
+    raise RuntimeError("RELAYCORE_MAX_ATTEMPTS must be between 1 and 10.")
+if MAX_QUEUE_DEPTH < 1:
+    raise RuntimeError("RELAYCORE_QUEUE_LIMIT must be at least 1.")
+if RATE_LIMIT_PER_MINUTE < 1:
+    raise RuntimeError("RELAYCORE_RATE_LIMIT_PER_MINUTE must be at least 1.")
+if not math.isfinite(LEASE_SECONDS) or LEASE_SECONDS <= 0:
+    raise RuntimeError("RELAYCORE_LEASE_SECONDS must be a finite positive number.")
 if not 300 <= AUTH_SESSION_SECONDS <= 604800:
     raise RuntimeError("RELAYCORE_AUTH_SESSION_SECONDS must be between 300 and 604800.")
 

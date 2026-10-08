@@ -18,7 +18,7 @@ The same queue-ready `SELECT ... ORDER BY available_at, created_at LIMIT 1` ran 
 
 ## Correctness and failure checks
 
-The acceptance suite completed with **48 passed** on PostgreSQL 18 / UTF-8 on 2026-10-05; app source coverage was **80%**. The current phase also ran Ruff and pre-commit successfully. It covers:
+The acceptance suite completed with **72 passed** on an isolated PostgreSQL 17.9 / UTF-8 database on 2026-10-08; app source coverage was **80%**. The current phase also ran Ruff, pre-commit, Python compilation, and dashboard JavaScript syntax checks. GitHub Actions runs the same suite on PostgreSQL 18. It covers:
 
 - API key authentication, role denial, request IDs, and cross-tenant `404` isolation.
 - Idempotent workflow creation, payload conflict, persisted history, step transitions, and fail-once retry.
@@ -35,8 +35,9 @@ The acceptance suite completed with **48 passed** on PostgreSQL 18 / UTF-8 on 20
 - A signed production webhook starts one immutable HTTP workflow, duplicate delivery does not enqueue another, the run retains only safe source-event metadata, the worker receives the event for body mapping, and publishing version 2 does not alter an already queued version 1 run.
 - Slack message action tests verify active workspace credential lookup, production workflow execution, bounded JSON requests, redirect rejection, and rate-limit retry delays. Live Slack delivery remains unverified; the at-least-once worker model can duplicate an accepted post after an ambiguous response.
 - A production worker rejects an old queued simulated action and dead-letters it without writing an effect.
+- A worker health check reports healthy only while a same-host database heartbeat is recent; runtime configuration rejects invalid worker, retry, queue, rate, and lease limits.
 
-The suite emits one dependency deprecation warning from Starlette's current `TestClient` adapter for HTTPX. It does not affect the results. The Compose manifest parses, but the stack itself was not launched because Docker Desktop's daemon was unavailable during this build.
+The suite emits one dependency deprecation warning from Starlette's current `TestClient` adapter for HTTPX. It does not affect the results. CI validates both Compose configurations and builds the image; the full Compose stack was not launched locally because Docker is unavailable in this environment.
 
 ## Live Demo Mode evidence
 
@@ -48,4 +49,4 @@ The PostgreSQL service was stopped immediately and restarted while a real worker
 
 ## Evidence boundaries
 
-The “charge” is a unique local PostgreSQL side-effect record, not a payment. Recovery and process restart were measured in one local deployment. Public-cloud deployment, external-service idempotency, backups, TLS, and distributed tracing with an OpenTelemetry collector are not proven here. The Compose runtime also remains unverified because Docker Desktop's daemon was unavailable.
+The “charge” is a unique local PostgreSQL side-effect record, not a payment. Recovery and process restart were measured in one local deployment. Public-cloud deployment, external-service idempotency, a full backup restore, TLS, and distributed tracing with an OpenTelemetry collector are not proven here. Docker Compose configuration and image build pass in CI, but the stack was not launched locally.
