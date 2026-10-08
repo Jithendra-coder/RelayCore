@@ -15,6 +15,7 @@ Custom signed webhooks, GitHub pull-request deliveries, and Slack app mentions c
 - Workspace membership derives tenant access; negative tests cover cross-workspace access.
 - Webhook signatures, delivery deduplication, encrypted credentials, host restrictions, bounded responses, and secret redaction are tested locally.
 - Worker failure, database restart, API restart, migration upgrade, replay, and concurrency have PostgreSQL integration coverage.
+- Production API/worker startup and the offline key-rotation command reject PostgreSQL connection strings without explicit `sslmode=verify-full`; managed certificate trust still needs staging verification.
 - Queue-age and expired-lease gauges are tenant-scoped; worker failure logs correlate request, run, task, worker, attempt, and step without exception details.
 - CI builds the production image without pip in the runtime layer and passes Trivy OS/library scanning; this complements the separate Python requirements audit but does not prove live deployment security.
 
@@ -31,8 +32,8 @@ Custom signed webhooks, GitHub pull-request deliveries, and Slack app mentions c
 ## Priorities
 
 - **Before public use:** define metadata retention, configure managed backups/disaster recovery, and add edge request limits. Database-held key rotation now has an offline command, but production still needs key custody, backup escrow, and a verified operating procedure. Raw payload expiry is implemented with active-run and DLQ-replay safeguards, and a disposable CI restore drill now passes.
-- **Before staging:** verify worker health and Compose production settings, exercise a real isolated provider workflow, and deploy API and worker as distinct roles.
-- **After the core is proven:** deploy and exercise the included scrape and alert examples, verify traces with a collector, add type checks, and consider a small SDK/CLI if the real user flow benefits from them. Scheduling currently covers durable intervals, not cron/timezone calendars.
+- **Before staging:** verify worker health and Compose production settings, exercise a real isolated provider workflow, and deploy API and worker as distinct roles using a managed database certificate chain.
+- **After the core is proven:** deploy and exercise the included scrape and alert examples, verify traces with a collector, and consider a small SDK/CLI if the real user flow benefits from them. Mypy checks all application and SDK modules, including untyped function bodies. Scheduling currently covers durable intervals, not cron/timezone calendars.
 
 ## Architecture decision
 

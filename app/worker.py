@@ -12,7 +12,7 @@ import psycopg
 from opentelemetry import trace
 from psycopg.rows import dict_row
 
-from app.settings import DATABASE_URL, LEASE_SECONDS
+from app.settings import DATABASE_URL, DEMO_MODE, LEASE_SECONDS, validate_database_tls
 from app.store import claim_task, execute_step, fail_task, heartbeat, mark_worker_stopped
 from app.telemetry import configure_tracing, mark_span_failed, workflow_step_span
 
@@ -58,6 +58,7 @@ def worker_is_healthy() -> bool:
 
 
 def main() -> None:
+    validate_database_tls(DATABASE_URL, demo_mode=DEMO_MODE)
     worker_id = worker_identifier()
     tracer_provider = configure_tracing("relaycore-worker")
     tracer = trace.get_tracer("relaycore.worker")

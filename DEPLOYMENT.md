@@ -8,7 +8,7 @@ The supported runnable setup is the loopback-only Docker Compose Demo Mode descr
 
 Production requires a UTF-8 PostgreSQL database and all of the following environment values:
 
-- `DATABASE_URL`: managed PostgreSQL connection string with TLS and a least-privilege role.
+- `DATABASE_URL`: managed PostgreSQL connection string with `sslmode=verify-full`, a trusted root CA when needed, and a least-privilege role. Production API/worker startup and the key-rotation command reject weaker or implicit SSL modes.
 - `RELAYCORE_DEMO_MODE=0`.
 - `RELAYCORE_OIDC_ISSUER`, `RELAYCORE_OIDC_CLIENT_ID`, `RELAYCORE_OIDC_CLIENT_SECRET`, and `RELAYCORE_OIDC_REDIRECT_URI`.
 - `RELAYCORE_OIDC_STATE_SECRET`: random signing key with at least 32 characters.

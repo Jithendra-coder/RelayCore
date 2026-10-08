@@ -6,6 +6,7 @@ import psycopg
 from cryptography.fernet import Fernet
 from psycopg.rows import dict_row
 
+from app.settings import DEMO_MODE, validate_database_tls
 from app.secretbox import credential_fingerprint, decrypt_secret, encrypt_secret
 
 
@@ -96,6 +97,7 @@ def main() -> None:
     database_url = os.environ.get("DATABASE_URL", "").strip()
     if not database_url:
         raise RuntimeError("Set DATABASE_URL to the RelayCore database before rotating stored secrets.")
+    validate_database_tls(database_url, demo_mode=DEMO_MODE)
     old_key = _key("RELAYCORE_SECRET_ENCRYPTION_KEY")
     new_key = _key("RELAYCORE_SECRET_ENCRYPTION_NEW_KEY")
     with psycopg.connect(database_url, row_factory=dict_row) as conn:

@@ -84,6 +84,7 @@ from app.settings import (
     WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS,
     api_keys,
     secret_encryption_key,
+    validate_database_tls,
 )
 from app.store import (
     IdempotencyConflict,
@@ -222,6 +223,7 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("Production requires OIDC configuration; static API keys are Demo Mode only.")
     else:
         secret_encryption_key(required=True)
+    validate_database_tls(DATABASE_URL, demo_mode=DEMO_MODE)
     pool: DatabasePool = ConnectionPool[PsycopgConnection[dict[str, Any]]](
         DATABASE_URL, min_size=1, max_size=16,
         kwargs={"row_factory": dict_row, "application_name": "relaycore-api"},

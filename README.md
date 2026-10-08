@@ -89,7 +89,7 @@ To run the API without containers, set `DATABASE_URL` to a UTF-8 PostgreSQL data
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-The default database URL is intended only for build verification. Production startup requires HTTPS OIDC configuration and a managed PostgreSQL URL; static API keys are rejected outside Demo Mode. The browser signs in through `/auth/login`, creates its first workspace, and sends the selected workspace on each request. See [DEPLOYMENT.md](DEPLOYMENT.md) for the configuration contract. Live OIDC provider interoperability has not been verified because this repository has no provider credentials.
+The default database URL is intended only for build verification. Production startup requires HTTPS OIDC configuration and a managed PostgreSQL URL with `sslmode=verify-full`; the API and worker reject implicit or weaker database SSL modes. Static API keys are rejected outside Demo Mode. The browser signs in through `/auth/login`, creates its first workspace, and sends the selected workspace on each request. See [DEPLOYMENT.md](DEPLOYMENT.md) for the configuration contract. Live OIDC and managed-database TLS interoperability have not been verified because this repository has no provider credentials or staging database.
 
 ## Measure it
 

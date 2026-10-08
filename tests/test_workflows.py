@@ -342,6 +342,16 @@ def test_oidc_configuration_requires_complete_https_credentials(monkeypatch):
         settings.oidc_settings()
 
 
+def test_production_database_url_requires_verified_tls():
+    from app.settings import validate_database_tls
+
+    validate_database_tls("postgresql://db.example.test/relaycore?sslmode=verify-full", demo_mode=False)
+    validate_database_tls("postgresql://localhost/relaycore", demo_mode=True)
+    for sslmode in ("disable", "allow", "prefer", "require", "verify-ca"):
+        with pytest.raises(RuntimeError, match="sslmode=verify-full"):
+            validate_database_tls(f"postgresql://db.example.test/relaycore?sslmode={sslmode}", demo_mode=False)
+
+
 def test_oidc_identity_rejects_unverified_or_wrong_issuer_claims():
     claims = {"iss": "https://identity.example.test", "sub": "subject-1",
               "email": "user@example.test", "email_verified": True, "name": "Example User"}

@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet
+from psycopg.conninfo import conninfo_to_dict
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres@127.0.0.1:55432/postgres")
 DEMO_MODE = os.environ.get("RELAYCORE_DEMO_MODE", "0").lower() in {"1", "true", "yes"}
@@ -62,6 +63,11 @@ def oidc_settings() -> dict[str, str] | None:
     if discovery.scheme != "https" or not discovery.netloc or discovery.username or discovery.password:
         raise RuntimeError("RELAYCORE_OIDC_DISCOVERY_URL must be an HTTPS URL without embedded credentials.")
     return values
+
+
+def validate_database_tls(database_url: str, *, demo_mode: bool) -> None:
+    if not demo_mode and conninfo_to_dict(database_url).get("sslmode") != "verify-full":
+        raise RuntimeError("Production DATABASE_URL must explicitly set sslmode=verify-full.")
 
 
 def api_keys() -> dict[str, dict[str, str]]:
