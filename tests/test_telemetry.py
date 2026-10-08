@@ -72,3 +72,54 @@ def test_tracing_uses_the_otlp_endpoint_and_service_name(monkeypatch):
     assert provider is providers[0]
     assert provider.resource.attributes["service.name"] == "relaycore-worker"
     provider.shutdown()
+
+
+def test_configured_otlp_exporter_sends_spans_to_a_local_receiver(monkeypatch):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
+
+    import app.telemetry as telemetry
+
+    class Receiver(BaseHTTPRequestHandler):
+        def do_POST(self):
+            request = ExportTraceServiceRequest()
+            request.ParseFromString(self.rfile.read(int(self.headers["Content-Length"])))
+            self.server.exports.append((self.path, self.headers.get("Content-Type"), request))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-protobuf")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, _format, *_args):
+            pass
+
+    receiver = ThreadingHTTPServer(("127.0.0.1", 0), Receiver)
+    receiver.exports = []
+    thread = threading.Thread(target=receiver.serve_forever, daemon=True)
+    thread.start()
+    providers = []
+    monkeypatch.setattr(telemetry.trace, "set_tracer_provider", providers.append)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", f"http://127.0.0.1:{receiver.server_port}")
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
+    monkeypatch.delenv("OTEL_SERVICE_NAME", raising=False)
+
+    provider = configure_tracing("relaycore-test")
+    try:
+        assert provider is providers[0]
+        with provider.get_tracer("relaycore.test").start_as_current_span("exported workflow step"):
+            pass
+        assert provider.force_flush(timeout_millis=3000)
+        assert len(receiver.exports) == 1
+        path, content_type, exported = receiver.exports[0]
+        assert path == "/v1/traces" and content_type == "application/x-protobuf"
+        spans = exported.resource_spans[0].scope_spans[0].spans
+        assert [span.name for span in spans] == ["exported workflow step"]
+        assert any(attribute.key == "service.name" and attribute.value.string_value == "relaycore-test"
+                   for attribute in exported.resource_spans[0].resource.attributes)
+    finally:
+        provider.shutdown()
+        receiver.shutdown()
+        receiver.server_close()
+        thread.join(timeout=3)
