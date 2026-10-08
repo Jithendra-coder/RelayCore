@@ -15,6 +15,7 @@ Custom signed webhooks, GitHub pull-request deliveries, and Slack app mentions c
 - Workspace membership derives tenant access; negative tests cover cross-workspace access.
 - Webhook signatures, delivery deduplication, encrypted credentials, host restrictions, bounded responses, and secret redaction are tested locally.
 - Worker failure, database restart, API restart, migration upgrade, replay, and concurrency have PostgreSQL integration coverage.
+- Queue-age and expired-lease gauges are tenant-scoped; worker failure logs correlate request, run, task, worker, attempt, and step without exception details.
 
 ## Capability boundaries
 
