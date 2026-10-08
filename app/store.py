@@ -1877,6 +1877,13 @@ def dashboard(conn: Connection, tenant_id: str, *, include_workers: bool = False
     ).fetchone()
     effects = conn.execute("SELECT count(*) AS count FROM side_effects WHERE tenant_id=%s", (tenant_id,)).fetchone()["count"]
     dlq = conn.execute("SELECT count(*) AS count FROM dead_letters WHERE tenant_id=%s AND replayed_at IS NULL", (tenant_id,)).fetchone()["count"]
+    operations = conn.execute(
+        """SELECT coalesce(extract(epoch FROM (clock_timestamp() - min(available_at) FILTER (
+                          WHERE status IN ('queued','retry_wait') AND available_at<=clock_timestamp()
+                      ))),0) AS oldest_ready_seconds,
+                  count(*) FILTER (WHERE status='running' AND lease_until<=clock_timestamp()) AS expired_leases
+           FROM tasks WHERE tenant_id=%s""", (tenant_id,)
+    ).fetchone()
     workers = []
     if include_workers:
         workers = conn.execute(
@@ -1896,5 +1903,6 @@ def dashboard(conn: Connection, tenant_id: str, *, include_workers: bool = False
            FROM workflow_runs WHERE tenant_id=%s AND finished_at IS NOT NULL""", (tenant_id,)
     ).fetchone()
     return {"counts": counts, "queue_depth": queue, "events": events, "side_effect_count": effects,
+            "operations": operations,
             "dlq_size": dlq, "workers": workers, "workflows": workflows, "latency_ms": latencies}
 

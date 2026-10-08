@@ -25,6 +25,7 @@ from app.store import (
     claim_task,
     create_auth_session,
     create_workflow,
+    dashboard,
     dispatch_due_schedules,
     emit_event,
     ingest_business_event,
@@ -66,6 +67,41 @@ def test_auth_roles_tenant_boundary_and_request_correlation(client):
     assert client.get(f"/api/workflows/{run_id}", headers=OTHER).status_code == 404
     correlated = client.get("/api/status", headers={**ADMIN, "X-Request-ID": "build-test-001"})
     assert correlated.headers["X-Request-ID"] == "build-test-001"
+    assert client.get("/metrics").status_code == 401
+    metrics = client.get("/metrics", headers=ADMIN)
+    assert metrics.status_code == 200
+    assert "relaycore_queue_oldest_ready_seconds" in metrics.text
+    assert "relaycore_expired_leases" in metrics.text
+
+
+def test_queue_operational_metrics_report_ready_age_and_tenant_scoped_expired_leases():
+    tenant, other = random_tenant(), random_tenant()
+    with pytest.raises(RuntimeError, match="rollback metric fixtures"):
+        with connect(DATABASE_URL, row_factory=dict_row) as conn, conn.transaction():
+            queued = create_workflow(
+                conn, tenant, "metrics queued", [{"name": "record", "action": "record", "payload": {}}],
+                f"metrics-queued:{uuid.uuid4()}", "metrics-test",
+            )
+            leased = create_workflow(
+                conn, other, "metrics expired lease", [{"name": "record", "action": "record", "payload": {}}],
+                f"metrics-lease:{uuid.uuid4()}", "metrics-test",
+            )
+            conn.execute(
+                "UPDATE tasks SET available_at=clock_timestamp()-interval '1 hour' WHERE run_id=%s",
+                (queued["id"],),
+            )
+            conn.execute(
+                """UPDATE tasks SET status='running',lease_owner='metrics-test',
+                          lease_until=clock_timestamp()-interval '5 seconds' WHERE run_id=%s""",
+                (leased["id"],),
+            )
+            queue_metrics = dashboard(conn, tenant)["operations"]
+            lease_metrics = dashboard(conn, other)["operations"]
+            assert queue_metrics["oldest_ready_seconds"] >= 3600
+            assert queue_metrics["expired_leases"] == 0
+            assert lease_metrics["oldest_ready_seconds"] == 0
+            assert lease_metrics["expired_leases"] == 1
+            raise RuntimeError("rollback metric fixtures")
 
 
 def test_workspace_sessions_rbac_and_cross_workspace_isolation(client):

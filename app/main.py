@@ -1589,6 +1589,12 @@ def metrics(user: Principal = Depends(principal), pool: ConnectionPool = Depends
         "# HELP relaycore_queue_depth Ready or leased tasks for the authenticated tenant.",
         "# TYPE relaycore_queue_depth gauge",
         f"relaycore_queue_depth {data['queue_depth']}",
+        "# HELP relaycore_queue_oldest_ready_seconds Age of the oldest available queued task for the authenticated tenant.",
+        "# TYPE relaycore_queue_oldest_ready_seconds gauge",
+        f"relaycore_queue_oldest_ready_seconds {data['operations']['oldest_ready_seconds']:.3f}",
+        "# HELP relaycore_expired_leases Number of running tasks with an expired lease for the authenticated tenant.",
+        "# TYPE relaycore_expired_leases gauge",
+        f"relaycore_expired_leases {data['operations']['expired_leases']}",
         "# HELP relaycore_workflows_total Workflow runs by state.",
         "# TYPE relaycore_workflows_total gauge",
     ]
