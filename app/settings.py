@@ -13,6 +13,7 @@ DEMO_MODE = os.environ.get("RELAYCORE_DEMO_MODE", "0").lower() in {"1", "true", 
 WORKER_COUNT = int(os.environ.get("RELAYCORE_WORKERS", "2"))
 MAX_ATTEMPTS = int(os.environ.get("RELAYCORE_MAX_ATTEMPTS", "3"))
 MAX_QUEUE_DEPTH = int(os.environ.get("RELAYCORE_QUEUE_LIMIT", "1000"))
+MAX_SCHEDULES_PER_TENANT = int(os.environ.get("RELAYCORE_SCHEDULE_LIMIT", "1000"))
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("RELAYCORE_RATE_LIMIT_PER_MINUTE", "600"))
 MAX_WEBHOOK_BYTES = 256 * 1024
 WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS = 300
@@ -24,6 +25,8 @@ if not 1 <= MAX_ATTEMPTS <= 10:
     raise RuntimeError("RELAYCORE_MAX_ATTEMPTS must be between 1 and 10.")
 if MAX_QUEUE_DEPTH < 1:
     raise RuntimeError("RELAYCORE_QUEUE_LIMIT must be at least 1.")
+if MAX_SCHEDULES_PER_TENANT < 1:
+    raise RuntimeError("RELAYCORE_SCHEDULE_LIMIT must be at least 1.")
 if RATE_LIMIT_PER_MINUTE < 1:
     raise RuntimeError("RELAYCORE_RATE_LIMIT_PER_MINUTE must be at least 1.")
 if not math.isfinite(LEASE_SECONDS) or LEASE_SECONDS <= 0:

@@ -20,16 +20,16 @@ Custom signed webhooks, GitHub pull-request deliveries, and Slack app mentions c
 
 | Classification | Current evidence |
 |---|---|
-| **Implemented and locally tested** | Durable workflow execution, retries, lease recovery, cancellation, dead-letter replay, immutable versions, OIDC/session and workspace code, signed webhook intake, HTTP action controls, and event-triggered runs. |
+| **Implemented and locally tested** | Durable workflow execution, retries, lease recovery, cancellation, dead-letter replay, immutable versions, interval schedules, OIDC/session and workspace code, signed webhook intake, HTTP action controls, and event-triggered runs. |
 | **Implemented, provider unverified** | OIDC sign-in, GitHub App installation/webhooks, Slack OAuth/events/message posting, and outbound HTTP. Tests use mocked provider responses or a no-network transport; no live provider credentials are configured. |
 | **Simulated** | Synthetic benchmark traffic and the Demo Mode inventory/payment/shipping story. The `charge` action records a local database effect, not a payment. |
-| **Incomplete** | Durable scheduling, SDK/CLI, cloud deployment, OpenTelemetry traces and alerts, automatic event retention, encryption-key rotation, a full restore drill, and live provider verification. |
+| **Incomplete** | SDK/CLI, cloud deployment, OpenTelemetry traces and alerts, automatic event retention, encryption-key rotation, a full restore drill, and live provider verification. |
 
 ## Priorities
 
 - **Before public use:** define webhook payload retention and prove restore/recovery; add edge request limits and key lifecycle controls.
 - **Before staging:** verify worker health and Compose production settings, exercise a real isolated provider workflow, and deploy API and worker as distinct roles.
-- **After the core is proven:** add durable interval schedules, traces/alerts, type and dependency checks, and a small SDK/CLI if the real user flow benefits from them.
+- **After the core is proven:** add traces/alerts, type and dependency checks, and a small SDK/CLI if the real user flow benefits from them. Scheduling currently covers durable intervals, not cron/timezone calendars.
 
 ## Architecture decision
 

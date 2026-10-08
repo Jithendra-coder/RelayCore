@@ -2,7 +2,7 @@
 
 ## Current phase
 
-Identity, workspace authorization, signed durable webhook intake, encrypted workspace credential storage, constrained production HTTP and Slack message actions, exact-match Demo/production triggers, GitHub pull-request events, and Slack app-mention events are implemented and locally tested. Production runs are versioned; HTTP body mapping is explicit and bounded. RelayCore remains a prototype: scheduling, SDK/CLI, telemetry, and deployment are not complete.
+Identity, workspace authorization, signed durable webhook intake, encrypted workspace credential storage, constrained production HTTP and Slack message actions, exact-match Demo/production triggers, GitHub pull-request events, Slack app-mention events, and durable interval schedules are implemented and locally tested. Production runs are versioned; HTTP body mapping is explicit and bounded. RelayCore remains a prototype: SDK/CLI, OpenTelemetry, staging, and production deployment are not complete.
 
 ## Phase gates
 
@@ -26,24 +26,25 @@ Identity, workspace authorization, signed durable webhook intake, encrypted work
 | Webhook workflow triggers | Complete locally for Demo Mode and constrained production actions | Exact endpoint ID + JSON `type`; event intake and matching run commit atomically. Duplicates do not enqueue twice. Production runs reference the source event, pin an immutable version, and support bounded JSON Pointer references in HTTP request bodies. |
 | GitHub App linking and pull-request webhooks | Complete locally; live provider unverified | One-use workspace-admin state with PKCE; user access and App ownership checks; temporary token discarded; signed raw-body delivery, UUID dedupe, normalized PR events, installation status changes, dashboard controls, and durable workflow triggers covered by tests. GitHub API actions and live credentials remain absent. |
 | Slack OAuth, Events API, and message action | Complete locally; live provider unverified | Workspace-admin OAuth state requests app-mention and message-post scopes; encrypted bot credential, active team uniqueness, raw-body HMAC plus five-minute timestamp check, URL verification, app-mention normalization, event dedupe, uninstall revocation, dashboard controls, durable workflow triggers, and bounded message posts are covered by tests. Live credentials remain absent. |
-| Production secrets, scheduling, deployment, SDK/CLI | Incomplete | See `LIMITATIONS.md`. |
+| Durable interval schedules | Complete locally; operations/UI limited | PostgreSQL stores schedule state; concurrent coordinator polls use `SKIP LOCKED`; queue pressure preserves a due occurrence; pause/resume/cancel are tenant-scoped; runs pin the current immutable version. Integration tests cover idempotency, lifecycle, concurrent dispatch, queue-full retention, version changes, event-dependent pauses, and schema upgrades. Cron/timezones and dashboard controls are absent. |
+| Production secrets, deployment, SDK/CLI | Incomplete | See `LIMITATIONS.md`. |
 
 ## Latest validation
 
-- PostgreSQL integration suite: **72 passed** on an isolated PostgreSQL 17.9 / UTF-8 database, 2026-10-08; **80% app source coverage**. It includes the prior OIDC/RBAC, secret, HTTP/SSRF, versioning, trigger, GitHub/Slack, concurrency, worker recovery, and migration checks, plus fresh/stale worker-heartbeat health and invalid runtime-limit startup checks. The current GitHub Actions workflow also runs the suite on PostgreSQL 18.
-- Ruff, pre-commit, compilation, dashboard JavaScript syntax, and Compose configuration pass. Coverage is a report, not a configured threshold.
+- PostgreSQL integration suite: **77 passed** on an isolated PostgreSQL 17.9 / UTF-8 database, 2026-10-08; **80% app source coverage**. Schedule coverage includes workspace RBAC, idempotency, pause/resume/cancel, two concurrent dispatchers, queue-full fairness across tenants, API coordinator dispatch, version pinning, and safe pause when event data becomes required. The current GitHub Actions workflow also runs the suite on PostgreSQL 18.
+- Ruff, pre-commit, compilation, and `git diff --check` pass. Coverage is a report, not a configured threshold.
 - The logical backup helper created a valid PostgreSQL custom archive; `restore.ps1 -WhatIf` validated its catalog without changing a database. A successful restore drill is still pending.
-- `python -m compileall -q app tests benchmarks scripts` passes; the dashboard script passes `node --check`; `git diff --check` passes. Runtime limits now fail fast when worker count, attempt range, queue/rate limits, or lease duration are invalid.
+- `python -m compileall -q app tests benchmarks scripts` passes. Runtime limits fail fast when worker count, attempt range, queue/schedule/rate limits, or lease duration are invalid.
 - Local live Demo Mode evidence: 10 duplicate deliveries -> 1 workflow -> 3 effects; a killed worker was replaced after lease expiry; DLQ replay completed. Queue depth ended at 0. The recorded P95 includes recovery delay.
 - Synthetic 100-workflow P95: 3,096.99 ms (1 worker), 2,364.86 ms (2), 2,289.27 ms (4); 0/100 failures each. A local 20,000-row query measured 15.411 ms before and 0.126 ms after a partial index in one run. See `BENCHMARKS.md` and `docs/evidence.md`.
-- The current verification did not run Docker, a live OIDC provider, external integrations, or a cloud deployment.
+- Docker, a live OIDC provider, external integrations, and cloud deployment were not run locally. CI will validate the changed Compose file after this slice is pushed.
 
 ## Known limits and technical debt
 
 - A configured OIDC provider and credentials are required for actual browser sign-in; only local claim/configuration behavior and cookie-backed sessions were tested here.
-- Production API startup requires OIDC and a Fernet encryption key; static keys are Demo Mode only. Production workflow submission accepts constrained HTTP and connected-workspace Slack message steps, with manual starts or exact event triggers.
+- Production API startup requires OIDC and a Fernet encryption key; static keys are Demo Mode only. Production workflow submission accepts constrained HTTP and connected-workspace Slack message steps, with manual starts, exact event triggers, or durable interval schedules.
 - GitHub App linking and pull-request webhook intake, Slack OAuth/app-mention intake, and Slack message posting are locally tested with mocked provider responses; no live GitHub, Slack, or OIDC credentials are configured. GitHub API actions, provider-side GitHub uninstall, HTTP response mapping, and dynamic URL/header/message mapping remain open. External actions remain at least once; HTTP providers must honor the stable idempotency key, while Slack can duplicate posts after ambiguous responses. An in-flight call can finish after cancellation, with its response recorded. The worker rejects sandbox actions in production even if old demo rows remain queued.
-- Durable schedules, workflow conditions/branches, approvals, and a transactional external-action outbox remain open. Slack `Retry-After` delays are honored; richer provider-specific limit handling remains open.
+- Workflow conditions/branches, approvals, cron/timezone schedules, and a transactional external-action outbox remain open. Slack `Retry-After` delays are honored; richer provider-specific limit handling remains open.
 - Incoming webhook payloads have no retention/cleanup or endpoint-specific schema. The encryption master key has no automated rotation; public deployment also needs edge IP/network limits.
 - PostgreSQL is the source of truth and queue. The per-tenant event-order lock can bottleneck high-volume writes. Independent broker scaling/replay has not been measured or justified.
 - The default local stack can supervise worker children under the API. For separate roles, set `RELAYCORE_WORKERS=0` on the API and run standalone worker processes with unique IDs before scaling API replicas.
@@ -52,8 +53,8 @@ Identity, workspace authorization, signed durable webhook intake, encrypted work
 
 ## Latest change
 
-Added bounded production Slack message actions with durable `Retry-After` scheduling, Slack admin reconnect, and a locally verified standalone API/worker deployment mode. The worker Compose health check now uses its recent database heartbeat, and Compose forwards the documented OIDC and provider configuration to the API. `app_mention` events enter the existing deduplicated, version-pinned workflow trigger transaction. Live Slack, live GitHub, live OIDC, and cloud release remain unverified.
+Added durable interval schedules. Due occurrences are claimed transactionally across coordinators, deferred without loss under queue/rate limits, and admitted using the current published version. Paused/cancelled states and schedule audit events are persisted. Live provider credentials and cloud release remain unverified.
 
 ## Next milestone
 
-Continue with durable scheduling, SDK/CLI, telemetry, and deployment. Live GitHub, Slack, and OIDC credentials are prerequisites for external interoperability checks.
+Continue with SDK/CLI, telemetry, and deployment. Live GitHub, Slack, and OIDC credentials are prerequisites for external interoperability checks.

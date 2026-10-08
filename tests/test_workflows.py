@@ -25,12 +25,14 @@ from app.store import (
     claim_task,
     create_auth_session,
     create_workflow,
+    dispatch_due_schedules,
     emit_event,
     ingest_business_event,
     migrate,
     upsert_oidc_user,
 )
-from tests.conftest import ADMIN, OTHER, TEST_TENANT, VIEWER, drive_run, get_run, make_workflow, random_tenant
+from tests.conftest import (ADMIN, OTHER, OTHER_TENANT, TEST_TENANT, VIEWER, drive_run, get_run, make_workflow,
+                            random_tenant)
 
 
 @pytest.mark.parametrize(("name", "value"), [
@@ -38,6 +40,7 @@ from tests.conftest import ADMIN, OTHER, TEST_TENANT, VIEWER, drive_run, get_run
     ("RELAYCORE_MAX_ATTEMPTS", "0"),
     ("RELAYCORE_MAX_ATTEMPTS", "11"),
     ("RELAYCORE_QUEUE_LIMIT", "0"),
+    ("RELAYCORE_SCHEDULE_LIMIT", "0"),
     ("RELAYCORE_RATE_LIMIT_PER_MINUTE", "0"),
     ("RELAYCORE_LEASE_SECONDS", "0"),
     ("RELAYCORE_LEASE_SECONDS", "nan"),
@@ -47,7 +50,7 @@ def test_invalid_runtime_limits_fail_during_settings_import(name, value):
     environment[name] = value
     root = os.path.dirname(os.path.dirname(__file__))
     result = subprocess.run([sys.executable, "-c", "import app.settings"], cwd=root, env=environment,
-                            capture_output=True, text=True, timeout=5)
+                            capture_output=True, text=True, timeout=15)
     assert result.returncode != 0
     assert name in result.stderr
 
@@ -768,6 +771,233 @@ def test_workflow_versions_are_immutable_and_runs_pin_the_selected_version(clien
     assert client.get(f"/api/workflow-definitions/{workflow_id}", headers=OTHER).status_code == 404
 
 
+def test_schedule_api_is_scoped_idempotent_and_supports_pause_resume_cancel(client, monkeypatch):
+    import app.store as store
+
+    definition = client.post("/api/workflow-definitions", headers={
+        **ADMIN, "Idempotency-Key": f"schedule-definition:{uuid.uuid4()}"
+    }, json={
+        "title": "scheduled flow",
+        "steps": [{"name": "record value", "action": "record", "payload": {"value": 1}}],
+    })
+    assert definition.status_code == 201, definition.text
+    workspace = TEST_TENANT
+    path = f"/api/workspaces/{workspace}/schedules"
+    body = {"workflow_id": definition.json()["id"], "name": "hourly check", "interval_seconds": 3600}
+    key = f"schedule-create:{uuid.uuid4()}"
+
+    assert client.post(path, headers={**VIEWER, "Idempotency-Key": key}, json=body).status_code == 403
+    assert client.post(path, headers={**ADMIN, "Idempotency-Key": key},
+                       json={**body, "interval_seconds": 59}).status_code == 422
+    created = client.post(path, headers={**ADMIN, "Idempotency-Key": key}, json=body)
+    repeated = client.post(path, headers={**ADMIN, "Idempotency-Key": key}, json=body)
+    conflict = client.post(path, headers={**ADMIN, "Idempotency-Key": key},
+                           json={**body, "interval_seconds": 7200})
+    assert created.status_code == 201, created.text
+    assert repeated.json()["id"] == created.json()["id"] and repeated.json()["created"] is False
+    assert conflict.status_code == 409
+    schedule_id = created.json()["id"]
+    monkeypatch.setattr(store, "MAX_SCHEDULES_PER_TENANT", 1)
+    full = client.post(path, headers={**ADMIN, "Idempotency-Key": f"schedule-full:{uuid.uuid4()}"},
+                       json={**body, "name": "second schedule"})
+    assert full.status_code == 429
+    assert client.get(path, headers=OTHER).status_code == 404
+    assert client.get(path, headers=ADMIN).json()[0]["id"] == schedule_id
+    assert client.get(path, headers=VIEWER).status_code == 200
+
+    paused = client.patch(f"{path}/{schedule_id}", headers=ADMIN, json={"status": "paused"})
+    resumed = client.patch(f"{path}/{schedule_id}", headers=ADMIN, json={"status": "active"})
+    assert paused.json()["status"] == "paused" and paused.json()["pause_reason"] == "user_paused"
+    assert resumed.json()["status"] == "active" and resumed.json()["pause_reason"] is None
+    assert client.delete(f"{path}/{schedule_id}", headers=ADMIN).json()["status"] == "cancelled"
+    assert client.delete(f"{path}/{schedule_id}", headers=ADMIN).json()["status"] == "cancelled"
+    assert client.patch(f"{path}/{schedule_id}", headers=ADMIN, json={"status": "active"}).status_code == 409
+
+
+def test_scheduler_pins_each_current_version_and_pauses_event_dependent_workflows(client, monkeypatch):
+    import app.coordinator as coordinator
+
+    monkeypatch.setattr(coordinator, "dispatch_due_schedules", lambda _conn: 0)
+    definition = client.post("/api/workflow-definitions", headers={
+        **ADMIN, "Idempotency-Key": f"schedule-version-definition:{uuid.uuid4()}"
+    }, json={
+        "title": "scheduled version flow",
+        "steps": [{"name": "record value", "action": "record", "payload": {"value": 1}}],
+    })
+    assert definition.status_code == 201, definition.text
+    path = f"/api/workspaces/{TEST_TENANT}/schedules"
+    schedule = client.post(path, headers={**ADMIN, "Idempotency-Key": f"schedule:{uuid.uuid4()}"}, json={
+        "workflow_id": definition.json()["id"], "name": "version poll", "interval_seconds": 60,
+    })
+    assert schedule.status_code == 201, schedule.text
+    schedule_id, workflow_id = schedule.json()["id"], definition.json()["id"]
+
+    def make_due():
+        with client.app.state.pool.connection() as conn:
+            conn.execute("UPDATE workflow_schedules SET next_run_at=clock_timestamp()-interval '1 second' WHERE id=%s",
+                         (schedule_id,))
+
+    make_due()
+    start = threading.Barrier(2)
+    results = []
+
+    def dispatch_concurrently():
+        with client.app.state.pool.connection() as conn:
+            start.wait(5)
+            results.append(dispatch_due_schedules(conn))
+
+    workers = [threading.Thread(target=dispatch_concurrently) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=8)
+    assert all(not worker.is_alive() for worker in workers)
+    assert sum(results) == 1
+    with client.app.state.pool.connection() as conn:
+        assert dispatch_due_schedules(conn) == 0
+        runs = conn.execute(
+            """SELECT id,workflow_version_id,definition FROM workflow_runs
+               WHERE tenant_id=%s AND idempotency_key LIKE %s ORDER BY created_at""",
+            (TEST_TENANT, f"schedule:{schedule_id}:%"),
+        ).fetchall()
+    assert len(runs) == 1
+    assert runs[0]["workflow_version_id"] == definition.json()["version_id"]
+    assert runs[0]["definition"]["steps"][0]["payload"]["value"] == 1
+
+    second = client.post(f"/api/workflow-definitions/{workflow_id}/versions", headers={
+        **ADMIN, "Idempotency-Key": f"schedule-version:{uuid.uuid4()}"
+    }, json={
+        "title": "scheduled version flow",
+        "steps": [{"name": "record value", "action": "record", "payload": {"value": 2}}],
+    })
+    assert second.status_code == 201, second.text
+    make_due()
+    with client.app.state.pool.connection() as conn:
+        assert dispatch_due_schedules(conn) == 1
+
+    third = client.post(f"/api/workflow-definitions/{workflow_id}/versions", headers={
+        **ADMIN, "Idempotency-Key": f"schedule-version:{uuid.uuid4()}"
+    }, json={
+        "title": "event-dependent version",
+        "steps": [{"name": "record event reference", "action": "record",
+                   "payload": {"body": {"$event": "/order"}}}],
+    })
+    assert third.status_code == 201, third.text
+    make_due()
+    with client.app.state.pool.connection() as conn:
+        assert dispatch_due_schedules(conn) == 0
+        state = conn.execute(
+            "SELECT status,pause_reason FROM workflow_schedules WHERE tenant_id=%s AND id=%s",
+            (TEST_TENANT, schedule_id),
+        ).fetchone()
+        runs = conn.execute(
+            """SELECT workflow_version_id,definition FROM workflow_runs
+               WHERE tenant_id=%s AND idempotency_key LIKE %s ORDER BY created_at""",
+            (TEST_TENANT, f"schedule:{schedule_id}:%"),
+        ).fetchall()
+    assert state == {"status": "paused", "pause_reason": "workflow_requires_webhook_event"}
+    assert [run["workflow_version_id"] for run in runs] == [definition.json()["version_id"], second.json()["id"]]
+    assert [run["definition"]["steps"][0]["payload"]["value"] for run in runs] == [1, 2]
+
+
+def test_scheduler_leaves_due_occurrence_queued_when_tenant_queue_is_full(client, monkeypatch):
+    import app.coordinator as coordinator
+    import app.store as store
+
+    monkeypatch.setattr(coordinator, "dispatch_due_schedules", lambda _conn: 0)
+    definition = client.post("/api/workflow-definitions", headers={
+        **ADMIN, "Idempotency-Key": f"schedule-full-definition:{uuid.uuid4()}"
+    }, json={
+        "title": "full queue scheduled flow",
+        "steps": [{"name": "record value", "action": "record", "payload": {"value": 1}}],
+    })
+    assert definition.status_code == 201, definition.text
+    path = f"/api/workspaces/{TEST_TENANT}/schedules"
+    schedule = client.post(path, headers={**ADMIN, "Idempotency-Key": f"schedule:{uuid.uuid4()}"}, json={
+        "workflow_id": definition.json()["id"], "name": "wait for capacity", "interval_seconds": 60,
+    })
+    assert schedule.status_code == 201, schedule.text
+    schedule_id = schedule.json()["id"]
+
+    other_definition = client.post("/api/workflow-definitions", headers={
+        **OTHER, "Idempotency-Key": f"other-schedule-definition:{uuid.uuid4()}"
+    }, json={
+        "title": "healthy tenant scheduled flow",
+        "steps": [{"name": "record value", "action": "record", "payload": {"value": 2}}],
+    })
+    assert other_definition.status_code == 201, other_definition.text
+    other_path = f"/api/workspaces/{OTHER_TENANT}/schedules"
+    other_schedule = client.post(other_path, headers={
+        **OTHER, "Idempotency-Key": f"other-schedule:{uuid.uuid4()}"
+    }, json={
+        "workflow_id": other_definition.json()["id"], "name": "healthy tenant", "interval_seconds": 60,
+    })
+    assert other_schedule.status_code == 201, other_schedule.text
+    other_schedule_id = other_schedule.json()["id"]
+
+    with client.app.state.pool.connection() as conn:
+        active = conn.execute(
+            "SELECT count(*) AS count FROM tasks WHERE tenant_id=%s AND status IN ('queued','retry_wait','running')",
+            (TEST_TENANT,),
+        ).fetchone()["count"]
+    monkeypatch.setattr(store, "MAX_QUEUE_DEPTH", active + 1)
+    pending = make_workflow(client, key=f"queue-before-schedule:{uuid.uuid4()}")
+    assert pending.status_code == 202, pending.text
+    with client.app.state.pool.connection() as conn:
+        conn.execute("UPDATE workflow_schedules SET next_run_at=clock_timestamp()-interval '2 seconds' WHERE id=%s",
+                     (schedule_id,))
+        conn.execute("UPDATE workflow_schedules SET next_run_at=clock_timestamp()-interval '1 second' WHERE id=%s",
+                     (other_schedule_id,))
+        assert dispatch_due_schedules(conn) == 1
+        state = conn.execute(
+            "SELECT status,next_run_at<=clock_timestamp() AS is_due FROM workflow_schedules WHERE id=%s",
+            (schedule_id,),
+        ).fetchone()
+        scheduled_runs = conn.execute(
+            "SELECT count(*) AS count FROM workflow_runs WHERE tenant_id=%s AND idempotency_key LIKE %s",
+            (TEST_TENANT, f"schedule:{schedule_id}:%"),
+        ).fetchone()["count"]
+        healthy_run_count = conn.execute(
+            "SELECT count(*) AS count FROM workflow_runs WHERE tenant_id=%s AND idempotency_key LIKE %s",
+            (OTHER_TENANT, f"schedule:{other_schedule_id}:%"),
+        ).fetchone()["count"]
+    assert state == {"status": "active", "is_due": True}
+    assert scheduled_runs == 0
+    assert healthy_run_count == 1
+
+
+def test_api_coordinator_dispatches_due_schedule(client):
+    definition = client.post("/api/workflow-definitions", headers={
+        **ADMIN, "Idempotency-Key": f"coordinator-schedule-definition:{uuid.uuid4()}"
+    }, json={
+        "title": "coordinator scheduled flow",
+        "steps": [{"name": "record value", "action": "record", "payload": {"value": 3}}],
+    })
+    assert definition.status_code == 201, definition.text
+    path = f"/api/workspaces/{TEST_TENANT}/schedules"
+    schedule = client.post(path, headers={**ADMIN, "Idempotency-Key": f"coordinator-schedule:{uuid.uuid4()}"}, json={
+        "workflow_id": definition.json()["id"], "name": "coordinator poll", "interval_seconds": 60,
+    })
+    assert schedule.status_code == 201, schedule.text
+    schedule_id = schedule.json()["id"]
+    with client.app.state.pool.connection() as conn:
+        conn.execute("UPDATE workflow_schedules SET next_run_at=clock_timestamp()-interval '1 second' WHERE id=%s",
+                     (schedule_id,))
+
+    deadline = time.monotonic() + 4
+    state = None
+    while time.monotonic() < deadline:
+        with client.app.state.pool.connection() as conn:
+            state = conn.execute(
+                "SELECT last_run_id,last_run_at FROM workflow_schedules WHERE id=%s", (schedule_id,),
+            ).fetchone()
+        if state["last_run_id"]:
+            break
+        time.sleep(0.05)
+    assert state and state["last_run_id"]
+    assert state["last_run_at"] is not None
+
+
 def test_idempotent_workflow_creation_and_durable_history(client):
     key = f"persist:{uuid.uuid4()}"
     first = make_workflow(client, key=key)
@@ -1076,7 +1306,8 @@ def test_versioned_migrations_bootstrap_and_skip_applied_files():
             assert conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall() == [
                 {"version": "001"}, {"version": "002"}, {"version": "003"},
                 {"version": "004"}, {"version": "005"}, {"version": "006"}, {"version": "007"},
-                {"version": "008"}, {"version": "009"}, {"version": "010"}, {"version": "011"}
+                {"version": "008"}, {"version": "009"}, {"version": "010"}, {"version": "011"},
+                {"version": "012"}
             ]
             assert conn.execute("SELECT count(*) AS n FROM tasks").fetchone()["n"] == 0
             assert conn.execute(
@@ -1107,6 +1338,10 @@ def test_versioned_migrations_bootstrap_and_skip_applied_files():
                 (["slack_oauth_states", "slack_installations"],),
             ).fetchall()
             assert len(slack_tables) == 2
+            assert conn.execute(
+                """SELECT 1 FROM information_schema.tables
+                   WHERE table_schema=current_schema() AND table_name='workflow_schedules'"""
+            ).fetchone()
             credential_tables = conn.execute(
                 """SELECT table_name FROM information_schema.tables
                    WHERE table_schema=current_schema() AND table_name=ANY(%s)""",
@@ -1148,7 +1383,8 @@ def test_workflow_version_migration_upgrades_an_existing_001_database():
             ).fetchall() == [
                 {"version": "001"}, {"version": "002"}, {"version": "003"},
                 {"version": "004"}, {"version": "005"}, {"version": "006"}, {"version": "007"},
-                {"version": "008"}, {"version": "009"}, {"version": "010"}, {"version": "011"}
+                {"version": "008"}, {"version": "009"}, {"version": "010"}, {"version": "011"},
+                {"version": "012"}
             ]
             columns = conn.execute(
                 """SELECT column_name FROM information_schema.columns

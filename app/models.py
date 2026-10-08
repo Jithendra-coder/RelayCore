@@ -60,6 +60,28 @@ class WorkflowRequest(BaseModel):
     trigger: WebhookTriggerRequest | None = None
 
 
+class ScheduleCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workflow_id: UUID
+    name: str = Field(min_length=1, max_length=100)
+    interval_seconds: int = Field(ge=60, le=31_536_000)
+
+    @field_validator("name")
+    @classmethod
+    def schedule_name_is_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Schedule name must contain a visible character.")
+        return value
+
+
+class ScheduleStatusRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["active", "paused"]
+
+
 class DuplicateEventRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

@@ -38,6 +38,10 @@ Production workflows currently accept versioned HTTP steps and Slack message ste
 
 Put the step in a `POST /api/workflow-definitions` request and include `"trigger":{"endpoint_id":"<endpoint-id>","event_type":"push"}` to run it from signed webhooks. A body using `$event` references requires a webhook trigger and cannot be started manually. `POST /api/workflows` is reserved for Demo Mode.
 
+## Durable interval schedules
+
+Create an authenticated workspace schedule with `POST /api/workspaces/{workspace_id}/schedules`, passing a workflow definition UUID, a name, and an interval from 60 seconds to one year. The first occurrence is due after the full interval. `GET` lists schedules, `PATCH` pauses or resumes with `{"status":"paused"}` / `{"status":"active"}`, and `DELETE` cancels. Include an `Idempotency-Key` when creating. Active/paused schedules are limited per workspace and mutations use the configured write rate limit. Resume starts a fresh interval; queue or rate-limit pressure leaves the due occurrence pending. Each accepted run pins the version current at dispatch. If a later version needs webhook event data, the schedule pauses with a reason. The coordinator polls around once per second; cron and timezone calendars are not supported. See [the runbook](docs/runbook.md) for a request example and operational behavior.
+
 ## GitHub App events
 
 RelayCore can link one GitHub App installation to each workspace and turn signed pull-request deliveries into ordinary durable webhook events. Run production OIDC and configure all `RELAYCORE_GITHUB_*` values in [`.env.example`](.env.example). In the GitHub App settings, set the setup and callback URLs to those environment values, set the webhook URL to `https://<your-host>/integrations/github/webhook`, choose the same webhook secret, grant **Pull requests: read-only**, and subscribe to `pull_request` and `installation` events. Do not enable GitHub's automatic OAuth-on-install redirect; RelayCore uses the separate setup URL to bind the installation to the signed-in workspace admin.

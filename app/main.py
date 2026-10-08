@@ -49,6 +49,8 @@ from app.models import (
     DuplicateEventRequest,
     CredentialCreateRequest,
     CredentialRotateRequest,
+    ScheduleCreateRequest,
+    ScheduleStatusRequest,
     WorkspaceCreateRequest,
     WorkspaceMemberRequest,
     WebhookCreateRequest,
@@ -76,6 +78,8 @@ from app.store import (
     QueueFull,
     RateLimited,
     WorkflowDisabled,
+    WorkflowScheduleCancelled,
+    ScheduleLimitReached,
     WebhookEndpointNotFound,
     WebhookSecretRotated,
     admit_rate_limit,
@@ -83,6 +87,7 @@ from app.store import (
     create_auth_session,
     create_workflow,
     create_workflow_definition,
+    create_workflow_schedule,
     create_workspace,
     create_webhook_endpoint,
     create_workspace_credential,
@@ -99,6 +104,7 @@ from app.store import (
     list_webhook_endpoints,
     list_workspace_credentials,
     list_workflow_definitions,
+    list_workflow_schedules,
     migrate,
     remove_workspace_member,
     revoke_webhook_endpoint,
@@ -109,6 +115,8 @@ from app.store import (
     rotate_webhook_secret,
     rotate_workspace_credential,
     trigger_workflow_definition,
+    set_workflow_schedule_status,
+    workflow_schedule_idempotent_result,
     upsert_oidc_user,
     workspace_members,
     webhook_signing_info,
@@ -151,6 +159,8 @@ def rate_limit_error(exc: Exception) -> None:
         raise HTTPException(429, f"Tenant queue is full ({MAX_QUEUE_DEPTH} active workflows). Retry later.")
     if isinstance(exc, RateLimited):
         raise HTTPException(429, f"Rate limit reached ({RATE_LIMIT_PER_MINUTE} writes per minute). Retry later.")
+    if isinstance(exc, ScheduleLimitReached):
+        raise HTTPException(429, "Workspace schedule limit reached. Cancel an unused schedule before adding another.")
     if isinstance(exc, IdempotencyConflict):
         raise HTTPException(409, "This idempotency key was already used with a different payload.")
     if isinstance(exc, ValueError):
@@ -1114,6 +1124,105 @@ def workflow_definitions(user: Principal = Depends(principal),
                          pool: ConnectionPool = Depends(pool_for)) -> list[dict[str, Any]]:
     with pool.connection() as conn:
         return list_workflow_definitions(conn, user.tenant_id)
+
+
+@app.get("/api/workspaces/{workspace_id}/schedules")
+def workflow_schedules(workspace_id: str, user: Principal = Depends(principal),
+                       pool: ConnectionPool = Depends(pool_for)) -> list[dict[str, Any]]:
+    if user.tenant_id != workspace_id:
+        raise HTTPException(404, "Workspace not found.")
+    with pool.connection() as conn:
+        return list_workflow_schedules(conn, workspace_id)
+
+
+@app.post("/api/workspaces/{workspace_id}/schedules", status_code=201)
+def create_schedule(
+    workspace_id: str,
+    body: ScheduleCreateRequest,
+    request: Request,
+    idempotency_key: str = Header(default_factory=lambda: str(uuid.uuid4()), alias="Idempotency-Key"),
+    user: Principal = Depends(principal),
+    pool: ConnectionPool = Depends(pool_for),
+) -> dict[str, Any]:
+    if user.tenant_id != workspace_id:
+        raise HTTPException(404, "Workspace not found.")
+    authorize(user, "admin", "operator")
+    try:
+        key = valid_idempotency_key(idempotency_key)
+        workflow_id = str(body.workflow_id)
+        with pool.connection() as conn:
+            conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (workspace_id,))
+            existing = workflow_schedule_idempotent_result(
+                conn, workspace_id, workflow_id, body.name, body.interval_seconds, key,
+            )
+            if existing:
+                return existing
+            definition = get_workflow_definition(conn, workspace_id, workflow_id)
+            if not definition:
+                raise HTTPException(404, "Workflow definition not found.")
+            if definition["status"] != "active":
+                raise HTTPException(409, "Workflow is disabled.")
+            latest = max(definition["versions"], key=lambda version: version["version_number"])
+            snapshot = latest["definition"]
+            if any(has_event_references(step["payload"].get("body")) for step in snapshot["steps"]):
+                raise HTTPException(422, "Workflows that require webhook event data cannot be scheduled.")
+            validate_workflow_actions(conn, workspace_id, snapshot["steps"], snapshot.get("trigger"))
+            result = create_workflow_schedule(
+                conn, workspace_id, workflow_id, body.name, body.interval_seconds,
+                key, request_id(request), user.user_id,
+            )
+    except WorkflowDisabled as exc:
+        raise HTTPException(409, "Workflow is disabled.") from exc
+    except (IdempotencyConflict, RateLimited, ScheduleLimitReached, ValueError) as exc:
+        rate_limit_error(exc)
+    if result is None:
+        raise HTTPException(404, "Workflow definition not found.")
+    return result
+
+
+@app.patch("/api/workspaces/{workspace_id}/schedules/{schedule_id}")
+def update_schedule(
+    workspace_id: str,
+    schedule_id: str,
+    body: ScheduleStatusRequest,
+    request: Request,
+    user: Principal = Depends(principal),
+    pool: ConnectionPool = Depends(pool_for),
+) -> dict[str, Any]:
+    if user.tenant_id != workspace_id:
+        raise HTTPException(404, "Workspace not found.")
+    authorize(user, "admin", "operator")
+    try:
+        with pool.connection() as conn:
+            result = set_workflow_schedule_status(
+                conn, workspace_id, schedule_id, body.status, request_id(request), user.user_id,
+            )
+    except WorkflowScheduleCancelled as exc:
+        raise HTTPException(409, "Cancelled schedules cannot be resumed or paused.") from exc
+    except RateLimited as exc:
+        rate_limit_error(exc)
+    if result is None:
+        raise HTTPException(404, "Schedule not found.")
+    return result
+
+
+@app.delete("/api/workspaces/{workspace_id}/schedules/{schedule_id}")
+def cancel_schedule(workspace_id: str, schedule_id: str, request: Request,
+                    user: Principal = Depends(principal),
+                    pool: ConnectionPool = Depends(pool_for)) -> dict[str, Any]:
+    if user.tenant_id != workspace_id:
+        raise HTTPException(404, "Workspace not found.")
+    authorize(user, "admin", "operator")
+    try:
+        with pool.connection() as conn:
+            result = set_workflow_schedule_status(
+                conn, workspace_id, schedule_id, "cancelled", request_id(request), user.user_id,
+            )
+    except RateLimited as exc:
+        rate_limit_error(exc)
+    if result is None:
+        raise HTTPException(404, "Schedule not found.")
+    return result
 
 
 @app.post("/api/workflow-definitions", status_code=201)

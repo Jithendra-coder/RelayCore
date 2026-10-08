@@ -18,7 +18,7 @@ The same queue-ready `SELECT ... ORDER BY available_at, created_at LIMIT 1` ran 
 
 ## Correctness and failure checks
 
-The acceptance suite completed with **72 passed** on an isolated PostgreSQL 17.9 / UTF-8 database on 2026-10-08; app source coverage was **80%**. The current phase also ran Ruff, pre-commit, Python compilation, and dashboard JavaScript syntax checks. GitHub Actions runs the same suite on PostgreSQL 18. It covers:
+The acceptance suite completed with **77 passed** on an isolated PostgreSQL 17.9 / UTF-8 database on 2026-10-08; app source coverage was **80%**. The current phase also ran Ruff, pre-commit, Python compilation, and `git diff --check`. GitHub Actions runs the suite on PostgreSQL 18. It covers:
 
 - API key authentication, role denial, request IDs, and cross-tenant `404` isolation.
 - Idempotent workflow creation, payload conflict, persisted history, step transitions, and fail-once retry.
@@ -36,6 +36,7 @@ The acceptance suite completed with **72 passed** on an isolated PostgreSQL 17.9
 - Slack message action tests verify active workspace credential lookup, production workflow execution, bounded JSON requests, redirect rejection, and rate-limit retry delays. Live Slack delivery remains unverified; the at-least-once worker model can duplicate an accepted post after an ambiguous response.
 - A production worker rejects an old queued simulated action and dead-letters it without writing an effect.
 - A worker health check reports healthy only while a same-host database heartbeat is recent; runtime configuration rejects invalid worker, retry, queue, rate, and lease limits.
+- Durable schedules are workspace-scoped and idempotent; the API coordinator dispatches a due row, two concurrent passes dispatch it only once, queue saturation leaves it due while another tenant proceeds, each run pins the then-current immutable version, and event-dependent versions pause safely.
 
 The suite emits one dependency deprecation warning from Starlette's current `TestClient` adapter for HTTPX. It does not affect the results. CI validates both Compose configurations and builds the image; the full Compose stack was not launched locally because Docker is unavailable in this environment.
 

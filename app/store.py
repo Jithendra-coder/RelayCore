@@ -13,8 +13,9 @@ from psycopg import Connection
 from psycopg.types.json import Jsonb
 
 from app.secretbox import decrypt_secret, encrypt_secret
-from app.http_action import PermanentActionError, RetryableActionError
-from app.settings import DEMO_MODE, MAX_ATTEMPTS, MAX_QUEUE_DEPTH, RATE_LIMIT_PER_MINUTE
+from app.http_action import PermanentActionError, RetryableActionError, has_event_references
+from app.settings import (DEMO_MODE, MAX_ATTEMPTS, MAX_QUEUE_DEPTH, MAX_SCHEDULES_PER_TENANT,
+                          RATE_LIMIT_PER_MINUTE)
 
 
 class QueueFull(Exception):
@@ -30,6 +31,14 @@ class IdempotencyConflict(Exception):
 
 
 class WorkflowDisabled(Exception):
+    pass
+
+
+class WorkflowScheduleCancelled(Exception):
+    pass
+
+
+class ScheduleLimitReached(Exception):
     pass
 
 
@@ -1163,6 +1172,215 @@ def trigger_workflow_definition(
     result["workflow_version_id"] = version["id"]
     result["version"] = version["version_number"]
     return result
+
+
+def _schedule_fingerprint(workflow_id: str, name: str, interval_seconds: int) -> str:
+    payload = {"workflow_id": workflow_id, "name": name, "interval_seconds": interval_seconds}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def workflow_schedule_idempotent_result(
+    conn: Connection, tenant_id: str, workflow_id: str, name: str,
+    interval_seconds: int, idempotency_key: str,
+) -> dict[str, Any] | None:
+    fingerprint = _schedule_fingerprint(workflow_id, name, interval_seconds)
+    existing = conn.execute(
+        "SELECT id,fingerprint FROM workflow_schedules WHERE tenant_id=%s AND idempotency_key=%s",
+        (tenant_id, idempotency_key),
+    ).fetchone()
+    if not existing:
+        return None
+    if existing["fingerprint"] != fingerprint:
+        raise IdempotencyConflict
+    return {**get_workflow_schedule(conn, tenant_id, existing["id"]), "created": False}
+
+
+def list_workflow_schedules(conn: Connection, tenant_id: str) -> list[dict[str, Any]]:
+    return conn.execute(
+        """SELECT s.id,s.workflow_id,s.name,s.interval_seconds,s.status,s.next_run_at,
+                  s.last_run_at,s.last_run_id,r.status AS last_run_status,s.pause_reason,
+                  s.created_at,s.updated_at
+           FROM workflow_schedules s LEFT JOIN workflow_runs r
+             ON r.tenant_id=s.tenant_id AND r.id=s.last_run_id
+           WHERE s.tenant_id=%s ORDER BY s.created_at DESC LIMIT 100""",
+        (tenant_id,),
+    ).fetchall()
+
+
+def get_workflow_schedule(conn: Connection, tenant_id: str, schedule_id: str) -> dict[str, Any] | None:
+    return conn.execute(
+        """SELECT s.id,s.workflow_id,s.name,s.interval_seconds,s.status,s.next_run_at,
+                  s.last_run_at,s.last_run_id,r.status AS last_run_status,s.pause_reason,
+                  s.created_at,s.updated_at
+           FROM workflow_schedules s LEFT JOIN workflow_runs r
+             ON r.tenant_id=s.tenant_id AND r.id=s.last_run_id
+           WHERE s.tenant_id=%s AND s.id=%s""",
+        (tenant_id, schedule_id),
+    ).fetchone()
+
+
+def create_workflow_schedule(
+    conn: Connection, tenant_id: str, workflow_id: str, name: str, interval_seconds: int,
+    idempotency_key: str, request_id: str, created_by: str | None = None,
+) -> dict[str, Any] | None:
+    _lock_tenant(conn, tenant_id)
+    existing = workflow_schedule_idempotent_result(
+        conn, tenant_id, workflow_id, name, interval_seconds, idempotency_key,
+    )
+    if existing:
+        return existing
+    active_count = conn.execute(
+        "SELECT count(*) AS count FROM workflow_schedules WHERE tenant_id=%s AND status IN ('active','paused')",
+        (tenant_id,),
+    ).fetchone()["count"]
+    if active_count >= MAX_SCHEDULES_PER_TENANT:
+        raise ScheduleLimitReached
+    admit_rate_limit(conn, tenant_id)
+    workflow = conn.execute(
+        """SELECT d.status,v.definition FROM workflow_definitions d JOIN workflow_versions v
+             ON v.tenant_id=d.tenant_id AND v.workflow_id=d.id AND v.version_number=d.current_version
+           WHERE d.tenant_id=%s AND d.id=%s""",
+        (tenant_id, workflow_id),
+    ).fetchone()
+    if not workflow:
+        return None
+    if workflow["status"] != "active":
+        raise WorkflowDisabled
+    if any(has_event_references(step["payload"].get("body")) for step in workflow["definition"]["steps"]):
+        raise ValueError("Workflows that require webhook event data cannot be scheduled.")
+
+    schedule_id = str(uuid.uuid4())
+    conn.execute(
+        """INSERT INTO workflow_schedules
+           (id,tenant_id,workflow_id,name,interval_seconds,next_run_at,idempotency_key,
+            fingerprint,created_by)
+           VALUES (%s,%s,%s,%s,%s,clock_timestamp()+(%s * interval '1 second'),%s,%s,%s)""",
+        (schedule_id, tenant_id, workflow_id, name, interval_seconds, interval_seconds,
+         idempotency_key, _schedule_fingerprint(workflow_id, name, interval_seconds), created_by),
+    )
+    emit_event(conn, tenant_id, "schedule.created", request_id=request_id,
+               data={"schedule_id": schedule_id, "workflow_id": workflow_id,
+                     "interval_seconds": interval_seconds, "actor_user_id": created_by})
+    return {**get_workflow_schedule(conn, tenant_id, schedule_id), "created": True}
+
+
+def set_workflow_schedule_status(
+    conn: Connection, tenant_id: str, schedule_id: str, status: str, request_id: str,
+    actor_user_id: str | None = None,
+) -> dict[str, Any] | None:
+    schedule = conn.execute(
+        "SELECT status,interval_seconds FROM workflow_schedules WHERE tenant_id=%s AND id=%s FOR UPDATE",
+        (tenant_id, schedule_id),
+    ).fetchone()
+    if not schedule:
+        return None
+    if schedule["status"] == "cancelled" and status != "cancelled":
+        raise WorkflowScheduleCancelled
+    if schedule["status"] == status:
+        return get_workflow_schedule(conn, tenant_id, schedule_id)
+
+    admit_rate_limit(conn, tenant_id)
+
+    if status == "active":
+        conn.execute(
+            """UPDATE workflow_schedules SET status='active',pause_reason=NULL,
+                 next_run_at=clock_timestamp()+(interval_seconds * interval '1 second'),
+                 updated_at=clock_timestamp() WHERE tenant_id=%s AND id=%s""",
+            (tenant_id, schedule_id),
+        )
+        kind = "schedule.resumed"
+    elif status == "paused":
+        conn.execute(
+            """UPDATE workflow_schedules SET status='paused',pause_reason='user_paused',
+                 updated_at=clock_timestamp() WHERE tenant_id=%s AND id=%s""",
+            (tenant_id, schedule_id),
+        )
+        kind = "schedule.paused"
+    else:
+        conn.execute(
+            """UPDATE workflow_schedules SET status='cancelled',pause_reason=NULL,
+                 updated_at=clock_timestamp() WHERE tenant_id=%s AND id=%s""",
+            (tenant_id, schedule_id),
+        )
+        kind = "schedule.cancelled"
+    emit_event(conn, tenant_id, kind, request_id=request_id,
+               data={"schedule_id": schedule_id, "actor_user_id": actor_user_id})
+    return get_workflow_schedule(conn, tenant_id, schedule_id)
+
+
+def dispatch_due_schedules(conn: Connection, batch_size: int = 20) -> int:
+    dispatched = 0
+    blocked_tenants: set[str] = set()
+    for _ in range(batch_size):
+        with conn.transaction():
+            schedule = conn.execute(
+                """SELECT id,tenant_id,workflow_id,interval_seconds,next_run_at,
+                          to_char(next_run_at AT TIME ZONE 'UTC','YYYYMMDDHH24MISSUS') AS occurrence
+                   FROM workflow_schedules WHERE status='active' AND next_run_at<=clock_timestamp()
+                     AND tenant_id <> ALL(%s::text[])
+                   ORDER BY next_run_at,id FOR UPDATE SKIP LOCKED LIMIT 1""",
+                (sorted(blocked_tenants),),
+            ).fetchone()
+            if not schedule:
+                return dispatched
+            try:
+                with conn.transaction():
+                    _lock_tenant(conn, schedule["tenant_id"])
+                    version = conn.execute(
+                        """SELECT d.status,v.definition FROM workflow_definitions d JOIN workflow_versions v
+                             ON v.tenant_id=d.tenant_id AND v.workflow_id=d.id AND v.version_number=d.current_version
+                           WHERE d.tenant_id=%s AND d.id=%s""",
+                        (schedule["tenant_id"], schedule["workflow_id"]),
+                    ).fetchone()
+                    reason = None
+                    if not version:
+                        reason = "workflow_missing"
+                    elif version["status"] != "active":
+                        reason = "workflow_disabled"
+                    elif any(has_event_references(step["payload"].get("body"))
+                             for step in version["definition"]["steps"]):
+                        reason = "workflow_requires_webhook_event"
+                    if reason:
+                        conn.execute(
+                            """UPDATE workflow_schedules SET status='paused',pause_reason=%s,
+                                 updated_at=clock_timestamp() WHERE tenant_id=%s AND id=%s""",
+                            (reason, schedule["tenant_id"], schedule["id"]),
+                        )
+                        emit_event(conn, schedule["tenant_id"], "schedule.paused",
+                                   request_id=f"schedule:{schedule['id']}:{schedule['occurrence']}",
+                                   data={"schedule_id": schedule["id"], "reason": reason})
+                    else:
+                        idempotency_key = f"schedule:{schedule['id']}:{schedule['occurrence']}"
+                        run = trigger_workflow_definition(
+                            conn, schedule["tenant_id"], schedule["workflow_id"], idempotency_key,
+                            idempotency_key,
+                        )
+                        if run is None:
+                            conn.execute(
+                                """UPDATE workflow_schedules SET status='paused',pause_reason='workflow_missing',
+                                     updated_at=clock_timestamp() WHERE tenant_id=%s AND id=%s""",
+                                (schedule["tenant_id"], schedule["id"]),
+                            )
+                            emit_event(conn, schedule["tenant_id"], "schedule.paused",
+                                       request_id=idempotency_key,
+                                       data={"schedule_id": schedule["id"], "reason": "workflow_missing"})
+                        else:
+                            conn.execute(
+                                """UPDATE workflow_schedules SET next_run_at=clock_timestamp()+
+                                     (interval_seconds * interval '1 second'),last_run_at=clock_timestamp(),
+                                     last_run_id=%s,updated_at=clock_timestamp()
+                                   WHERE tenant_id=%s AND id=%s""",
+                                (run["id"], schedule["tenant_id"], schedule["id"]),
+                            )
+                            emit_event(conn, schedule["tenant_id"], "schedule.dispatched",
+                                       run_id=run["id"], request_id=idempotency_key,
+                                       data={"schedule_id": schedule["id"],
+                                             "workflow_version_id": run.get("workflow_version_id"),
+                                             "version": run.get("version")})
+                            dispatched += 1
+            except (QueueFull, RateLimited):
+                blocked_tenants.add(schedule["tenant_id"])
+    return dispatched
 
 
 def create_workflow(
