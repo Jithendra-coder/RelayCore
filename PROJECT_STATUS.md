@@ -28,6 +28,7 @@ Identity, workspace authorization, signed durable webhook intake, encrypted work
 | Slack OAuth, Events API, and message action | Complete locally; live provider unverified | Workspace-admin OAuth state requests app-mention and message-post scopes; encrypted bot credential, active team uniqueness, raw-body HMAC plus five-minute timestamp check, URL verification, app-mention normalization, event dedupe, uninstall revocation, dashboard controls, durable workflow triggers, and bounded message posts are covered by tests. Live credentials remain absent. |
 | Durable interval schedules | Complete locally; operations/UI limited | PostgreSQL stores schedule state; concurrent coordinator polls use `SKIP LOCKED`; queue pressure preserves a due occurrence; pause/resume/cancel are tenant-scoped; runs pin the current immutable version. Integration tests cover idempotency, lifecycle, concurrent dispatch, queue-full retention, version changes, event-dependent pauses, and schema upgrades. Cron/timezones and dashboard controls are absent. |
 | Webhook payload retention | Complete locally; metadata expiry remains open | Coordinator clears raw bodies and parsed JSON after the configured retention period, protects nonterminal runs, retains dedupe/history metadata, and rejects DLQ replay after a referenced body expires. PostgreSQL integration coverage verifies expiry, duplicate delivery, and replay behavior. |
+| Python dependency advisory scan | Implemented; GitHub check pending | Separate GitHub Actions workflow audits the resolved runtime and dev requirements on pushes, pull requests, manual runs, and weekly. The local `pip-audit` requirements scan found no known vulnerabilities on 2026-10-08. |
 | Production secrets, deployment, SDK/CLI | Incomplete | See `LIMITATIONS.md`. |
 
 ## Latest validation
@@ -38,7 +39,7 @@ Identity, workspace authorization, signed durable webhook intake, encrypted work
 - `python -m compileall -q app tests benchmarks scripts` passes. Runtime limits fail fast when worker count, attempt range, queue/schedule/rate limits, payload retention, or lease duration are invalid.
 - Local live Demo Mode evidence: 10 duplicate deliveries -> 1 workflow -> 3 effects; a killed worker was replaced after lease expiry; DLQ replay completed. Queue depth ended at 0. The recorded P95 includes recovery delay.
 - Synthetic 100-workflow P95: 3,096.99 ms (1 worker), 2,364.86 ms (2), 2,289.27 ms (4); 0/100 failures each. A local 20,000-row query measured 15.411 ms before and 0.126 ms after a partial index in one run. See `BENCHMARKS.md` and `docs/evidence.md`.
-- Docker, a live OIDC provider, external integrations, and cloud deployment were not run locally. The retention slice has not yet run through GitHub Actions; its CI result is pending push.
+- GitHub Actions run [37770598389](https://github.com/Jithendra-coder/RelayCore/actions/runs/37770598389) passed the retention commit on PostgreSQL 18, including Ruff, pre-commit, the full test suite, both Compose configurations, and the image build. Docker, a live OIDC provider, external integrations, a dependency-audit Actions run, and cloud deployment were not run locally.
 
 ## Known limits and technical debt
 
@@ -49,7 +50,7 @@ Identity, workspace authorization, signed durable webhook intake, encrypted work
 - Raw webhook bodies and parsed JSON expire on a configurable schedule; event metadata and dedupe keys remain indefinitely, and endpoint-specific schemas are absent. The encryption master key has no automated rotation; public deployment also needs edge IP/network limits.
 - PostgreSQL is the source of truth and queue. The per-tenant event-order lock can bottleneck high-volume writes. Independent broker scaling/replay has not been measured or justified.
 - The default local stack can supervise worker children under the API. For separate roles, set `RELAYCORE_WORKERS=0` on the API and run standalone worker processes with unique IDs before scaling API replicas.
-- OpenTelemetry traces, pool metrics, Grafana dashboards, alert rules, mypy/Pyright, a coverage threshold, dependency scanning, staging, infrastructure-as-code, rollback, and production deployment remain missing.
+- OpenTelemetry traces, pool metrics, Grafana dashboards, alert rules, mypy/Pyright, a coverage threshold, container/OS image scanning, staging, infrastructure-as-code, rollback, and production deployment remain missing.
 - The public repository still needs the remaining integration/deployment milestones before this project can be called complete.
 
 ## Latest change

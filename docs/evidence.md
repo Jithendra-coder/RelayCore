@@ -39,7 +39,9 @@ The acceptance suite completed with **78 passed** on an isolated PostgreSQL 17.9
 - A worker health check reports healthy only while a same-host database heartbeat is recent; runtime configuration rejects invalid worker, retry, queue, rate, and lease limits.
 - Durable schedules are workspace-scoped and idempotent; the API coordinator dispatches a due row, two concurrent passes dispatch it only once, queue saturation leaves it due while another tenant proceeds, each run pins the then-current immutable version, and event-dependent versions pause safely.
 
-The suite emits one dependency deprecation warning from Starlette's current `TestClient` adapter for HTTPX. It does not affect the results. The prior schedule change passed CI Compose validation and image build; the current webhook-retention change is awaiting its CI run. The full Compose stack was not launched locally because Docker is unavailable in this environment.
+The suite emits one dependency deprecation warning from Starlette's current `TestClient` adapter for HTTPX. It does not affect the results. GitHub Actions run [37770598389](https://github.com/Jithendra-coder/RelayCore/actions/runs/37770598389) passed Compose validation and image build for the webhook-retention commit. The full Compose stack was not launched locally because Docker is unavailable in this environment.
+
+The resolved runtime and development requirements were scanned with `pip-audit` on 2026-10-08; it reported no known vulnerabilities. A separate GitHub Actions workflow runs this audit on pushes, pull requests, manual dispatch, and weekly. This check does not scan the container's OS packages or detect malicious packages.
 
 ## Live Demo Mode evidence
 
