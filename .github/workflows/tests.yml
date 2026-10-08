@@ -35,9 +35,13 @@ jobs:
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m ruff check app tests benchmarks scripts
       - run: python -m pre_commit run --all-files
-      - run: python -m pytest --cov=app --cov-report=term-missing -q
+      - run: python -m pytest --cov=app --cov-report=term-missing --cov-fail-under=80 -q
       - run: docker compose config --quiet
       - run: docker compose -f compose.yaml -f compose.workers.yaml config --quiet
+      - name: Validate Prometheus rules and config
+        run: |
+          docker run --rm -v "$PWD/monitoring:/etc/prometheus:ro" prom/prometheus:v3.14.0 promtool check rules /etc/prometheus/relaycore.rules.yml
+          docker run --rm -v "$PWD/monitoring:/etc/prometheus:ro" prom/prometheus:v3.14.0 promtool check config --syntax-only /etc/prometheus/prometheus.yml
       - run: docker build --tag relaycore:ci .
 
   backup-restore:
