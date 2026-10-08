@@ -40,13 +40,13 @@ jobs:
       - run: python -m pytest --cov=app --cov-report=term-missing --cov-fail-under=80 -q
       - run: docker compose config --quiet
       - run: docker compose -f compose.yaml -f compose.workers.yaml config --quiet
+      - name: Smoke test separate API and worker containers
+        run: python -m scripts.compose_smoke
       - name: Validate Prometheus rules and config
         run: |
           docker run --rm --entrypoint promtool -v "$PWD/monitoring:/etc/prometheus:ro" prom/prometheus:v3.14.0 check rules /etc/prometheus/relaycore.rules.yml
           docker run --rm --entrypoint promtool -v "$PWD/monitoring:/etc/prometheus:ro" prom/prometheus:v3.14.0 check config --syntax-only /etc/prometheus/prometheus.yml
           docker run --rm --entrypoint promtool -v "$PWD/monitoring:/etc/prometheus:ro" prom/prometheus:v3.14.0 test rules /etc/prometheus/relaycore.rules.test.yml
-      - run: docker build --tag relaycore:ci .
-
   backup-restore:
     runs-on: ubuntu-24.04
     services:
