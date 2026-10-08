@@ -165,6 +165,20 @@ class CredentialRotateRequest(BaseModel):
     secret: SecretStr
 
 
+class MetricsTokenCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=100)
+
+    @field_validator("name")
+    @classmethod
+    def metrics_token_name_is_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Metrics token name must contain a visible character.")
+        return value
+
+
 def valid_idempotency_key(value: str) -> str:
     if not re.fullmatch(r"[\w.:-]{1,120}", value):
         raise ValueError("Idempotency-Key may contain letters, digits, dot, underscore, colon, and hyphen (max 120).")

@@ -75,6 +75,12 @@ def principal(
     identity: Identity = Depends(authenticated_identity),
     selected_workspace_id: str | None = Header(default=None, alias="X-Workspace-ID"),
 ) -> Principal:
+    return principal_for_identity(request, identity, selected_workspace_id)
+
+
+def principal_for_identity(
+    request: Request, identity: Identity, selected_workspace_id: str | None = None,
+) -> Principal:
     if identity.demo_tenant is not None:
         return Principal(identity.demo_tenant, identity.demo_role or "viewer",
                          identity.credential_fingerprint)

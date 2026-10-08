@@ -1,0 +1,27 @@
+groups:
+  - name: relaycore.operations
+    rules:
+      - alert: RelayCoreQueueAgeHigh
+        expr: relaycore_queue_oldest_ready_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: RelayCore has runnable work waiting for too long
+          description: The oldest ready task has been waiting longer than five minutes for at least five minutes.
+      - alert: RelayCoreExpiredLeases
+        expr: relaycore_expired_leases > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: RelayCore has tasks with expired worker leases
+          description: Check worker health and database connectivity for this workspace.
+      - alert: RelayCoreDeadLettersPresent
+        expr: relaycore_dead_letters > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: RelayCore has unreplayed dead letters
+          description: Review failed workflows and replay only after correcting the cause.

@@ -148,6 +148,48 @@ def revoke_auth_session(conn: Connection, token_hash: str, request_id: str) -> b
     return False
 
 
+def create_workspace_metrics_token(
+    conn: Connection, workspace_id: str, actor_id: str, name: str, token_hash: str, request_id: str,
+) -> dict[str, Any]:
+    token = conn.execute(
+        """INSERT INTO workspace_metrics_tokens(id,workspace_id,name,token_hash,created_by)
+           VALUES (%s,%s,%s,%s,%s) RETURNING id,name,created_at""",
+        (str(uuid.uuid4()), workspace_id, name, token_hash, actor_id),
+    ).fetchone()
+    emit_event(conn, workspace_id, "workspace.metrics_token_created", request_id=request_id,
+               data={"token_id": token["id"], "name": name, "actor_user_id": actor_id})
+    return token
+
+
+def workspace_metrics_token(conn: Connection, token_hash: str) -> dict[str, Any] | None:
+    return conn.execute(
+        """SELECT id,workspace_id FROM workspace_metrics_tokens
+           WHERE token_hash=%s AND revoked_at IS NULL""", (token_hash,),
+    ).fetchone()
+
+
+def list_workspace_metrics_tokens(conn: Connection, workspace_id: str) -> list[dict[str, Any]]:
+    return conn.execute(
+        """SELECT id,name,created_at,revoked_at FROM workspace_metrics_tokens
+           WHERE workspace_id=%s ORDER BY created_at DESC""", (workspace_id,),
+    ).fetchall()
+
+
+def revoke_workspace_metrics_token(
+    conn: Connection, workspace_id: str, token_id: str, actor_id: str, request_id: str,
+) -> bool:
+    changed = conn.execute(
+        """UPDATE workspace_metrics_tokens SET revoked_at=clock_timestamp()
+           WHERE id=%s AND workspace_id=%s AND revoked_at IS NULL RETURNING id,name""",
+        (token_id, workspace_id),
+    ).fetchone()
+    if not changed:
+        return False
+    emit_event(conn, workspace_id, "workspace.metrics_token_revoked", request_id=request_id,
+               data={"token_id": changed["id"], "name": changed["name"], "actor_user_id": actor_id})
+    return True
+
+
 def list_user_workspaces(conn: Connection, user_id: str) -> list[dict[str, Any]]:
     return conn.execute(
         """SELECT w.id,w.name,m.role FROM workspace_members m

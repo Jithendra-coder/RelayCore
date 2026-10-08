@@ -33,6 +33,7 @@ from app.store import (
     emit_event,
     ingest_business_event,
     migrate,
+    set_workspace_member,
     upsert_oidc_user,
 )
 from tests.conftest import (ADMIN, OTHER, OTHER_TENANT, TEST_TENANT, VIEWER, drive_run, get_run, make_workflow,
@@ -75,6 +76,67 @@ def test_auth_roles_tenant_boundary_and_request_correlation(client):
     assert metrics.status_code == 200
     assert "relaycore_queue_oldest_ready_seconds" in metrics.text
     assert "relaycore_expired_leases" in metrics.text
+
+
+def test_workspace_metrics_tokens_are_hash_only_read_only_and_revocable(client):
+    owner_email = "metrics-token-owner@example.test"
+    viewer_email = "metrics-token-viewer@example.test"
+    with client.app.state.pool.connection() as conn, conn.transaction():
+        owner = upsert_oidc_user(conn, "https://identity.example", str(uuid.uuid4()), owner_email, owner_email)
+        owner_session = create_auth_session(conn, owner["id"], "metrics-token-owner", 3600)
+        viewer = upsert_oidc_user(conn, "https://identity.example", str(uuid.uuid4()), viewer_email, viewer_email)
+        viewer_session = create_auth_session(conn, viewer["id"], "metrics-token-viewer", 3600)
+    owner_headers = {"Cookie": f"{SESSION_COOKIE}={owner_session}"}
+    workspace = client.post("/api/workspaces", headers=owner_headers, json={"name": "Metrics Team"})
+    assert workspace.status_code == 201, workspace.text
+    workspace_id = workspace.json()["id"]
+    path = f"/api/workspaces/{workspace_id}/metrics-tokens"
+    scoped_owner = {**owner_headers, "X-Workspace-ID": workspace_id}
+    with client.app.state.pool.connection() as conn, conn.transaction():
+        set_workspace_member(conn, workspace_id, owner["id"], viewer["id"], "VIEWER", "metrics-token-member")
+    scoped_viewer = {"Cookie": f"{SESSION_COOKIE}={viewer_session}", "X-Workspace-ID": workspace_id}
+    denied = client.post(path, headers=scoped_viewer, json={"name": "viewer"})
+    assert denied.status_code == 403
+
+    created = client.post(path, headers=scoped_owner, json={"name": "Prometheus production"})
+    assert created.status_code == 201, created.text
+    token = created.json()["token"]
+    assert token.startswith("rcm_")
+    assert "token" not in client.get(path, headers=scoped_owner).text
+    with client.app.state.pool.connection() as conn:
+        stored_hash = conn.execute(
+            "SELECT token_hash FROM workspace_metrics_tokens WHERE id=%s", (created.json()["id"],)
+        ).fetchone()["token_hash"]
+    assert stored_hash == hashlib.sha256(token.encode()).hexdigest()
+
+    bearer = {"Authorization": f"Bearer {token}"}
+    scraped = client.get("/metrics", headers=bearer)
+    assert scraped.status_code == 200 and "relaycore_queue_depth" in scraped.text
+    assert client.get("/api/status", headers=bearer).status_code == 401
+    assert client.get("/metrics", headers={**bearer, "X-Workspace-ID": str(uuid.uuid4())}).status_code == 404
+
+    revoked = client.delete(f"{path}/{created.json()['id']}", headers=scoped_owner)
+    assert revoked.status_code == 204
+    assert client.get("/metrics", headers=bearer).status_code == 401
+
+
+def test_prometheus_configuration_and_rules_are_valid_yaml():
+    from pathlib import Path
+
+    import yaml
+
+    root = Path(__file__).parents[1]
+    config = yaml.safe_load((root / "monitoring" / "prometheus.yml").read_text(encoding="utf-8"))
+    rules = yaml.safe_load((root / "monitoring" / "relaycore.rules.yml").read_text(encoding="utf-8"))
+    assert config["rule_files"] == ["/etc/prometheus/relaycore.rules.yml"]
+    assert config["scrape_configs"][0]["authorization"]["credentials_file"].endswith(
+        "relaycore-metrics-token"
+    )
+    alerts = rules["groups"][0]["rules"]
+    assert {alert["alert"] for alert in alerts} == {
+        "RelayCoreQueueAgeHigh", "RelayCoreExpiredLeases", "RelayCoreDeadLettersPresent",
+    }
+    assert all("expr" in alert and "for" in alert for alert in alerts)
 
 
 def test_queue_operational_metrics_report_ready_age_and_tenant_scoped_expired_leases():
@@ -1431,7 +1493,7 @@ def test_versioned_migrations_bootstrap_and_skip_applied_files():
                 {"version": "001"}, {"version": "002"}, {"version": "003"},
                 {"version": "004"}, {"version": "005"}, {"version": "006"}, {"version": "007"},
                 {"version": "008"}, {"version": "009"}, {"version": "010"}, {"version": "011"},
-                {"version": "012"}, {"version": "013"}, {"version": "014"}
+                {"version": "012"}, {"version": "013"}, {"version": "014"}, {"version": "015"}
             ]
             assert conn.execute("SELECT count(*) AS n FROM tasks").fetchone()["n"] == 0
             assert conn.execute(
@@ -1508,7 +1570,7 @@ def test_workflow_version_migration_upgrades_an_existing_001_database():
                 {"version": "001"}, {"version": "002"}, {"version": "003"},
                 {"version": "004"}, {"version": "005"}, {"version": "006"}, {"version": "007"},
                 {"version": "008"}, {"version": "009"}, {"version": "010"}, {"version": "011"},
-                {"version": "012"}, {"version": "013"}, {"version": "014"}
+                {"version": "012"}, {"version": "013"}, {"version": "014"}, {"version": "015"}
             ]
             columns = conn.execute(
                 """SELECT column_name FROM information_schema.columns

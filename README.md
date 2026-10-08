@@ -22,7 +22,7 @@ In the dashboard:
 4. Click **Create DLQ case**. After three bounded failures, click **Replay** on its DLQ row. The replay action releases this deterministic demo hold, making the terminal transition observable.
 5. Open `/docs` for the API, `/metrics` for Prometheus text, or use the dashboard event timeline.
 
-`/metrics` is tenant-authenticated and includes `relaycore_queue_oldest_ready_seconds` and `relaycore_expired_leases` for queue-lag and lease alerts, alongside queue depth and dead-letter gauges. Configure a scrape credential for each tenant you monitor; the endpoint does not add tenant IDs as metric labels.
+`/metrics` is workspace-authenticated and includes `relaycore_queue_oldest_ready_seconds` and `relaycore_expired_leases` for queue-lag and lease alerts, alongside queue depth and dead-letter gauges. Owners and admins can issue read-only workspace metrics tokens for Prometheus. See [docs/operations.md](docs/operations.md) for token handling and the Prometheus scrape and alert examples.
 
 Optional distributed traces use OTLP/HTTP. Set `OTEL_EXPORTER_OTLP_ENDPOINT` to a reachable collector base URL (for example, `http://otel-collector:4318`) to export API request and worker step spans. Tracing is disabled when no OTLP endpoint is set. RelayCore propagates W3C `traceparent` through durable tasks, stores no baggage, and excludes workflow payloads and exception messages from spans.
 

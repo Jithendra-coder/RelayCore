@@ -27,7 +27,16 @@ from opentelemetry import trace
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.sessions import SessionMiddleware
 
-from app.auth import Identity, Principal, SESSION_COOKIE, authenticated_identity, authorize, principal, verified_oidc_profile
+from app.auth import (
+    Identity,
+    Principal,
+    SESSION_COOKIE,
+    authenticated_identity,
+    authorize,
+    principal,
+    principal_for_identity,
+    verified_oidc_profile,
+)
 from app.github import (
     GitHubError,
     app_installation,
@@ -50,6 +59,7 @@ from app.models import (
     DuplicateEventRequest,
     CredentialCreateRequest,
     CredentialRotateRequest,
+    MetricsTokenCreateRequest,
     ScheduleCreateRequest,
     ScheduleStatusRequest,
     WorkspaceCreateRequest,
@@ -92,6 +102,7 @@ from app.store import (
     create_workspace,
     create_webhook_endpoint,
     create_workspace_credential,
+    create_workspace_metrics_token,
     create_github_oauth_state,
     create_slack_oauth_state,
     active_workspace_credential,
@@ -104,12 +115,14 @@ from app.store import (
     list_incoming_events,
     list_webhook_endpoints,
     list_workspace_credentials,
+    list_workspace_metrics_tokens,
     list_workflow_definitions,
     list_workflow_schedules,
     migrate,
     remove_workspace_member,
     revoke_webhook_endpoint,
     revoke_workspace_credential,
+    revoke_workspace_metrics_token,
     revoke_auth_session,
     run_summary,
     set_workspace_member,
@@ -131,6 +144,7 @@ from app.store import (
     update_github_installation_status,
     revoke_github_installation,
     workspace_membership,
+    workspace_metrics_token,
     discard_github_oauth_state,
     discard_slack_oauth_state,
     finish_slack_installation,
@@ -151,6 +165,27 @@ _tracer = trace.get_tracer("relaycore.api")
 
 def pool_for(request: Request) -> ConnectionPool:
     return request.app.state.pool
+
+
+def metrics_principal(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    selected_workspace_id: str | None = Header(default=None, alias="X-Workspace-ID"),
+    pool: ConnectionPool = Depends(pool_for),
+) -> Principal:
+    if authorization and authorization.startswith("Bearer "):
+        bearer = authorization[7:]
+        if 32 <= len(bearer) <= 256:
+            token_hash = hashlib.sha256(bearer.encode()).hexdigest()
+            with pool.connection() as conn:
+                token = workspace_metrics_token(conn, token_hash)
+            if token:
+                tenant_id = str(token["workspace_id"])
+                if selected_workspace_id and selected_workspace_id != tenant_id:
+                    raise HTTPException(404, "Workspace not found.")
+                return Principal(tenant_id, "viewer", token_hash)
+    identity = authenticated_identity(request, authorization)
+    return principal_for_identity(request, identity, selected_workspace_id)
 
 
 def request_id(request: Request) -> str:
@@ -478,6 +513,49 @@ def credential_secret_value(secret: Any) -> str:
     if not 16 <= len(value) <= 4096 or any(ord(c) < 32 or ord(c) == 127 for c in value):
         raise HTTPException(422, "Credential secret must be between 16 and 4096 characters.")
     return value
+
+
+@app.get("/api/workspaces/{workspace_id}/metrics-tokens")
+def metrics_tokens(workspace_id: str, user: Principal = Depends(principal),
+                   pool: ConnectionPool = Depends(pool_for)) -> list[dict[str, Any]]:
+    if user.tenant_id != workspace_id:
+        raise HTTPException(404, "Workspace not found.")
+    authorize(user, "admin")
+    with pool.connection() as conn:
+        return list_workspace_metrics_tokens(conn, workspace_id)
+
+
+@app.post("/api/workspaces/{workspace_id}/metrics-tokens", status_code=201)
+def new_metrics_token(workspace_id: str, body: MetricsTokenCreateRequest, request: Request,
+                      user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)
+                      ) -> dict[str, Any]:
+    if user.tenant_id != workspace_id:
+        raise HTTPException(404, "Workspace not found.")
+    authorize(user, "admin")
+    if user.user_id is None:
+        raise HTTPException(403, "Metrics tokens require a signed-in workspace administrator.")
+    raw_token = "rcm_" + secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    with pool.connection() as conn, conn.transaction():
+        result = create_workspace_metrics_token(conn, workspace_id, user.user_id, body.name,
+                                                token_hash, request_id(request))
+    return {**result, "token": raw_token}
+
+
+@app.delete("/api/workspaces/{workspace_id}/metrics-tokens/{token_id}", status_code=204)
+def delete_metrics_token(workspace_id: str, token_id: str, request: Request,
+                         user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)
+                         ) -> Response:
+    if user.tenant_id != workspace_id:
+        raise HTTPException(404, "Workspace not found.")
+    authorize(user, "admin")
+    if user.user_id is None:
+        raise HTTPException(403, "Metrics token revocation requires a signed-in workspace administrator.")
+    with pool.connection() as conn, conn.transaction():
+        found = revoke_workspace_metrics_token(conn, workspace_id, token_id, user.user_id, request_id(request))
+    if not found:
+        raise HTTPException(404, "Metrics token not found.")
+    return Response(status_code=204)
 
 
 def validate_workflow_actions(conn, workspace_id: str, steps: list[dict[str, Any]], trigger: Any = None) -> None:
@@ -1605,7 +1683,7 @@ async def event_stream(request: Request, after: int | None = None,
 
 
 @app.get("/metrics", include_in_schema=False)
-def metrics(user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)) -> Response:
+def metrics(user: Principal = Depends(metrics_principal), pool: ConnectionPool = Depends(pool_for)) -> Response:
     with pool.connection() as conn:
         data = dashboard(conn, user.tenant_id)
     lines = [
