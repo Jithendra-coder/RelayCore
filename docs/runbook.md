@@ -36,7 +36,7 @@
 | `RELAYCORE_SCHEDULE_LIMIT` | `1000` | Per-workspace active or paused schedule cap |
 | `RELAYCORE_RATE_LIMIT_PER_MINUTE` | `600` | Per-tenant mutation bound |
 | `RELAYCORE_WEBHOOK_PAYLOAD_RETENTION_DAYS` | `30` | Days to retain raw webhook bodies and parsed payloads; accepted range 1–3650 |
-| `RELAYCORE_LEASE_SECONDS` | `4` | Lease renewed while the step is active |
+| `RELAYCORE_LEASE_SECONDS` | `4` | Task lease; must be at least 0.2 seconds. HTTP and Slack actions get one total DNS-plus-request timeout capped at half this lease. |
 | `RELAYCORE_MAX_ATTEMPTS` | `3` | Bounded attempts per step |
 | `RELAYCORE_OIDC_*` | unset | Required for production sign-in; values and HTTPS constraints are in `DEPLOYMENT.md` |
 | `RELAYCORE_SECRET_ENCRYPTION_KEY` | unset | Required in production; Fernet key injected by a secret manager for encrypted webhook keys |

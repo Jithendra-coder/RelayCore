@@ -1820,15 +1820,18 @@ def execute_step(conn: Connection, worker_id: str, task: dict[str, Any], request
                 emit_event(conn, task["tenant_id"], kind, run_id=task["run_id"],
                            task_id=task["id"], worker_id=worker_id, request_id=request_id)
             return
-        heartbeat(conn, worker_id, task["id"], LEASE_SECONDS)
         key = secret_encryption_key(required=True)
         if action == "http":
-            from app.http_action import execute_http_action
+            from app.http_action import MAX_TIMEOUT_SECONDS, execute_http_action
 
             credential = workspace_credential_secret(conn, task["tenant_id"], payload["credential_id"], key)
             if not credential or credential["provider"] != "http":
                 raise PermanentActionError("HTTP action credential is unavailable or has the wrong provider.")
-            result = execute_http_action(payload, credential["secret"], f"{task['run_id']}:{index}",
+            action_payload = {**payload, "timeout_seconds": min(
+                float(payload.get("timeout_seconds", MAX_TIMEOUT_SECONDS)), MAX_TIMEOUT_SECONDS, LEASE_SECONDS / 2,
+            )}
+            heartbeat(conn, worker_id, task["id"], LEASE_SECONDS)
+            result = execute_http_action(action_payload, credential["secret"], f"{task['run_id']}:{index}",
                                          credential["allowed_host"], task.get("trigger_payload"))
         else:
             from app.slack import post_message
@@ -1838,8 +1841,8 @@ def execute_step(conn: Connection, worker_id: str, task: dict[str, Any], request
                           if credential_id else None)
             if not credential or credential["provider"] != "slack":
                 raise PermanentActionError("Slack App credential is unavailable.")
-            result = post_message(payload, credential["secret"],
-                                  timeout_seconds=min(1.0, LEASE_SECONDS / 2))
+            heartbeat(conn, worker_id, task["id"], LEASE_SECONDS)
+            result = post_message(payload, credential["secret"], timeout_seconds=LEASE_SECONDS / 2)
         heartbeat(conn, worker_id, task["id"], LEASE_SECONDS)
     else:
         from app.sandbox import execute_sandbox_action

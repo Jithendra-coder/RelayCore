@@ -12,7 +12,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from app.http_action import PermanentActionError, RetryableActionError
+from app.http_action import (
+    PermanentActionError,
+    RetryableActionError,
+    _PinnedHTTPSConnection,
+    _resolve_public_addresses,
+)
 
 
 MAX_MESSAGE_RESPONSE_BYTES = 64 * 1024
@@ -76,18 +81,24 @@ def post_message(payload: dict[str, Any], bot_token: str, *, timeout_seconds: fl
             or any(ord(char) < 32 or ord(char) == 127 for char in bot_token)):
         raise PermanentActionError("Slack app credential is invalid.")
     body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
-    request = Request("https://slack.com/api/chat.postMessage", data=body,
-                      headers={"Accept": "application/json", "Authorization": f"Bearer {bot_token}",
-                               "Content-Type": "application/json", "User-Agent": "RelayCore/0.1"},
-                      method="POST")
+    timeout_seconds = min(timeout_seconds, MAX_MESSAGE_TIMEOUT_SECONDS)
+    deadline = time.monotonic() + timeout_seconds
+    addresses = _resolve_public_addresses("slack.com", 443, timeout_seconds)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RetryableActionError("Slack message timed out during DNS resolution.")
+    connection = _PinnedHTTPSConnection("slack.com", 443, addresses[0], remaining)
     try:
-        response = build_opener(_NoRedirect).open(request, timeout=timeout_seconds)
-    except HTTPError as exc:
-        response = exc
-    except (URLError, TimeoutError, OSError) as exc:
-        raise RetryableActionError("Slack message request failed or timed out.") from exc
-    with response:
-        status = response.getcode() if hasattr(response, "getcode") else getattr(response, "status", 0)
+        connection.request("POST", "/api/chat.postMessage", body=body, headers={
+            "Accept": "application/json", "Authorization": f"Bearer {bot_token}",
+            "Content-Type": "application/json", "User-Agent": "RelayCore/0.1",
+        })
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        connection.sock.settimeout(remaining)
+        response = connection.getresponse()
+        status = response.status
         retry_after = response.headers.get("Retry-After")
         if status == 429:
             try:
@@ -101,7 +112,24 @@ def post_message(payload: dict[str, Any], bot_token: str, *, timeout_seconds: fl
             raise PermanentActionError("Slack message redirects are not followed.")
         if not 200 <= status < 300:
             raise PermanentActionError(f"Slack returned status {status}.")
-        raw = response.read(MAX_MESSAGE_RESPONSE_BYTES + 1)
+        chunks, size = [], 0
+        while size <= MAX_MESSAGE_RESPONSE_BYTES:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            connection.sock.settimeout(remaining)
+            chunk = response.read(min(8192, MAX_MESSAGE_RESPONSE_BYTES + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        raw = b"".join(chunks)
+    except (PermanentActionError, RetryableActionError):
+        raise
+    except Exception as exc:
+        raise RetryableActionError("Slack message request failed or timed out.") from exc
+    finally:
+        connection.close()
     if len(raw) > MAX_MESSAGE_RESPONSE_BYTES:
         raise PermanentActionError("Slack message response exceeded the size limit.")
     try:

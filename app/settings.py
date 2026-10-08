@@ -32,8 +32,8 @@ if RATE_LIMIT_PER_MINUTE < 1:
     raise RuntimeError("RELAYCORE_RATE_LIMIT_PER_MINUTE must be at least 1.")
 if not 1 <= WEBHOOK_PAYLOAD_RETENTION_DAYS <= 3650:
     raise RuntimeError("RELAYCORE_WEBHOOK_PAYLOAD_RETENTION_DAYS must be between 1 and 3650.")
-if not math.isfinite(LEASE_SECONDS) or LEASE_SECONDS <= 0:
-    raise RuntimeError("RELAYCORE_LEASE_SECONDS must be a finite positive number.")
+if not math.isfinite(LEASE_SECONDS) or LEASE_SECONDS < 0.2:
+    raise RuntimeError("RELAYCORE_LEASE_SECONDS must be finite and at least 0.2 seconds.")
 if not 300 <= AUTH_SESSION_SECONDS <= 604800:
     raise RuntimeError("RELAYCORE_AUTH_SESSION_SECONDS must be between 300 and 604800.")
 

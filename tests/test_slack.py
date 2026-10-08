@@ -302,63 +302,87 @@ def test_slack_message_action_uses_connected_workspace_token(client, monkeypatch
 
 
 def test_slack_message_api_is_bounded_and_honors_rate_limit(monkeypatch):
-    import io
     import app.slack as slack
-    from app.http_action import RetryableActionError
+    from app.http_action import PermanentActionError, RetryableActionError
 
-    class Response(io.BytesIO):
+    class Response:
         def __init__(self, body: bytes, status: int, headers=None):
-            super().__init__(body)
+            self.body = body
             self.status = status
-            self.code = status
             self.headers = headers or {}
 
-        def __enter__(self):
-            return self
+        def read(self, size):
+            chunk, self.body = self.body[:size], self.body[size:]
+            return chunk
 
-        def __exit__(self, *_args):
-            self.close()
+    class Socket:
+        def settimeout(self, _timeout):
+            pass
+
+    class Connection:
+        def __init__(self, response):
+            self.response = response
+            self.sock = Socket()
+            self.request_args = None
+            self.closed = False
+
+        def request(self, method, path, *, body, headers):
+            self.request_args = method, path, body, headers
+
+        def getresponse(self):
+            return self.response
+
+        def close(self):
+            self.closed = True
 
     payload = {"channel": "C123TEST", "text": "Build finished."}
     calls = []
+    responses = iter([
+        Response(b'{"ok":true,"channel":"C123TEST","ts":"1710000000.000100"}', 200),
+        Response(b"{}", 429, {"Retry-After": "2"}),
+        Response(b"{}", 429, {}),
+        Response(b"{}", 500, {}),
+        Response(b"{}", 302, {}),
+        Response(b"x" * (slack.MAX_MESSAGE_RESPONSE_BYTES + 1), 200),
+    ])
 
-    class Opener:
-        def __init__(self, response):
-            self.response = response
+    def resolve(host, port, timeout):
+        calls.append(("dns", host, port, timeout))
+        time.sleep(0.02)
+        return ["93.184.216.34"]
 
-        def open(self, request, timeout):
-            calls.append((request, timeout))
-            return self.response
+    def connect(host, port, address, timeout):
+        connection = Connection(next(responses))
+        calls.append(("connect", host, port, address, timeout, connection))
+        return connection
 
-    monkeypatch.setattr(slack, "build_opener", lambda handler: (
-        calls.append(("redirect_handler", handler)) or Opener(Response(
-            b'{"ok":true,"channel":"C123TEST","ts":"1710000000.000100"}', 200,
-        ))
-    ))
+    monkeypatch.setattr(slack, "_resolve_public_addresses", resolve)
+    monkeypatch.setattr(slack, "_PinnedHTTPSConnection", connect)
     assert post_message(payload, BOT_TOKEN) == {"channel": "C123TEST", "message_ts": "1710000000.000100"}
-    request, timeout = calls[-1]
-    assert request.full_url == "https://slack.com/api/chat.postMessage" and timeout == 1
-    assert request.get_header("Authorization") == f"Bearer {BOT_TOKEN}"
-    assert json.loads(request.data) == payload
-    assert calls[0] == ("redirect_handler", slack._NoRedirect)
+    assert calls[0] == ("dns", "slack.com", 443, 1)
+    assert 0 < calls[1][4] < 1
+    connection = calls[1][5]
+    method, path, body, headers = connection.request_args
+    assert (method, path) == ("POST", "/api/chat.postMessage")
+    assert headers["Authorization"] == f"Bearer {BOT_TOKEN}"
+    assert json.loads(body) == payload
+    assert connection.closed
 
-    monkeypatch.setattr(slack, "build_opener", lambda *_args: Opener(Response(b"{}", 429, {"Retry-After": "2"})))
     with pytest.raises(RetryableActionError, match="rate limited") as error:
         post_message(payload, BOT_TOKEN)
     assert error.value.retry_after == 2
 
-    monkeypatch.setattr(slack, "build_opener", lambda *_args: Opener(Response(b"{}", 429, {})))
     with pytest.raises(RetryableActionError, match="rate limited") as error:
         post_message(payload, BOT_TOKEN)
     assert error.value.retry_after is None
 
-    monkeypatch.setattr(slack, "build_opener", lambda *_args: Opener(Response(b"{}", 500, {})))
     with pytest.raises(RetryableActionError, match="status 500"):
         post_message(payload, BOT_TOKEN)
 
-    monkeypatch.setattr(slack, "build_opener", lambda *_args: Opener(Response(b"{}", 302, {})))
-    from app.http_action import PermanentActionError
     with pytest.raises(PermanentActionError, match="redirects"):
+        post_message(payload, BOT_TOKEN)
+
+    with pytest.raises(PermanentActionError, match="size limit"):
         post_message(payload, BOT_TOKEN)
 
     for invalid in ({"channel": "#general", "text": "hi"},

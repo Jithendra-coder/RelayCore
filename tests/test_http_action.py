@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import socket
 import ssl
+import threading
+import time
 
 import pytest
 
@@ -23,8 +25,11 @@ def payload(**overrides):
 
 
 class FakeSocket:
+    def __init__(self):
+        self.timeouts = []
+
     def settimeout(self, _timeout):
-        pass
+        self.timeouts.append(_timeout)
 
 
 class FakeResponse:
@@ -69,7 +74,7 @@ def fake_transport(monkeypatch, *, status=200, body=b'{"ok":true}'):
 
     monkeypatch.setenv("RELAYCORE_HTTP_ALLOWED_HOSTS", "hooks.example.com")
     monkeypatch.setattr(http_action, "_resolve_public_addresses",
-                        lambda _host, _port: ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"])
+                        lambda _host, _port, _timeout: ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"])
     monkeypatch.setattr(http_action, "_PinnedHTTPSConnection", connect)
     return connections
 
@@ -98,6 +103,40 @@ def test_http_step_rejects_auth_headers_and_private_dns(monkeypatch):
         (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443)),
     ])
     with pytest.raises(http_action.PermanentActionError, match="non-public"):
+        http_action.execute_http_action(payload(), "workspace-token-123456", "run:0", "hooks.example.com")
+
+
+def test_http_dns_timeout_is_retryable_before_opening_a_connection(monkeypatch):
+    monkeypatch.setenv("RELAYCORE_HTTP_ALLOWED_HOSTS", "hooks.example.com")
+    started, release = threading.Event(), threading.Event()
+
+    def stalled_resolver(*_args, **_kwargs):
+        started.set()
+        release.wait(2)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", stalled_resolver)
+    monkeypatch.setattr(http_action, "_PinnedHTTPSConnection",
+                        lambda *_args: pytest.fail("A timed-out DNS lookup must not open a connection."))
+    before = time.monotonic()
+    try:
+        with pytest.raises(http_action.RetryableActionError, match="DNS resolution timed out"):
+            http_action.execute_http_action(payload(timeout_seconds=0.1), "workspace-token-123456",
+                                            "run:0", "hooks.example.com")
+        assert started.is_set()
+        assert time.monotonic() - before < 0.5
+    finally:
+        release.set()
+
+
+def test_http_dns_error_is_retryable(monkeypatch):
+    monkeypatch.setenv("RELAYCORE_HTTP_ALLOWED_HOSTS", "hooks.example.com")
+
+    def failed_resolver(*_args, **_kwargs):
+        raise socket.gaierror("temporary resolver failure")
+
+    monkeypatch.setattr(socket, "getaddrinfo", failed_resolver)
+    with pytest.raises(http_action.RetryableActionError, match="DNS resolution failed"):
         http_action.execute_http_action(payload(), "workspace-token-123456", "run:0", "hooks.example.com")
 
 
@@ -132,6 +171,21 @@ def test_http_action_pins_public_dns_and_redacts_response_secrets(monkeypatch):
         "message": "provider echoed [redacted]",
     }
     assert connection.closed
+
+
+def test_http_action_uses_one_timeout_budget_for_dns_and_https(monkeypatch):
+    connections = fake_transport(monkeypatch)
+
+    def slow_resolver(_host, _port, _timeout):
+        time.sleep(0.05)
+        return ["93.184.216.34"]
+
+    monkeypatch.setattr(http_action, "_resolve_public_addresses", slow_resolver)
+    http_action.execute_http_action(payload(timeout_seconds=0.5), "workspace-token-123456",
+                                   "run:0", "hooks.example.com")
+    connection = connections[0]
+    assert 0 < connection.timeout < 0.45
+    assert connection.sock.timeouts and all(0 < timeout < 0.5 for timeout in connection.sock.timeouts)
 
 
 def test_http_action_resolves_limited_event_references_in_json_body(monkeypatch):

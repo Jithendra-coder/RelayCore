@@ -49,6 +49,7 @@ from tests.conftest import (ADMIN, OTHER, OTHER_TENANT, TEST_TENANT, VIEWER, dri
     ("RELAYCORE_RATE_LIMIT_PER_MINUTE", "0"),
     ("RELAYCORE_WEBHOOK_PAYLOAD_RETENTION_DAYS", "0"),
     ("RELAYCORE_LEASE_SECONDS", "0"),
+    ("RELAYCORE_LEASE_SECONDS", "0.1"),
     ("RELAYCORE_LEASE_SECONDS", "nan"),
 ])
 def test_invalid_runtime_limits_fail_during_settings_import(name, value):
@@ -512,7 +513,9 @@ def test_production_workflow_runs_only_allowlisted_http_steps(client, monkeypatc
     completed = get_run(client, run.json()["id"], workspace_id)
     assert completed["status"] == "completed"
     assert completed["side_effects"][0]["result"]["status_code"] == 202
-    assert calls == [(steps[0]["payload"], stored_secret, f"{run.json()['id']}:0", "hooks.example.com", None)]
+    assert calls == [({**steps[0]["payload"], "timeout_seconds": 0.6}, stored_secret,
+                       f"{run.json()['id']}:0", "hooks.example.com", None)]
+    assert "timeout_seconds" not in steps[0]["payload"]
     repeated = client.post(f"/api/workflow-definitions/{definition.json()['id']}/runs", headers=run_headers)
     assert repeated.status_code == 202 and repeated.json()["created"] is False
 

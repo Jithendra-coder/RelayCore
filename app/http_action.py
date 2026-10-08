@@ -7,6 +7,7 @@ import os
 import re
 import socket
 import ssl
+import threading
 import time
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 from uuid import UUID
@@ -18,6 +19,7 @@ _HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _FORBIDDEN_HEADERS = {"authorization", "connection", "content-length", "cookie", "host", "idempotency-key",
                       "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"}
 _EVENT_REFERENCE = "$event"
+_DNS_RESOLVER_SLOTS = threading.BoundedSemaphore(4)
 _SENSITIVE_KEYS = {"access_token", "accesstoken", "api_key", "apikey", "authorization", "client_secret",
                    "clientsecret", "password", "private_key", "refresh_token", "refreshtoken", "secret",
                    "secret_key", "token"}
@@ -188,11 +190,33 @@ def _resolve_event_references(value, event_payload):
     return value
 
 
-def _resolve_public_addresses(host: str, port: int) -> list[str]:
+def _resolve_public_addresses(host: str, port: int, timeout_seconds: float = MAX_TIMEOUT_SECONDS) -> list[str]:
+    if not _DNS_RESOLVER_SLOTS.acquire(blocking=False):
+        raise RetryableActionError("DNS resolver capacity is temporarily exhausted.")
+    result: list[list[tuple]] = []
+    errors: list[Exception] = []
+
+    def resolve() -> None:
+        try:
+            result.append(socket.getaddrinfo(host, port, type=socket.SOCK_STREAM))
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            _DNS_RESOLVER_SLOTS.release()
+
+    resolver = threading.Thread(target=resolve, name="relaycore-dns", daemon=True)
     try:
-        answers = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    except OSError as exc:
-        raise RetryableActionError("HTTP action DNS resolution failed.") from exc
+        resolver.start()
+    except Exception:
+        _DNS_RESOLVER_SLOTS.release()
+        raise
+    resolver.join(timeout_seconds)
+    if resolver.is_alive():
+        # getaddrinfo cannot be cancelled; daemon threads and a fixed semaphore bound stuck lookups.
+        raise RetryableActionError("HTTP action DNS resolution timed out.")
+    if errors:
+        raise RetryableActionError("HTTP action DNS resolution failed.") from errors[0]
+    answers = result[0]
     addresses = list(dict.fromkeys(answer[4][0] for answer in answers))
     if not addresses:
         raise RetryableActionError("HTTP action DNS resolution returned no addresses.")
@@ -225,7 +249,6 @@ def execute_http_action(payload: dict, credential: str, idempotency_key: str,
     host, port, target = validate_http_target(payload["url"])
     if host != credential_host:
         raise PermanentActionError("HTTP action host does not match the credential's bound host.")
-    addresses = _resolve_public_addresses(host, port)
     timeout = min(float(payload.get("timeout_seconds", MAX_TIMEOUT_SECONDS)), MAX_TIMEOUT_SECONDS)
     body = None
     headers = {"Accept": "application/json", "Authorization": f"Bearer {credential}",
@@ -237,11 +260,19 @@ def execute_http_action(payload: dict, credential: str, idempotency_key: str,
             raise PermanentActionError("Rendered HTTP action body exceeded the 4 KiB limit.")
         headers["Content-Type"] = "application/json"
     headers.update(payload.get("headers", {}))
-    connection = _PinnedHTTPSConnection(host, port, addresses[0], timeout)
+    deadline = time.monotonic() + timeout
+    addresses = _resolve_public_addresses(host, port, timeout)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RetryableActionError("HTTP action timed out during DNS resolution.")
+    connection = _PinnedHTTPSConnection(host, port, addresses[0], remaining)
     try:
         connection.request(payload["method"], target, body=body, headers=headers)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        connection.sock.settimeout(remaining)
         response = connection.getresponse()
-        deadline = time.monotonic() + timeout
         chunks, size = [], 0
         while size <= MAX_RESPONSE_BYTES:
             remaining = deadline - time.monotonic()
