@@ -18,7 +18,7 @@ The same queue-ready `SELECT ... ORDER BY available_at, created_at LIMIT 1` ran 
 
 ## Correctness and failure checks
 
-The latest acceptance suite completed with **113 passed** on an isolated PostgreSQL 17.9 / UTF-8 database on 2026-10-08; app source coverage was **81.84%** against an enforced 80% floor. Ruff, Python compilation, pre-commit, and `git diff --check` passed for the latest slice. Current PostgreSQL 18 CI also passed **113 tests at 82.64% app coverage**, the PostgreSQL 16 backup/restore drill, both Compose checks, a live split API/worker Compose smoke, Prometheus validation, and image builds in [run 37790046864](https://github.com/Jithendra-coder/RelayCore/actions/runs/37790046864); its dependency audit passed in [run 37790047044](https://github.com/Jithendra-coder/RelayCore/actions/runs/37790047044). It covers:
+The latest acceptance suite completed with **113 passed** on an isolated PostgreSQL 17.9 / UTF-8 database on 2026-10-08; app source coverage was **81.84%** against an enforced 80% floor. Ruff, Python compilation, pre-commit, and `git diff --check` passed for the latest slice. Current PostgreSQL 18 CI also passed **113 tests at 82.64% app coverage**, the PostgreSQL 16 backup/restore drill, both Compose checks, a live split API/worker Compose smoke, Prometheus validation, and image builds in [run 37790505388](https://github.com/Jithendra-coder/RelayCore/actions/runs/37790505388); its dependency audit passed in [run 37790505450](https://github.com/Jithendra-coder/RelayCore/actions/runs/37790505450). It covers:
 
 - API key authentication, role denial, request IDs, and cross-tenant `404` isolation.
 - Idempotent workflow creation, payload conflict, persisted history, step transitions, and fail-once retry.
@@ -61,7 +61,7 @@ The latest local PostgreSQL run covers one-time token display, SHA-256-only data
 
 ## Live Demo Mode evidence
 
-The GitHub Actions Compose smoke built and launched an isolated PostgreSQL 18/API/standalone-worker stack. It submitted the four-step Demo Mode workflow through the API, verified the worker completed it with four persisted step results, and removed the temporary Compose volume. This verifies container startup and local worker coordination, not live provider delivery or managed staging. See [run 37790046864](https://github.com/Jithendra-coder/RelayCore/actions/runs/37790046864).
+The GitHub Actions Compose smoke built and launched an isolated PostgreSQL 18/API/standalone-worker stack. It submitted the four-step Demo Mode workflow through the API, verified the worker completed it with four persisted step results, and removed the temporary Compose volume. This verifies container startup and local worker coordination, not live provider delivery or managed staging. See [run 37790505388](https://github.com/Jithendra-coder/RelayCore/actions/runs/37790505388).
 
 The clean local Demo Mode run is recorded in [`demo-run.json`](demo-run.json). It completed on 2026-10-04 against the isolated `relaycore_final` database with two independent worker processes. Ten deliveries of one business key yielded one workflow and three logical effects. A real child worker was killed while it held a lease; the lease expired, the other worker reclaimed it, and four unique step effects completed. A three-attempt failure entered the DLQ, was replayed by admin, and completed. Final queue depth and unreplayed DLQ size were both zero. The run's measured workflow P95 was 6.90 seconds; this includes the failure/retry delay and is separate from the synthetic load results above.
 
