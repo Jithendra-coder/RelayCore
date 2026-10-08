@@ -21,16 +21,19 @@ jobs:
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: "relaycore-ci:${{ github.sha }}"
+          version: v0.75.0
           scanners: vuln
           vuln-type: os,library
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "1"
           timeout: 10m0s
-      - name: Show vulnerable package paths
+      - name: Show scanner and installed package details
         if: failure() && steps.scan.outcome == 'failure'
         run: |
-          trivy image --exit-code 0 --ignore-unfixed --scanners vuln --vuln-type os,library \
+          docker run --rm --entrypoint python "relaycore-ci:${GITHUB_SHA}" -c \
+            'import importlib.metadata as m; print([(d.metadata.get("Name"), d.version, str(d._path)) for d in m.distributions() if d.metadata.get("Name", "").lower() in {"msgpack", "setuptools", "urllib3"}])'
+          trivy image --exit-code 0 --ignore-unfixed --scanners vuln --pkg-types os,library \
             --severity HIGH,CRITICAL --format json --output trivy-results.json "relaycore-ci:${GITHUB_SHA}"
           jq -r '.Results[]? as $target | $target.Vulnerabilities[]? |
             "\($target.Target)\t\(.PkgName)\t\(.InstalledVersion)\t\(.FixedVersion)\t\(.VulnerabilityID)\t\(.PkgPath // "-")"' \
