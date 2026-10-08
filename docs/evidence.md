@@ -42,6 +42,10 @@ The acceptance suite completed with **79 passed** on an isolated PostgreSQL 17.9
 
 The suite emits one dependency deprecation warning from Starlette's current `TestClient` adapter for HTTPX. It does not affect the results. GitHub Actions run [37770598389](https://github.com/Jithendra-coder/RelayCore/actions/runs/37770598389) passed Compose validation and image build for the webhook-retention commit. The full Compose stack was not launched locally because Docker is unavailable in this environment.
 
+## PostgreSQL backup and restore drill
+
+GitHub Actions run [37772675726](https://github.com/Jithendra-coder/RelayCore/actions/runs/37772675726) passed the `backup-restore` job on 2026-10-08. Against disposable PostgreSQL 16.15 source and target databases, the job ran the repository's PowerShell backup and restore scripts, validated the custom-format archive, and confirmed that all **13 migrations** and a known queued workflow record survived the restore. The archive and databases were ephemeral CI resources. This is repeatable script-level restore evidence; it does not establish managed backup retention, cloud recovery, or disaster recovery.
+
 The resolved runtime and development requirements were scanned with `pip-audit` on 2026-10-08; it reported no known vulnerabilities locally and in [GitHub Actions run 37771385684](https://github.com/Jithendra-coder/RelayCore/actions/runs/37771385684). The workflow runs on pushes, pull requests, manual dispatch, and weekly. This check does not scan the container's OS packages or detect malicious packages.
 
 ## Live Demo Mode evidence
