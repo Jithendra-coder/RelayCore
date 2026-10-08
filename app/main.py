@@ -59,6 +59,7 @@ from app.models import (
     DuplicateEventRequest,
     CredentialCreateRequest,
     CredentialRotateRequest,
+    ApiTokenCreateRequest,
     MetricsTokenCreateRequest,
     ScheduleCreateRequest,
     ScheduleStatusRequest,
@@ -103,6 +104,7 @@ from app.store import (
     create_webhook_endpoint,
     create_workspace_credential,
     create_workspace_metrics_token,
+    create_workspace_api_token,
     create_github_oauth_state,
     create_slack_oauth_state,
     active_workspace_credential,
@@ -116,6 +118,7 @@ from app.store import (
     list_webhook_endpoints,
     list_workspace_credentials,
     list_workspace_metrics_tokens,
+    list_workspace_api_tokens,
     list_workflow_definitions,
     list_workflow_schedules,
     migrate,
@@ -123,6 +126,7 @@ from app.store import (
     revoke_webhook_endpoint,
     revoke_workspace_credential,
     revoke_workspace_metrics_token,
+    revoke_workspace_api_token,
     revoke_auth_session,
     run_summary,
     set_workspace_member,
@@ -412,6 +416,8 @@ def me(identity: Identity = Depends(authenticated_identity),
         ]}
     with pool.connection() as conn:
         workspaces = list_user_workspaces(conn, identity.user_id)
+    if identity.workspace_id:
+        workspaces = [workspace for workspace in workspaces if workspace["id"] == identity.workspace_id]
     return {"id": identity.user_id, "email": identity.email, "name": identity.display_name,
             "workspaces": workspaces}
 
@@ -422,7 +428,9 @@ def workspaces(identity: Identity = Depends(authenticated_identity),
     if identity.user_id is None:
         return [{"id": identity.demo_tenant, "name": identity.demo_tenant, "role": identity.demo_role}]
     with pool.connection() as conn:
-        return list_user_workspaces(conn, identity.user_id)
+        workspaces = list_user_workspaces(conn, identity.user_id)
+    return ([workspace for workspace in workspaces if workspace["id"] == identity.workspace_id]
+            if identity.workspace_id else workspaces)
 
 
 @app.post("/api/workspaces", status_code=201)
@@ -431,6 +439,8 @@ def new_workspace(body: WorkspaceCreateRequest, request: Request,
                   pool: ConnectionPool = Depends(pool_for)) -> dict[str, Any]:
     if identity.user_id is None:
         raise HTTPException(403, "Create workspaces with a signed-in user account.")
+    if identity.workspace_id:
+        raise HTTPException(403, "Workspace-bound API tokens cannot create workspaces.")
     with pool.connection() as conn, conn.transaction():
         return create_workspace(conn, identity.user_id, body.name, request_id(request))
 
@@ -555,6 +565,55 @@ def delete_metrics_token(workspace_id: str, token_id: str, request: Request,
         found = revoke_workspace_metrics_token(conn, workspace_id, token_id, user.user_id, request_id(request))
     if not found:
         raise HTTPException(404, "Metrics token not found.")
+    return Response(status_code=204)
+
+
+@app.get("/api/workspaces/{workspace_id}/api-tokens")
+def api_tokens(workspace_id: str, user: Principal = Depends(principal),
+               pool: ConnectionPool = Depends(pool_for)) -> list[dict[str, Any]]:
+    if user.tenant_id != workspace_id:
+        raise HTTPException(404, "Workspace not found.")
+    authorize(user, "admin")
+    with pool.connection() as conn:
+        return list_workspace_api_tokens(conn, workspace_id)
+
+
+@app.post("/api/workspaces/{workspace_id}/api-tokens", status_code=201)
+def new_api_token(workspace_id: str, body: ApiTokenCreateRequest, request: Request,
+                  user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)
+                  ) -> dict[str, Any]:
+    if DEMO_MODE:
+        raise HTTPException(404, "API tokens are available for signed-in workspace accounts.")
+    if user.tenant_id != workspace_id:
+        raise HTTPException(404, "Workspace not found.")
+    authorize(user, "admin")
+    if user.user_id is None:
+        raise HTTPException(403, "API tokens require a signed-in workspace administrator.")
+    raw_token = "rca_" + secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    try:
+        with pool.connection() as conn, conn.transaction():
+            admit_rate_limit(conn, workspace_id)
+            result = create_workspace_api_token(conn, workspace_id, user.user_id, body.name, token_hash,
+                                                body.expires_in_days, request_id(request))
+    except RateLimited as exc:
+        rate_limit_error(exc)
+    return {**result, "token": raw_token}
+
+
+@app.delete("/api/workspaces/{workspace_id}/api-tokens/{token_id}", status_code=204)
+def delete_api_token(workspace_id: str, token_id: str, request: Request,
+                     user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)
+                     ) -> Response:
+    if user.tenant_id != workspace_id:
+        raise HTTPException(404, "Workspace not found.")
+    authorize(user, "admin")
+    if user.user_id is None:
+        raise HTTPException(403, "API token revocation requires a signed-in workspace administrator.")
+    with pool.connection() as conn, conn.transaction():
+        found = revoke_workspace_api_token(conn, workspace_id, token_id, user.user_id, request_id(request))
+    if not found:
+        raise HTTPException(404, "API token not found.")
     return Response(status_code=204)
 
 

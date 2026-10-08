@@ -190,6 +190,55 @@ def revoke_workspace_metrics_token(
     return True
 
 
+def create_workspace_api_token(
+    conn: Connection, workspace_id: str, actor_id: str, name: str, token_hash: str,
+    expires_in_days: int, request_id: str,
+) -> dict[str, Any]:
+    token = conn.execute(
+        """INSERT INTO workspace_api_tokens(id,workspace_id,user_id,name,token_hash,expires_at)
+           VALUES (%s,%s,%s,%s,%s,clock_timestamp()+(%s * interval '1 day'))
+           RETURNING id,name,created_at,expires_at""",
+        (str(uuid.uuid4()), workspace_id, actor_id, name, token_hash, expires_in_days),
+    ).fetchone()
+    token["id"] = str(token["id"])
+    emit_event(conn, workspace_id, "workspace.api_token_created", request_id=request_id,
+               data={"token_id": token["id"], "name": name, "actor_user_id": actor_id,
+                     "expires_in_days": expires_in_days})
+    return token
+
+
+def workspace_api_token(conn: Connection, token_hash: str) -> dict[str, Any] | None:
+    return conn.execute(
+        """SELECT t.workspace_id,t.user_id,t.token_hash,u.email,u.display_name
+           FROM workspace_api_tokens t JOIN users u ON u.id=t.user_id
+           WHERE t.token_hash=%s AND t.revoked_at IS NULL AND t.expires_at>clock_timestamp()
+             AND u.status='active'""",
+        (token_hash,),
+    ).fetchone()
+
+
+def list_workspace_api_tokens(conn: Connection, workspace_id: str) -> list[dict[str, Any]]:
+    return conn.execute(
+        """SELECT id,name,created_at,expires_at,revoked_at FROM workspace_api_tokens
+           WHERE workspace_id=%s ORDER BY created_at DESC""", (workspace_id,),
+    ).fetchall()
+
+
+def revoke_workspace_api_token(
+    conn: Connection, workspace_id: str, token_id: str, actor_id: str, request_id: str,
+) -> bool:
+    changed = conn.execute(
+        """UPDATE workspace_api_tokens SET revoked_at=clock_timestamp()
+           WHERE id=%s AND workspace_id=%s AND revoked_at IS NULL RETURNING id,name""",
+        (token_id, workspace_id),
+    ).fetchone()
+    if not changed:
+        return False
+    emit_event(conn, workspace_id, "workspace.api_token_revoked", request_id=request_id,
+               data={"token_id": str(changed["id"]), "name": changed["name"], "actor_user_id": actor_id})
+    return True
+
+
 def list_user_workspaces(conn: Connection, user_id: str) -> list[dict[str, Any]]:
     return conn.execute(
         """SELECT w.id,w.name,m.role FROM workspace_members m

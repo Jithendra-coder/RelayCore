@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from fastapi import Depends, Header, HTTPException, Request
 
 from app.settings import DEMO_MODE, api_keys
-from app.store import auth_session, list_user_workspaces, workspace_membership
+from app.store import auth_session, list_user_workspaces, workspace_api_token, workspace_membership
 
 SESSION_COOKIE = "relaycore_session"
 
@@ -31,6 +31,7 @@ class Identity:
     session_token_hash: str | None = None
     demo_tenant: str | None = None
     demo_role: str | None = None
+    workspace_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -49,16 +50,22 @@ def authenticated_identity(
     authorization: str | None = Header(default=None),
 ) -> Identity:
     if authorization is not None:
-        if not DEMO_MODE or not authorization.startswith("Bearer "):
-            raise HTTPException(401, "Bearer API keys are available only in Demo Mode.",
-                                headers={"WWW-Authenticate": "Bearer"})
+        if not authorization.startswith("Bearer "):
+            raise HTTPException(401, "Use a bearer token.", headers={"WWW-Authenticate": "Bearer"})
         supplied = authorization[7:]
-        for secret, identity in api_keys().items():
-            if hmac.compare_digest(secret, supplied):
-                fingerprint = hashlib.sha256(secret.encode()).hexdigest()
-                return Identity(None, None, None, fingerprint, demo_tenant=identity["tenant_id"],
-                                demo_role=identity["role"])
-        raise HTTPException(401, "API key is not valid.", headers={"WWW-Authenticate": "Bearer"})
+        if DEMO_MODE:
+            for secret, demo_identity in api_keys().items():
+                if hmac.compare_digest(secret, supplied):
+                    fingerprint = hashlib.sha256(secret.encode()).hexdigest()
+                    return Identity(None, None, None, fingerprint, demo_tenant=demo_identity["tenant_id"],
+                                    demo_role=demo_identity["role"])
+        elif 32 <= len(supplied) <= 256:
+            with request.app.state.pool.connection() as conn:
+                token = workspace_api_token(conn, hashlib.sha256(supplied.encode()).hexdigest())
+            if token:
+                return Identity(token["user_id"], token["email"], token["display_name"],
+                                token["token_hash"], workspace_id=token["workspace_id"])
+        raise HTTPException(401, "Bearer token is not valid.", headers={"WWW-Authenticate": "Bearer"})
 
     token = request.cookies.get(SESSION_COOKIE)
     if token:
@@ -84,6 +91,11 @@ def principal_for_identity(
     if identity.demo_tenant is not None:
         return Principal(identity.demo_tenant, identity.demo_role or "viewer",
                          identity.credential_fingerprint)
+
+    if identity.workspace_id:
+        if selected_workspace_id and selected_workspace_id != identity.workspace_id:
+            raise HTTPException(404, "Workspace not found.")
+        selected_workspace_id = identity.workspace_id
 
     with request.app.state.pool.connection() as conn:
         memberships = list_user_workspaces(conn, identity.user_id or "")

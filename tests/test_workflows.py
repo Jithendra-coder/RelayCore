@@ -1495,7 +1495,8 @@ def test_versioned_migrations_bootstrap_and_skip_applied_files():
                 {"version": "001"}, {"version": "002"}, {"version": "003"},
                 {"version": "004"}, {"version": "005"}, {"version": "006"}, {"version": "007"},
                 {"version": "008"}, {"version": "009"}, {"version": "010"}, {"version": "011"},
-                {"version": "012"}, {"version": "013"}, {"version": "014"}, {"version": "015"}
+                {"version": "012"}, {"version": "013"}, {"version": "014"}, {"version": "015"},
+                {"version": "016"}
             ]
             assert conn.execute("SELECT count(*) AS n FROM tasks").fetchone()["n"] == 0
             assert conn.execute(
@@ -1546,6 +1547,10 @@ def test_versioned_migrations_bootstrap_and_skip_applied_files():
                    WHERE table_schema=current_schema() AND table_name='workflow_versions'
                      AND column_name='author_user_id'"""
             ).fetchone() == {"column_name": "author_user_id"}
+            assert conn.execute(
+                """SELECT table_name FROM information_schema.tables
+                   WHERE table_schema=current_schema() AND table_name='workspace_api_tokens'"""
+            ).fetchone() == {"table_name": "workspace_api_tokens"}
         finally:
             conn.execute("SET search_path TO public")
             conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
@@ -1572,7 +1577,8 @@ def test_workflow_version_migration_upgrades_an_existing_001_database():
                 {"version": "001"}, {"version": "002"}, {"version": "003"},
                 {"version": "004"}, {"version": "005"}, {"version": "006"}, {"version": "007"},
                 {"version": "008"}, {"version": "009"}, {"version": "010"}, {"version": "011"},
-                {"version": "012"}, {"version": "013"}, {"version": "014"}, {"version": "015"}
+                {"version": "012"}, {"version": "013"}, {"version": "014"}, {"version": "015"},
+                {"version": "016"}
             ]
             columns = conn.execute(
                 """SELECT column_name FROM information_schema.columns

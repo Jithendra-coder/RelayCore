@@ -179,6 +179,21 @@ class MetricsTokenCreateRequest(BaseModel):
         return value
 
 
+class ApiTokenCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=100)
+    expires_in_days: int = Field(default=30, ge=1, le=90)
+
+    @field_validator("name")
+    @classmethod
+    def api_token_name_is_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("API token name must contain a visible character.")
+        return value
+
+
 def valid_idempotency_key(value: str) -> str:
     if not re.fullmatch(r"[\w.:-]{1,120}", value):
         raise ValueError("Idempotency-Key may contain letters, digits, dot, underscore, colon, and hyphen (max 120).")

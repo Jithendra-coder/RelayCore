@@ -18,7 +18,7 @@ The same queue-ready `SELECT ... ORDER BY available_at, created_at LIMIT 1` ran 
 
 ## Correctness and failure checks
 
-The acceptance suite completed with **79 passed** on an isolated PostgreSQL 17.9 / UTF-8 database on 2026-10-08; app source coverage was **80%**. The current phase also ran Ruff, pre-commit, Python compilation, and `git diff --check`. GitHub Actions runs the suite on PostgreSQL 18. It covers:
+The acceptance suite completed with **106 passed** on an isolated PostgreSQL 17.9 / UTF-8 database on 2026-10-08; app source coverage was **81.51%** against an enforced 80% floor. The current phase also ran Ruff, pre-commit, Python compilation, dashboard JavaScript syntax validation, package installation/CLI help, and `git diff --check`. GitHub Actions runs the suite on PostgreSQL 18. It covers:
 
 - API key authentication, role denial, request IDs, and cross-tenant `404` isolation.
 - Idempotent workflow creation, payload conflict, persisted history, step transitions, and fail-once retry.
@@ -52,7 +52,11 @@ The queue/lease metric integration test creates an hour-old runnable task and an
 
 ## Database encryption-key rotation
 
-The offline re-encryption command was exercised against an isolated schema on local PostgreSQL 17.9 as part of the **92-test**, **80.78% coverage** full run. Tests verified webhook secrets, all integration credential versions, and GitHub PKCE verifiers decrypt under the new key; credential creation and rotation idempotency still work after fingerprint rekeying; and a corrupt ciphertext rolls back earlier table updates. PostgreSQL 18 CI for this change is pending. The test does not verify production secret-manager updates, a maintenance rollout, or restoring pre-rotation backups with the escrowed old key.
+The offline re-encryption command was exercised against an isolated schema on local PostgreSQL 17.9 as part of the **106-test**, **81.51% coverage** full run. Tests verified webhook secrets, all integration credential versions, and GitHub PKCE verifiers decrypt under the new key; credential creation and rotation idempotency still work after fingerprint rekeying; and a corrupt ciphertext rolls back earlier table updates. PostgreSQL 18 CI passed in run [37780848171](https://github.com/Jithendra-coder/RelayCore/actions/runs/37780848171). The test does not verify production secret-manager updates, a maintenance rollout, or restoring pre-rotation backups with the escrowed old key.
+
+## Workspace API tokens and Python client
+
+The latest local PostgreSQL run covers one-time token display, SHA-256-only database storage, expiry/revocation, workspace binding, membership removal, live role changes, permission denial for workspace creation, and write-rate limiting. Token secrets do not appear in list responses. The standard-library SDK rejects non-loopback HTTP and redirects, preserves stable idempotency keys, and returns typed models. CLI tests cover environment-based credentials and workflow JSON input. `pip install --no-deps -e .` succeeded locally and the installed `relaycore --help` command ran. PostgreSQL 18 CI for this API/SDK/CLI change is pending; there is no package-index release or live OIDC sign-in configured.
 
 ## Live Demo Mode evidence
 
