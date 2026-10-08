@@ -156,6 +156,7 @@ def create_workspace_metrics_token(
            VALUES (%s,%s,%s,%s,%s) RETURNING id,name,created_at""",
         (str(uuid.uuid4()), workspace_id, name, token_hash, actor_id),
     ).fetchone()
+    token["id"] = str(token["id"])
     emit_event(conn, workspace_id, "workspace.metrics_token_created", request_id=request_id,
                data={"token_id": token["id"], "name": name, "actor_user_id": actor_id})
     return token
@@ -186,7 +187,7 @@ def revoke_workspace_metrics_token(
     if not changed:
         return False
     emit_event(conn, workspace_id, "workspace.metrics_token_revoked", request_id=request_id,
-               data={"token_id": changed["id"], "name": changed["name"], "actor_user_id": actor_id})
+               data={"token_id": str(changed["id"]), "name": changed["name"], "actor_user_id": actor_id})
     return True
 
 
