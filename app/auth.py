@@ -5,10 +5,8 @@ import hmac
 from dataclasses import dataclass
 
 from fastapi import Depends, Header, HTTPException, Request
-from psycopg import Connection
-
 from app.settings import DEMO_MODE, api_keys
-from app.store import auth_session, list_user_workspaces, workspace_api_token, workspace_membership
+from app.store import DBConnection, auth_session, list_user_workspaces, workspace_api_token, workspace_membership
 
 SESSION_COOKIE = "relaycore_session"
 
@@ -62,10 +60,10 @@ def authenticated_identity(
                                     demo_role=demo_identity["role"])
         elif 32 <= len(supplied) <= 256:
             with request.app.state.pool.connection() as conn:
-                token = workspace_api_token(conn, hashlib.sha256(supplied.encode()).hexdigest())
-            if token:
-                return Identity(token["user_id"], token["email"], token["display_name"],
-                                token["token_hash"], workspace_id=token["workspace_id"])
+                token_record = workspace_api_token(conn, hashlib.sha256(supplied.encode()).hexdigest())
+            if token_record:
+                return Identity(token_record["user_id"], token_record["email"], token_record["display_name"],
+                                token_record["token_hash"], workspace_id=token_record["workspace_id"])
         raise HTTPException(401, "Bearer token is not valid.", headers={"WWW-Authenticate": "Bearer"})
 
     token = request.cookies.get(SESSION_COOKIE)
@@ -122,7 +120,7 @@ def authorize(user: Principal, *roles: str) -> None:
         raise HTTPException(403, "This identity does not have permission for that action.")
 
 
-def principal_is_current(conn: Connection, user: Principal) -> bool:
+def principal_is_current(conn: DBConnection, user: Principal) -> bool:
     if user.user_id is None:
         return True
     if not workspace_membership(conn, user.tenant_id, user.user_id):

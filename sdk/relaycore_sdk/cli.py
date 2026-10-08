@@ -6,7 +6,7 @@ import os
 import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Sequence, cast
 
 from relaycore_sdk.client import RelayCoreAPIError, RelayCoreClient, RelayCoreConnectionError
 
@@ -46,11 +46,11 @@ def _parser() -> argparse.ArgumentParser:
 
 def _display(value: Any) -> None:
     if is_dataclass(value):
-        value = asdict(value)
+        value = asdict(cast(Any, value))
         if value.get("details"):
             value = value["details"]
     elif isinstance(value, list):
-        value = [asdict(item) if is_dataclass(item) else item for item in value]
+        value = [asdict(cast(Any, item)) if is_dataclass(item) else item for item in value]
     print(json.dumps(value, indent=2, default=str))
 
 
@@ -66,6 +66,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     try:
         client = RelayCoreClient(args.url, token, args.workspace, timeout=args.timeout)
+        result: Any
         if args.area == "workspaces":
             result = client.list_workspaces()
         elif args.area == "workflow":

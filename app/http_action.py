@@ -39,13 +39,14 @@ class RetryableActionError(RuntimeError):
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
     def __init__(self, host: str, port: int, address: str, timeout: float):
-        super().__init__(host, port, timeout=timeout, context=ssl.create_default_context())
+        self.tls_context = ssl.create_default_context()
+        super().__init__(host, port, timeout=timeout, context=self.tls_context)
         self.address = address
 
     def connect(self) -> None:
-        raw = socket.create_connection((self.address, self.port), self.timeout, self.source_address)
+        raw = socket.create_connection((self.address, self.port), self.timeout)
         try:
-            self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+            self.sock = self.tls_context.wrap_socket(raw, server_hostname=self.host)
         except Exception:
             raw.close()
             raise
@@ -302,9 +303,10 @@ def execute_http_action(payload: dict, credential: str, idempotency_key: str,
     if not 200 <= response.status < 300:
         raise PermanentActionError(f"HTTP action returned status {response.status}.")
     raw = b"".join(chunks)
+    content_type = response.getheader("Content-Type", "")[:128]
     result = {"status_code": response.status, "response_bytes": size,
-              "content_type": response.getheader("Content-Type", "")[:128]}
-    if "json" in result["content_type"].lower():
+              "content_type": content_type}
+    if "json" in content_type.lower():
         try:
             result["body"] = _redact_json(json.loads(raw), credential)
         except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):

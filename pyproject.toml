@@ -21,6 +21,11 @@ relaycore_sdk = ["py.typed"]
 [tool.pytest.ini_options]
 pythonpath = ["sdk"]
 
+[tool.mypy]
+python_version = "3.13"
+platform = "linux"
+files = ["app", "sdk"]
+
 [tool.ruff]
 target-version = "py313"
 line-length = 120

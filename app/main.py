@@ -15,12 +15,13 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any
+from typing import Any, NoReturn, TypeAlias
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from psycopg import Connection as PsycopgConnection
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from opentelemetry import trace
@@ -166,9 +167,10 @@ from app.telemetry import configure_tracing, http_request_span, mark_http_span_f
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(message)s")
 logger = logging.getLogger("relaycore.api")
 _tracer = trace.get_tracer("relaycore.api")
+DatabasePool: TypeAlias = ConnectionPool[PsycopgConnection[dict[str, Any]]]
 
 
-def pool_for(request: Request) -> ConnectionPool:
+def pool_for(request: Request) -> DatabasePool:
     return request.app.state.pool
 
 
@@ -176,7 +178,7 @@ def metrics_principal(
     request: Request,
     authorization: str | None = Header(default=None),
     selected_workspace_id: str | None = Header(default=None, alias="X-Workspace-ID"),
-    pool: ConnectionPool = Depends(pool_for),
+    pool: DatabasePool = Depends(pool_for),
 ) -> Principal:
     if authorization and authorization.startswith("Bearer "):
         bearer = authorization[7:]
@@ -197,7 +199,7 @@ def request_id(request: Request) -> str:
     return request.state.request_id
 
 
-def rate_limit_error(exc: Exception) -> None:
+def rate_limit_error(exc: Exception) -> NoReturn:
     if isinstance(exc, QueueFull):
         raise HTTPException(429, f"Tenant queue is full ({MAX_QUEUE_DEPTH} active workflows). Retry later.")
     if isinstance(exc, RateLimited):
@@ -219,12 +221,16 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("Production requires OIDC configuration; static API keys are Demo Mode only.")
     else:
         secret_encryption_key(required=True)
-    pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=16,
-                          kwargs={"row_factory": dict_row, "application_name": "relaycore-api"},
-                          check=ConnectionPool.check_connection, open=False)
+    pool: DatabasePool = ConnectionPool[PsycopgConnection[dict[str, Any]]](
+        DATABASE_URL, min_size=1, max_size=16,
+        kwargs={"row_factory": dict_row, "application_name": "relaycore-api"},
+        check=ConnectionPool.check_connection, open=False,
+    )
     pool.open(wait=True)
     with pool.connection() as conn:
-        encoding = conn.execute("SHOW server_encoding").fetchone()["server_encoding"]
+        encoding_row = conn.execute("SHOW server_encoding").fetchone()
+        assert encoding_row is not None
+        encoding = encoding_row["server_encoding"]
     if encoding != "UTF8":
         pool.close()
         raise RuntimeError("RelayCore requires a UTF8 PostgreSQL database.")
@@ -232,7 +238,7 @@ async def lifespan(app: FastAPI):
         migrate(conn)
     app.state.pool = pool
     if OIDC_SETTINGS:
-        from authlib.integrations.starlette_client import OAuth
+        from authlib.integrations.starlette_client import OAuth  # type: ignore[import-untyped]
 
         oauth = OAuth()
         oauth.register(
@@ -362,7 +368,7 @@ async def oidc_login(request: Request):
 
 
 @app.get("/auth/callback", include_in_schema=False)
-async def oidc_callback(request: Request, pool: ConnectionPool = Depends(pool_for)):
+async def oidc_callback(request: Request, pool: DatabasePool = Depends(pool_for)):
     if not OIDC_SETTINGS:
         raise HTTPException(404, "OpenID Connect is not configured.")
     try:
@@ -397,7 +403,7 @@ async def oidc_callback(request: Request, pool: ConnectionPool = Depends(pool_fo
 def oidc_logout(
     request: Request,
     identity: Identity = Depends(authenticated_identity),
-    pool: ConnectionPool = Depends(pool_for),
+    pool: DatabasePool = Depends(pool_for),
 ) -> Response:
     if not identity.session_token_hash:
         raise HTTPException(404, "Only signed-in sessions can be logged out here.")
@@ -410,7 +416,7 @@ def oidc_logout(
 
 @app.get("/api/me")
 def me(identity: Identity = Depends(authenticated_identity),
-       pool: ConnectionPool = Depends(pool_for)) -> dict[str, Any]:
+       pool: DatabasePool = Depends(pool_for)) -> dict[str, Any]:
     if identity.user_id is None:
         return {"authentication": "demo", "workspaces": [
             {"id": identity.demo_tenant, "name": identity.demo_tenant, "role": identity.demo_role}
@@ -425,7 +431,7 @@ def me(identity: Identity = Depends(authenticated_identity),
 
 @app.get("/api/workspaces")
 def workspaces(identity: Identity = Depends(authenticated_identity),
-               pool: ConnectionPool = Depends(pool_for)) -> list[dict[str, Any]]:
+               pool: DatabasePool = Depends(pool_for)) -> list[dict[str, Any]]:
     if identity.user_id is None:
         return [{"id": identity.demo_tenant, "name": identity.demo_tenant, "role": identity.demo_role}]
     with pool.connection() as conn:
@@ -437,7 +443,7 @@ def workspaces(identity: Identity = Depends(authenticated_identity),
 @app.post("/api/workspaces", status_code=201)
 def new_workspace(body: WorkspaceCreateRequest, request: Request,
                   identity: Identity = Depends(authenticated_identity),
-                  pool: ConnectionPool = Depends(pool_for)) -> dict[str, Any]:
+                  pool: DatabasePool = Depends(pool_for)) -> dict[str, Any]:
     if identity.user_id is None:
         raise HTTPException(403, "Create workspaces with a signed-in user account.")
     if identity.workspace_id:
@@ -448,7 +454,7 @@ def new_workspace(body: WorkspaceCreateRequest, request: Request,
 
 @app.get("/api/workspaces/{workspace_id}/members")
 def members(workspace_id: str, user: Principal = Depends(principal),
-            pool: ConnectionPool = Depends(pool_for)) -> list[dict[str, Any]]:
+            pool: DatabasePool = Depends(pool_for)) -> list[dict[str, Any]]:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
     with pool.connection() as conn:
@@ -457,7 +463,7 @@ def members(workspace_id: str, user: Principal = Depends(principal),
 
 @app.put("/api/workspaces/{workspace_id}/members", status_code=200)
 def set_member(workspace_id: str, body: WorkspaceMemberRequest, request: Request,
-               user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)) -> dict[str, str]:
+               user: Principal = Depends(principal), pool: DatabasePool = Depends(pool_for)) -> dict[str, str]:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
     authorize(user, "admin")
@@ -480,7 +486,7 @@ def set_member(workspace_id: str, body: WorkspaceMemberRequest, request: Request
 
 @app.delete("/api/workspaces/{workspace_id}/members/{member_id}", status_code=204)
 def delete_member(workspace_id: str, member_id: str, request: Request,
-                  user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)) -> Response:
+                  user: Principal = Depends(principal), pool: DatabasePool = Depends(pool_for)) -> Response:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
     authorize(user, "admin")
@@ -528,7 +534,7 @@ def credential_secret_value(secret: Any) -> str:
 
 @app.get("/api/workspaces/{workspace_id}/metrics-tokens")
 def metrics_tokens(workspace_id: str, user: Principal = Depends(principal),
-                   pool: ConnectionPool = Depends(pool_for)) -> list[dict[str, Any]]:
+                   pool: DatabasePool = Depends(pool_for)) -> list[dict[str, Any]]:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
     authorize(user, "admin")
@@ -538,7 +544,7 @@ def metrics_tokens(workspace_id: str, user: Principal = Depends(principal),
 
 @app.post("/api/workspaces/{workspace_id}/metrics-tokens", status_code=201)
 def new_metrics_token(workspace_id: str, body: MetricsTokenCreateRequest, request: Request,
-                      user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)
+                      user: Principal = Depends(principal), pool: DatabasePool = Depends(pool_for)
                       ) -> dict[str, Any]:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
@@ -555,7 +561,7 @@ def new_metrics_token(workspace_id: str, body: MetricsTokenCreateRequest, reques
 
 @app.delete("/api/workspaces/{workspace_id}/metrics-tokens/{token_id}", status_code=204)
 def delete_metrics_token(workspace_id: str, token_id: str, request: Request,
-                         user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)
+                         user: Principal = Depends(principal), pool: DatabasePool = Depends(pool_for)
                          ) -> Response:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
@@ -571,7 +577,7 @@ def delete_metrics_token(workspace_id: str, token_id: str, request: Request,
 
 @app.get("/api/workspaces/{workspace_id}/api-tokens")
 def api_tokens(workspace_id: str, user: Principal = Depends(principal),
-               pool: ConnectionPool = Depends(pool_for)) -> list[dict[str, Any]]:
+               pool: DatabasePool = Depends(pool_for)) -> list[dict[str, Any]]:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
     authorize(user, "admin")
@@ -581,7 +587,7 @@ def api_tokens(workspace_id: str, user: Principal = Depends(principal),
 
 @app.post("/api/workspaces/{workspace_id}/api-tokens", status_code=201)
 def new_api_token(workspace_id: str, body: ApiTokenCreateRequest, request: Request,
-                  user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)
+                  user: Principal = Depends(principal), pool: DatabasePool = Depends(pool_for)
                   ) -> dict[str, Any]:
     if DEMO_MODE:
         raise HTTPException(404, "API tokens are available for signed-in workspace accounts.")
@@ -604,7 +610,7 @@ def new_api_token(workspace_id: str, body: ApiTokenCreateRequest, request: Reque
 
 @app.delete("/api/workspaces/{workspace_id}/api-tokens/{token_id}", status_code=204)
 def delete_api_token(workspace_id: str, token_id: str, request: Request,
-                     user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)
+                     user: Principal = Depends(principal), pool: DatabasePool = Depends(pool_for)
                      ) -> Response:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
@@ -640,7 +646,7 @@ def validate_workflow_actions(conn, workspace_id: str, steps: list[dict[str, Any
 
 @app.get("/api/workspaces/{workspace_id}/credentials")
 def credentials(workspace_id: str, user: Principal = Depends(principal),
-                pool: ConnectionPool = Depends(pool_for)) -> list[dict[str, Any]]:
+                pool: DatabasePool = Depends(pool_for)) -> list[dict[str, Any]]:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
     authorize(user, "admin")
@@ -651,7 +657,7 @@ def credentials(workspace_id: str, user: Principal = Depends(principal),
 @app.post("/api/workspaces/{workspace_id}/credentials", status_code=201)
 def new_credential(workspace_id: str, body: CredentialCreateRequest, request: Request,
                    idempotency_key: str = Header(default_factory=lambda: str(uuid.uuid4()), alias="Idempotency-Key"),
-                   user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)) -> dict[str, Any]:
+                   user: Principal = Depends(principal), pool: DatabasePool = Depends(pool_for)) -> dict[str, Any]:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
     authorize(user, "admin")
@@ -674,7 +680,7 @@ def new_credential(workspace_id: str, body: CredentialCreateRequest, request: Re
 @app.post("/api/workspaces/{workspace_id}/credentials/{credential_id}/rotate")
 def rotate_credential(workspace_id: str, credential_id: str, body: CredentialRotateRequest, request: Request,
                       idempotency_key: str = Header(default_factory=lambda: str(uuid.uuid4()), alias="Idempotency-Key"),
-                      user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)) -> dict[str, Any]:
+                      user: Principal = Depends(principal), pool: DatabasePool = Depends(pool_for)) -> dict[str, Any]:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
     authorize(user, "admin")
@@ -699,7 +705,7 @@ def rotate_credential(workspace_id: str, credential_id: str, body: CredentialRot
 
 @app.delete("/api/workspaces/{workspace_id}/credentials/{credential_id}", status_code=204)
 def delete_credential(workspace_id: str, credential_id: str, request: Request,
-                      user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)) -> Response:
+                      user: Principal = Depends(principal), pool: DatabasePool = Depends(pool_for)) -> Response:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
     authorize(user, "admin")
@@ -714,7 +720,7 @@ def delete_credential(workspace_id: str, credential_id: str, request: Request,
 
 @app.get("/api/workspaces/{workspace_id}/webhooks")
 def webhooks(workspace_id: str, user: Principal = Depends(principal),
-             pool: ConnectionPool = Depends(pool_for)) -> list[dict[str, Any]]:
+             pool: DatabasePool = Depends(pool_for)) -> list[dict[str, Any]]:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
     authorize(user, "admin")
@@ -745,7 +751,7 @@ def configured_slack():
 @app.post("/api/workspaces/{workspace_id}/slack/install", status_code=201)
 def start_slack_installation(
     workspace_id: str, request: Request, user: Principal = Depends(principal),
-    pool: ConnectionPool = Depends(pool_for),
+    pool: DatabasePool = Depends(pool_for),
 ) -> dict[str, str]:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
@@ -769,7 +775,7 @@ def slack_install_callback(
     code: str | None = Query(default=None, min_length=1, max_length=1024),
     error: str | None = Query(default=None, max_length=100),
     state: str = Query(min_length=32, max_length=128),
-    identity: Identity = Depends(authenticated_identity), pool: ConnectionPool = Depends(pool_for),
+    identity: Identity = Depends(authenticated_identity), pool: DatabasePool = Depends(pool_for),
 ) -> Response:
     config = configured_slack()
     if identity.user_id is None:
@@ -824,7 +830,7 @@ def slack_install_callback(
 
 @app.get("/api/workspaces/{workspace_id}/slack")
 def slack_connection(workspace_id: str, user: Principal = Depends(principal),
-                     pool: ConnectionPool = Depends(pool_for)) -> dict[str, Any]:
+                     pool: DatabasePool = Depends(pool_for)) -> dict[str, Any]:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
     with pool.connection() as conn:
@@ -836,7 +842,7 @@ def slack_connection(workspace_id: str, user: Principal = Depends(principal),
 
 @app.delete("/api/workspaces/{workspace_id}/slack", status_code=204)
 def disconnect_slack(workspace_id: str, request: Request, user: Principal = Depends(principal),
-                     pool: ConnectionPool = Depends(pool_for)) -> Response:
+                     pool: DatabasePool = Depends(pool_for)) -> Response:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
     authorize(user, "admin")
@@ -850,7 +856,7 @@ def disconnect_slack(workspace_id: str, request: Request, user: Principal = Depe
 @app.post("/api/workspaces/{workspace_id}/github/install", status_code=201)
 def start_github_installation(
     workspace_id: str, request: Request, user: Principal = Depends(principal),
-    pool: ConnectionPool = Depends(pool_for),
+    pool: DatabasePool = Depends(pool_for),
 ) -> dict[str, str]:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
@@ -876,7 +882,7 @@ def start_github_installation(
 def github_install_setup(
     installation_id: int = Query(gt=0, le=9223372036854775807),
     state: str = Query(min_length=32, max_length=128),
-    pool: ConnectionPool = Depends(pool_for),
+    pool: DatabasePool = Depends(pool_for),
 ) -> Response:
     config = configured_github()
     state_hash = hashlib.sha256(state.encode()).hexdigest()
@@ -897,7 +903,7 @@ def github_install_callback(
     code: str | None = Query(default=None, min_length=1, max_length=1024),
     error: str | None = Query(default=None, max_length=100),
     state: str = Query(min_length=32, max_length=128),
-    identity: Identity = Depends(authenticated_identity), pool: ConnectionPool = Depends(pool_for),
+    identity: Identity = Depends(authenticated_identity), pool: DatabasePool = Depends(pool_for),
 ) -> Response:
     config = configured_github()
     if identity.user_id is None:
@@ -955,7 +961,7 @@ def github_install_callback(
 
 @app.get("/api/workspaces/{workspace_id}/github")
 def github_connection(workspace_id: str, user: Principal = Depends(principal),
-                      pool: ConnectionPool = Depends(pool_for)) -> dict[str, Any]:
+                      pool: DatabasePool = Depends(pool_for)) -> dict[str, Any]:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
     with pool.connection() as conn:
@@ -967,7 +973,7 @@ def github_connection(workspace_id: str, user: Principal = Depends(principal),
 
 @app.delete("/api/workspaces/{workspace_id}/github", status_code=204)
 def disconnect_github(workspace_id: str, request: Request, user: Principal = Depends(principal),
-                      pool: ConnectionPool = Depends(pool_for)) -> Response:
+                      pool: DatabasePool = Depends(pool_for)) -> Response:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
     authorize(user, "admin")
@@ -984,7 +990,7 @@ async def receive_github_webhook(
     signature: str | None = Header(default=None, alias="X-Hub-Signature-256"),
     delivery: str | None = Header(default=None, alias="X-GitHub-Delivery"),
     event_name: str | None = Header(default=None, alias="X-GitHub-Event"),
-    pool: ConnectionPool = Depends(pool_for),
+    pool: DatabasePool = Depends(pool_for),
 ) -> dict[str, Any]:
     config = configured_github()
     if not delivery or not event_name or not re.fullmatch(r"[a-z_]{1,64}", event_name):
@@ -1045,7 +1051,7 @@ async def receive_slack_event(
     request: Request,
     timestamp: str | None = Header(default=None, alias="X-Slack-Request-Timestamp"),
     signature: str | None = Header(default=None, alias="X-Slack-Signature"),
-    pool: ConnectionPool = Depends(pool_for),
+    pool: DatabasePool = Depends(pool_for),
 ) -> dict[str, Any]:
     config = configured_slack()
     raw_body, payload = await read_webhook_payload(request)
@@ -1103,7 +1109,7 @@ async def receive_slack_event(
 @app.post("/api/workspaces/{workspace_id}/webhooks", status_code=201)
 def new_webhook(workspace_id: str, body: WebhookCreateRequest, request: Request,
                 idempotency_key: str = Header(default_factory=lambda: str(uuid.uuid4()), alias="Idempotency-Key"),
-                user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)) -> dict[str, Any]:
+                user: Principal = Depends(principal), pool: DatabasePool = Depends(pool_for)) -> dict[str, Any]:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
     authorize(user, "admin")
@@ -1125,7 +1131,7 @@ def new_webhook(workspace_id: str, body: WebhookCreateRequest, request: Request,
 @app.post("/api/workspaces/{workspace_id}/webhooks/{endpoint_id}/rotate", status_code=200)
 def rotate_webhook(workspace_id: str, endpoint_id: str, request: Request,
                    idempotency_key: str = Header(default_factory=lambda: str(uuid.uuid4()), alias="Idempotency-Key"),
-                   user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)) -> dict[str, Any]:
+                   user: Principal = Depends(principal), pool: DatabasePool = Depends(pool_for)) -> dict[str, Any]:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
     authorize(user, "admin")
@@ -1149,7 +1155,7 @@ def rotate_webhook(workspace_id: str, endpoint_id: str, request: Request,
 
 @app.delete("/api/workspaces/{workspace_id}/webhooks/{endpoint_id}", status_code=204)
 def delete_webhook(workspace_id: str, endpoint_id: str, request: Request,
-                   user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)) -> Response:
+                   user: Principal = Depends(principal), pool: DatabasePool = Depends(pool_for)) -> Response:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
     authorize(user, "admin")
@@ -1197,7 +1203,7 @@ async def receive_webhook(
     event_key: str | None = Header(default=None, alias="X-RelayCore-Event-ID"),
     timestamp: str | None = Header(default=None, alias="X-RelayCore-Timestamp"),
     signature: str | None = Header(default=None, alias="X-RelayCore-Signature"),
-    pool: ConnectionPool = Depends(pool_for),
+    pool: DatabasePool = Depends(pool_for),
 ) -> dict[str, Any]:
     if not event_key or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,120}", event_key):
         raise HTTPException(400, "X-RelayCore-Event-ID is required and must be a valid event key.")
@@ -1248,7 +1254,7 @@ async def receive_webhook(
 
 
 @app.get("/api/status")
-def status(user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)) -> dict[str, Any]:
+def status(user: Principal = Depends(principal), pool: DatabasePool = Depends(pool_for)) -> dict[str, Any]:
     with pool.connection() as conn:
         return dashboard(conn, user.tenant_id, include_workers=DEMO_MODE)
 
@@ -1264,7 +1270,7 @@ def create(
     request: Request,
     idempotency_key: str = Header(default_factory=lambda: str(uuid.uuid4()), alias="Idempotency-Key"),
     user: Principal = Depends(principal),
-    pool: ConnectionPool = Depends(pool_for),
+    pool: DatabasePool = Depends(pool_for),
 ) -> dict[str, Any]:
     authorize(user, "admin", "operator")
     if not DEMO_MODE:
@@ -1282,14 +1288,14 @@ def create(
 
 @app.get("/api/workflow-definitions")
 def workflow_definitions(user: Principal = Depends(principal),
-                         pool: ConnectionPool = Depends(pool_for)) -> list[dict[str, Any]]:
+                         pool: DatabasePool = Depends(pool_for)) -> list[dict[str, Any]]:
     with pool.connection() as conn:
         return list_workflow_definitions(conn, user.tenant_id)
 
 
 @app.get("/api/workspaces/{workspace_id}/schedules")
 def workflow_schedules(workspace_id: str, user: Principal = Depends(principal),
-                       pool: ConnectionPool = Depends(pool_for)) -> list[dict[str, Any]]:
+                       pool: DatabasePool = Depends(pool_for)) -> list[dict[str, Any]]:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
     with pool.connection() as conn:
@@ -1303,7 +1309,7 @@ def create_schedule(
     request: Request,
     idempotency_key: str = Header(default_factory=lambda: str(uuid.uuid4()), alias="Idempotency-Key"),
     user: Principal = Depends(principal),
-    pool: ConnectionPool = Depends(pool_for),
+    pool: DatabasePool = Depends(pool_for),
 ) -> dict[str, Any]:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
@@ -1348,7 +1354,7 @@ def update_schedule(
     body: ScheduleStatusRequest,
     request: Request,
     user: Principal = Depends(principal),
-    pool: ConnectionPool = Depends(pool_for),
+    pool: DatabasePool = Depends(pool_for),
 ) -> dict[str, Any]:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
@@ -1370,7 +1376,7 @@ def update_schedule(
 @app.delete("/api/workspaces/{workspace_id}/schedules/{schedule_id}")
 def cancel_schedule(workspace_id: str, schedule_id: str, request: Request,
                     user: Principal = Depends(principal),
-                    pool: ConnectionPool = Depends(pool_for)) -> dict[str, Any]:
+                    pool: DatabasePool = Depends(pool_for)) -> dict[str, Any]:
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
     authorize(user, "admin", "operator")
@@ -1392,7 +1398,7 @@ def create_definition(
     request: Request,
     idempotency_key: str = Header(default_factory=lambda: str(uuid.uuid4()), alias="Idempotency-Key"),
     user: Principal = Depends(principal),
-    pool: ConnectionPool = Depends(pool_for),
+    pool: DatabasePool = Depends(pool_for),
 ) -> dict[str, Any]:
     authorize(user, "admin", "operator")
     try:
@@ -1414,7 +1420,7 @@ def create_definition(
 
 @app.get("/api/workflow-definitions/{workflow_id}")
 def workflow_definition(workflow_id: str, user: Principal = Depends(principal),
-                        pool: ConnectionPool = Depends(pool_for)) -> dict[str, Any]:
+                        pool: DatabasePool = Depends(pool_for)) -> dict[str, Any]:
     with pool.connection() as conn:
         result = get_workflow_definition(conn, user.tenant_id, workflow_id)
     if not result:
@@ -1429,7 +1435,7 @@ def publish_workflow_version(
     request: Request,
     idempotency_key: str = Header(default_factory=lambda: str(uuid.uuid4()), alias="Idempotency-Key"),
     user: Principal = Depends(principal),
-    pool: ConnectionPool = Depends(pool_for),
+    pool: DatabasePool = Depends(pool_for),
 ) -> dict[str, Any]:
     authorize(user, "admin", "operator")
     try:
@@ -1460,7 +1466,7 @@ def run_workflow_definition(
     request: Request,
     idempotency_key: str = Header(default_factory=lambda: str(uuid.uuid4()), alias="Idempotency-Key"),
     user: Principal = Depends(principal),
-    pool: ConnectionPool = Depends(pool_for),
+    pool: DatabasePool = Depends(pool_for),
 ) -> dict[str, Any]:
     authorize(user, "admin", "operator")
     try:
@@ -1484,14 +1490,14 @@ def run_workflow_definition(
 
 
 @app.get("/api/workflows")
-def workflows(user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)) -> list[dict[str, Any]]:
+def workflows(user: Principal = Depends(principal), pool: DatabasePool = Depends(pool_for)) -> list[dict[str, Any]]:
     with pool.connection() as conn:
         stats = dashboard(conn, user.tenant_id)
     return stats["workflows"]
 
 
 @app.get("/api/workflows/{run_id}")
-def workflow(run_id: str, user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)) -> dict[str, Any]:
+def workflow(run_id: str, user: Principal = Depends(principal), pool: DatabasePool = Depends(pool_for)) -> dict[str, Any]:
     with pool.connection() as conn:
         result = run_summary(conn, user.tenant_id, run_id)
     if not result:
@@ -1501,7 +1507,7 @@ def workflow(run_id: str, user: Principal = Depends(principal), pool: Connection
 
 @app.post("/api/workflows/{run_id}/cancel")
 def cancel(run_id: str, request: Request, user: Principal = Depends(principal),
-           pool: ConnectionPool = Depends(pool_for)) -> dict[str, str]:
+           pool: DatabasePool = Depends(pool_for)) -> dict[str, str]:
     authorize(user, "admin", "operator")
     with pool.connection() as conn, conn.transaction():
         run = conn.execute("SELECT status FROM workflow_runs WHERE tenant_id=%s AND id=%s FOR UPDATE",
@@ -1521,7 +1527,7 @@ def cancel(run_id: str, request: Request, user: Principal = Depends(principal),
 
 
 @app.post("/api/demo/start", status_code=202)
-def demo_start(request: Request, user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)) -> dict[str, Any]:
+def demo_start(request: Request, user: Principal = Depends(principal), pool: DatabasePool = Depends(pool_for)) -> dict[str, Any]:
     authorize(user, "admin")
     require_demo()
     rid = request_id(request)
@@ -1542,7 +1548,7 @@ def demo_start(request: Request, user: Principal = Depends(principal), pool: Con
 
 @app.post("/api/demo/duplicates")
 def duplicate_demo(body: DuplicateEventRequest, request: Request,
-                   user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)) -> dict[str, Any]:
+                   user: Principal = Depends(principal), pool: DatabasePool = Depends(pool_for)) -> dict[str, Any]:
     authorize(user, "admin")
     require_demo()
     request_key = request_id(request)
@@ -1552,6 +1558,7 @@ def duplicate_demo(body: DuplicateEventRequest, request: Request,
             result = None
             for _ in range(10):
                 result = ingest_business_event(conn, user.tenant_id, body.event_key, payload, request_key)
+            assert result is not None
     except (QueueFull, RateLimited, IdempotencyConflict) as exc:
         rate_limit_error(exc)
     return {"deliveries_received": 10, "distinct_events": 1, "logical_workflows": 1,
@@ -1560,7 +1567,7 @@ def duplicate_demo(body: DuplicateEventRequest, request: Request,
 
 @app.post("/api/demo/dlq", status_code=202)
 def demo_dlq(body: DemoFailureRequest, request: Request,
-             user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)) -> dict[str, Any]:
+             user: Principal = Depends(principal), pool: DatabasePool = Depends(pool_for)) -> dict[str, Any]:
     authorize(user, "admin")
     require_demo()
     try:
@@ -1578,7 +1585,7 @@ def require_demo() -> None:
 
 
 @app.get("/api/dead-letters")
-def dead_letters(user: Principal = Depends(principal), pool: ConnectionPool = Depends(pool_for)) -> list[dict[str, Any]]:
+def dead_letters(user: Principal = Depends(principal), pool: DatabasePool = Depends(pool_for)) -> list[dict[str, Any]]:
     with pool.connection() as conn:
         return conn.execute(
             """SELECT id,run_id,task_id,attempts,error,failed_at,replayed_at
@@ -1589,7 +1596,7 @@ def dead_letters(user: Principal = Depends(principal), pool: ConnectionPool = De
 
 @app.post("/api/dead-letters/{dead_letter_id}/replay", status_code=202)
 def replay(dead_letter_id: int, request: Request, user: Principal = Depends(principal),
-           pool: ConnectionPool = Depends(pool_for)) -> dict[str, str]:
+           pool: DatabasePool = Depends(pool_for)) -> dict[str, str]:
     authorize(user, "admin")
     with pool.connection() as conn, conn.transaction():
         item = conn.execute(
@@ -1624,7 +1631,7 @@ def replay(dead_letter_id: int, request: Request, user: Principal = Depends(prin
 
 @app.post("/api/workers/{worker_id}/kill")
 def kill_worker(worker_id: str, request: Request, user: Principal = Depends(principal),
-                pool: ConnectionPool = Depends(pool_for)) -> dict[str, Any]:
+                pool: DatabasePool = Depends(pool_for)) -> dict[str, Any]:
     authorize(user, "admin")
     require_demo()
     with pool.connection() as conn, conn.transaction():
@@ -1646,7 +1653,7 @@ def kill_worker(worker_id: str, request: Request, user: Principal = Depends(prin
 
 @app.post("/api/workers/{worker_id}/restart")
 def restart_worker(worker_id: str, request: Request, user: Principal = Depends(principal),
-                   pool: ConnectionPool = Depends(pool_for)) -> dict[str, Any]:
+                   pool: DatabasePool = Depends(pool_for)) -> dict[str, Any]:
     authorize(user, "admin")
     require_demo()
     try:
@@ -1659,7 +1666,7 @@ def restart_worker(worker_id: str, request: Request, user: Principal = Depends(p
     return {"worker_id": worker_id, "pid": pid, "status": "restarted"}
 
 
-def _events_after(pool: ConnectionPool, user: Principal, sequence: int) -> list[dict[str, Any]] | None:
+def _events_after(pool: DatabasePool, user: Principal, sequence: int) -> list[dict[str, Any]] | None:
     with pool.connection() as conn:
         if not principal_is_current(conn, user):
             return None
@@ -1707,7 +1714,7 @@ def events(
     limit: int = Query(default=50, ge=1, le=100),
     cursor: str | None = Query(default=None, max_length=256),
     user: Principal = Depends(principal),
-    pool: ConnectionPool = Depends(pool_for),
+    pool: DatabasePool = Depends(pool_for),
 ) -> dict[str, Any]:
     before = decode_event_page_cursor(cursor)
     with pool.connection() as conn:
@@ -1726,7 +1733,7 @@ def events(
 async def event_stream(request: Request, after: int | None = None,
                        last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
                        user: Principal = Depends(principal),
-                       pool: ConnectionPool = Depends(pool_for)) -> StreamingResponse:
+                       pool: DatabasePool = Depends(pool_for)) -> StreamingResponse:
     cursor = event_cursor(after, last_event_id)
 
     async def stream():
@@ -1747,7 +1754,7 @@ async def event_stream(request: Request, after: int | None = None,
 
 
 @app.get("/metrics", include_in_schema=False)
-def metrics(user: Principal = Depends(metrics_principal), pool: ConnectionPool = Depends(pool_for)) -> Response:
+def metrics(user: Principal = Depends(metrics_principal), pool: DatabasePool = Depends(pool_for)) -> Response:
     with pool.connection() as conn:
         data = dashboard(conn, user.tenant_id)
     lines = [

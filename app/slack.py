@@ -99,13 +99,14 @@ def post_message(payload: dict[str, Any], bot_token: str, *, timeout_seconds: fl
         connection.sock.settimeout(remaining)
         response = connection.getresponse()
         status = response.status
-        retry_after = response.headers.get("Retry-After")
+        retry_after_header = response.headers.get("Retry-After")
         if status == 429:
             try:
-                retry_after = max(0.0, min(float(retry_after), 3600.0))
+                retry_after_seconds = (max(0.0, min(float(retry_after_header), 3600.0))
+                                       if retry_after_header is not None else None)
             except (TypeError, ValueError):
-                retry_after = None
-            raise RetryableActionError("Slack message was rate limited.", retry_after=retry_after)
+                retry_after_seconds = None
+            raise RetryableActionError("Slack message was rate limited.", retry_after=retry_after_seconds)
         if status >= 500:
             raise RetryableActionError(f"Slack returned status {status}.")
         if 300 <= status < 400:

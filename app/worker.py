@@ -43,14 +43,16 @@ def worker_identifier() -> str:
 def worker_is_healthy() -> bool:
     try:
         with psycopg.connect(DATABASE_URL, connect_timeout=2, autocommit=True) as conn:
-            return conn.execute(
+            row = conn.execute(
                 """SELECT EXISTS (
                        SELECT 1 FROM workers
                        WHERE host=%s AND stopped_at IS NULL
                          AND heartbeat_at>clock_timestamp()-interval '15 seconds'
                    )""",
                 (socket.gethostname(),),
-            ).fetchone()[0]
+            ).fetchone()
+            assert row is not None
+            return row[0]
     except psycopg.Error:
         return False
 

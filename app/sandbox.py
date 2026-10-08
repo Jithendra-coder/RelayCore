@@ -10,7 +10,7 @@ from app.settings import DEMO_MODE, LEASE_SECONDS
 
 
 def execute_sandbox_action(
-    conn: Connection, worker_id: str, task: dict[str, Any], step: dict[str, Any],
+    conn: Connection[dict[str, Any]], worker_id: str, task: dict[str, Any], step: dict[str, Any],
 ) -> dict[str, Any] | None:
     if not DEMO_MODE:
         raise PermanentActionError("Sandbox actions are disabled outside Demo Mode.")
@@ -19,10 +19,12 @@ def execute_sandbox_action(
     if action == "fail_once" and task["attempts"] == 1:
         raise RuntimeError("Deterministic Demo Mode failure on the first attempt.")
     if action == "fail_until_replay":
-        released = conn.execute(
+        released_row = conn.execute(
             "SELECT EXISTS(SELECT 1 FROM dead_letters WHERE task_id=%s AND replayed_at IS NOT NULL) AS released",
             (task["id"],),
-        ).fetchone()["released"]
+        ).fetchone()
+        assert released_row is not None
+        released = released_row["released"]
         if not released:
             raise RuntimeError("Demo failure is held until an administrator replays its dead letter.")
     if action == "sleep":

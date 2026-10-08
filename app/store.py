@@ -6,9 +6,9 @@ import os
 import secrets
 import socket
 import uuid
-from typing import Any
+from typing import Any, TypeAlias
 
-from psycopg import Connection
+from psycopg import Connection as PsycopgConnection
 from psycopg.types.json import Jsonb
 
 from app.secretbox import credential_fingerprint, decrypt_secret, encrypt_secret
@@ -16,6 +16,14 @@ from app.http_action import PermanentActionError, RetryableActionError, has_even
 from app.telemetry import current_traceparent
 from app.settings import (DEMO_MODE, MAX_ATTEMPTS, MAX_QUEUE_DEPTH, MAX_SCHEDULES_PER_TENANT,
                           RATE_LIMIT_PER_MINUTE, WEBHOOK_PAYLOAD_RETENTION_DAYS)
+
+DBConnection: TypeAlias = PsycopgConnection[dict[str, Any]]
+
+
+def _required_row(row: dict[str, Any] | None) -> dict[str, Any]:
+    if row is None:
+        raise RuntimeError("Database query did not return its expected row.")
+    return row
 
 
 class QueueFull(Exception):
@@ -66,7 +74,7 @@ class SlackInstallationConflict(Exception):
     pass
 
 
-def migrate(conn: Connection) -> None:
+def migrate(conn: DBConnection) -> None:
     from pathlib import Path
 
     migration_dir = Path(__file__).with_name("migrations")
@@ -93,19 +101,19 @@ def migrate(conn: Connection) -> None:
 
 
 def upsert_oidc_user(
-    conn: Connection, issuer: str, subject: str, email: str, display_name: str,
+    conn: DBConnection, issuer: str, subject: str, email: str, display_name: str,
 ) -> dict[str, Any]:
-    return conn.execute(
+    return _required_row(conn.execute(
         """INSERT INTO users(id,issuer,subject,email,display_name)
            VALUES (%s,%s,%s,%s,%s)
            ON CONFLICT (issuer,subject) DO UPDATE SET email=EXCLUDED.email,
              display_name=EXCLUDED.display_name,updated_at=clock_timestamp()
            RETURNING id,email,display_name,status""",
         (str(uuid.uuid4()), issuer, subject, email.lower(), display_name[:100]),
-    ).fetchone()
+    ).fetchone())
 
 
-def create_auth_session(conn: Connection, user_id: str, request_id: str, ttl_seconds: int) -> str:
+def create_auth_session(conn: DBConnection, user_id: str, request_id: str, ttl_seconds: int) -> str:
     token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     conn.execute(
@@ -120,7 +128,7 @@ def create_auth_session(conn: Connection, user_id: str, request_id: str, ttl_sec
     return token
 
 
-def auth_session(conn: Connection, token: str) -> dict[str, Any] | None:
+def auth_session(conn: DBConnection, token: str) -> dict[str, Any] | None:
     if not 32 <= len(token) <= 256:
         return None
     return conn.execute(
@@ -132,7 +140,7 @@ def auth_session(conn: Connection, token: str) -> dict[str, Any] | None:
     ).fetchone()
 
 
-def revoke_auth_session(conn: Connection, token_hash: str, request_id: str) -> bool:
+def revoke_auth_session(conn: DBConnection, token_hash: str, request_id: str) -> bool:
     session = conn.execute(
         """UPDATE auth_sessions SET revoked_at=clock_timestamp()
            WHERE token_hash=%s AND revoked_at IS NULL RETURNING user_id""",
@@ -148,27 +156,27 @@ def revoke_auth_session(conn: Connection, token_hash: str, request_id: str) -> b
 
 
 def create_workspace_metrics_token(
-    conn: Connection, workspace_id: str, actor_id: str, name: str, token_hash: str, request_id: str,
+    conn: DBConnection, workspace_id: str, actor_id: str, name: str, token_hash: str, request_id: str,
 ) -> dict[str, Any]:
-    token = conn.execute(
+    token = _required_row(conn.execute(
         """INSERT INTO workspace_metrics_tokens(id,workspace_id,name,token_hash,created_by)
            VALUES (%s,%s,%s,%s,%s) RETURNING id,name,created_at""",
         (str(uuid.uuid4()), workspace_id, name, token_hash, actor_id),
-    ).fetchone()
+    ).fetchone())
     token["id"] = str(token["id"])
     emit_event(conn, workspace_id, "workspace.metrics_token_created", request_id=request_id,
                data={"token_id": token["id"], "name": name, "actor_user_id": actor_id})
     return token
 
 
-def workspace_metrics_token(conn: Connection, token_hash: str) -> dict[str, Any] | None:
+def workspace_metrics_token(conn: DBConnection, token_hash: str) -> dict[str, Any] | None:
     return conn.execute(
         """SELECT id,workspace_id FROM workspace_metrics_tokens
            WHERE token_hash=%s AND revoked_at IS NULL""", (token_hash,),
     ).fetchone()
 
 
-def list_workspace_metrics_tokens(conn: Connection, workspace_id: str) -> list[dict[str, Any]]:
+def list_workspace_metrics_tokens(conn: DBConnection, workspace_id: str) -> list[dict[str, Any]]:
     return conn.execute(
         """SELECT id,name,created_at,revoked_at FROM workspace_metrics_tokens
            WHERE workspace_id=%s ORDER BY created_at DESC""", (workspace_id,),
@@ -176,7 +184,7 @@ def list_workspace_metrics_tokens(conn: Connection, workspace_id: str) -> list[d
 
 
 def revoke_workspace_metrics_token(
-    conn: Connection, workspace_id: str, token_id: str, actor_id: str, request_id: str,
+    conn: DBConnection, workspace_id: str, token_id: str, actor_id: str, request_id: str,
 ) -> bool:
     changed = conn.execute(
         """UPDATE workspace_metrics_tokens SET revoked_at=clock_timestamp()
@@ -191,15 +199,15 @@ def revoke_workspace_metrics_token(
 
 
 def create_workspace_api_token(
-    conn: Connection, workspace_id: str, actor_id: str, name: str, token_hash: str,
+    conn: DBConnection, workspace_id: str, actor_id: str, name: str, token_hash: str,
     expires_in_days: int, request_id: str,
 ) -> dict[str, Any]:
-    token = conn.execute(
+    token = _required_row(conn.execute(
         """INSERT INTO workspace_api_tokens(id,workspace_id,user_id,name,token_hash,expires_at)
            VALUES (%s,%s,%s,%s,%s,clock_timestamp()+(%s * interval '1 day'))
            RETURNING id,name,created_at,expires_at""",
         (str(uuid.uuid4()), workspace_id, actor_id, name, token_hash, expires_in_days),
-    ).fetchone()
+    ).fetchone())
     token["id"] = str(token["id"])
     emit_event(conn, workspace_id, "workspace.api_token_created", request_id=request_id,
                data={"token_id": token["id"], "name": name, "actor_user_id": actor_id,
@@ -207,7 +215,7 @@ def create_workspace_api_token(
     return token
 
 
-def workspace_api_token(conn: Connection, token_hash: str) -> dict[str, Any] | None:
+def workspace_api_token(conn: DBConnection, token_hash: str) -> dict[str, Any] | None:
     return conn.execute(
         """SELECT t.workspace_id,t.user_id,t.token_hash,u.email,u.display_name
            FROM workspace_api_tokens t JOIN users u ON u.id=t.user_id
@@ -217,7 +225,7 @@ def workspace_api_token(conn: Connection, token_hash: str) -> dict[str, Any] | N
     ).fetchone()
 
 
-def list_workspace_api_tokens(conn: Connection, workspace_id: str) -> list[dict[str, Any]]:
+def list_workspace_api_tokens(conn: DBConnection, workspace_id: str) -> list[dict[str, Any]]:
     return conn.execute(
         """SELECT id,name,created_at,expires_at,revoked_at FROM workspace_api_tokens
            WHERE workspace_id=%s ORDER BY created_at DESC""", (workspace_id,),
@@ -225,7 +233,7 @@ def list_workspace_api_tokens(conn: Connection, workspace_id: str) -> list[dict[
 
 
 def revoke_workspace_api_token(
-    conn: Connection, workspace_id: str, token_id: str, actor_id: str, request_id: str,
+    conn: DBConnection, workspace_id: str, token_id: str, actor_id: str, request_id: str,
 ) -> bool:
     changed = conn.execute(
         """UPDATE workspace_api_tokens SET revoked_at=clock_timestamp()
@@ -239,7 +247,7 @@ def revoke_workspace_api_token(
     return True
 
 
-def list_user_workspaces(conn: Connection, user_id: str) -> list[dict[str, Any]]:
+def list_user_workspaces(conn: DBConnection, user_id: str) -> list[dict[str, Any]]:
     return conn.execute(
         """SELECT w.id,w.name,m.role FROM workspace_members m
            JOIN workspaces w ON w.id=m.workspace_id
@@ -248,7 +256,7 @@ def list_user_workspaces(conn: Connection, user_id: str) -> list[dict[str, Any]]
     ).fetchall()
 
 
-def workspace_membership(conn: Connection, workspace_id: str, user_id: str) -> dict[str, Any] | None:
+def workspace_membership(conn: DBConnection, workspace_id: str, user_id: str) -> dict[str, Any] | None:
     return conn.execute(
         """SELECT w.id AS workspace_id,m.role FROM workspace_members m
            JOIN workspaces w ON w.id=m.workspace_id
@@ -258,7 +266,7 @@ def workspace_membership(conn: Connection, workspace_id: str, user_id: str) -> d
 
 
 def create_github_oauth_state(
-    conn: Connection, workspace_id: str, user_id: str, state_hash: str, verifier_encrypted: str,
+    conn: DBConnection, workspace_id: str, user_id: str, state_hash: str, verifier_encrypted: str,
 ) -> None:
     conn.execute("DELETE FROM github_oauth_states WHERE expires_at<=clock_timestamp()")
     conn.execute(
@@ -267,7 +275,7 @@ def create_github_oauth_state(
     )
 
 
-def github_oauth_state(conn: Connection, state_hash: str) -> dict[str, Any] | None:
+def github_oauth_state(conn: DBConnection, state_hash: str) -> dict[str, Any] | None:
     return conn.execute(
         """SELECT state_hash,workspace_id,user_id,installation_id,verifier_encrypted
            FROM github_oauth_states WHERE state_hash=%s AND expires_at>clock_timestamp()""",
@@ -275,11 +283,11 @@ def github_oauth_state(conn: Connection, state_hash: str) -> dict[str, Any] | No
     ).fetchone()
 
 
-def discard_github_oauth_state(conn: Connection, state_hash: str) -> None:
+def discard_github_oauth_state(conn: DBConnection, state_hash: str) -> None:
     conn.execute("DELETE FROM github_oauth_states WHERE state_hash=%s", (state_hash,))
 
 
-def bind_github_oauth_installation(conn: Connection, state_hash: str, installation_id: int) -> bool:
+def bind_github_oauth_installation(conn: DBConnection, state_hash: str, installation_id: int) -> bool:
     return bool(conn.execute(
         """UPDATE github_oauth_states SET installation_id=%s
            WHERE state_hash=%s AND expires_at>clock_timestamp()
@@ -289,7 +297,7 @@ def bind_github_oauth_installation(conn: Connection, state_hash: str, installati
 
 
 def finish_github_installation(
-    conn: Connection, state_hash: str, user_id: str, installation_id: int,
+    conn: DBConnection, state_hash: str, user_id: str, installation_id: int,
     account_id: int, account_login: str, account_type: str, request_id: str, encryption_key: bytes,
 ) -> dict[str, Any] | None:
     state = conn.execute(
@@ -360,7 +368,7 @@ def finish_github_installation(
             "status": "active", "account_login": account_login, "created": True}
 
 
-def github_installation_for_workspace(conn: Connection, workspace_id: str) -> dict[str, Any] | None:
+def github_installation_for_workspace(conn: DBConnection, workspace_id: str) -> dict[str, Any] | None:
     return conn.execute(
         """SELECT installation_id,endpoint_id,account_id,account_login,account_type,status,created_at
            FROM github_installations WHERE workspace_id=%s ORDER BY created_at DESC LIMIT 1""",
@@ -368,7 +376,7 @@ def github_installation_for_workspace(conn: Connection, workspace_id: str) -> di
     ).fetchone()
 
 
-def github_installation_for_delivery(conn: Connection, installation_id: int) -> dict[str, Any] | None:
+def github_installation_for_delivery(conn: DBConnection, installation_id: int) -> dict[str, Any] | None:
     return conn.execute(
         """SELECT g.workspace_id,g.endpoint_id,g.status,s.version
            FROM github_installations g JOIN webhook_secrets s ON s.endpoint_id=g.endpoint_id
@@ -379,7 +387,7 @@ def github_installation_for_delivery(conn: Connection, installation_id: int) -> 
     ).fetchone()
 
 
-def update_github_installation_status(conn: Connection, installation_id: int, action: str,
+def update_github_installation_status(conn: DBConnection, installation_id: int, action: str,
                                      request_id: str) -> bool:
     statuses = {"suspend": "suspended", "unsuspend": "active", "deleted": "revoked"}
     status = statuses.get(action)
@@ -403,7 +411,7 @@ def update_github_installation_status(conn: Connection, installation_id: int, ac
     return True
 
 
-def revoke_github_installation(conn: Connection, workspace_id: str, request_id: str) -> bool:
+def revoke_github_installation(conn: DBConnection, workspace_id: str, request_id: str) -> bool:
     row = conn.execute(
         """UPDATE github_installations SET status='revoked',updated_at=clock_timestamp()
            WHERE workspace_id=%s AND status<>'revoked' RETURNING installation_id,endpoint_id""",
@@ -421,7 +429,7 @@ def revoke_github_installation(conn: Connection, workspace_id: str, request_id: 
     return True
 
 
-def create_slack_oauth_state(conn: Connection, workspace_id: str, user_id: str, state_hash: str) -> None:
+def create_slack_oauth_state(conn: DBConnection, workspace_id: str, user_id: str, state_hash: str) -> None:
     conn.execute("DELETE FROM slack_oauth_states WHERE expires_at<=clock_timestamp()")
     conn.execute(
         "INSERT INTO slack_oauth_states(state_hash,workspace_id,user_id) VALUES (%s,%s,%s)",
@@ -429,19 +437,19 @@ def create_slack_oauth_state(conn: Connection, workspace_id: str, user_id: str, 
     )
 
 
-def slack_oauth_state(conn: Connection, state_hash: str) -> dict[str, Any] | None:
+def slack_oauth_state(conn: DBConnection, state_hash: str) -> dict[str, Any] | None:
     return conn.execute(
         """SELECT workspace_id,user_id FROM slack_oauth_states
            WHERE state_hash=%s AND expires_at>clock_timestamp()""", (state_hash,),
     ).fetchone()
 
 
-def discard_slack_oauth_state(conn: Connection, state_hash: str) -> None:
+def discard_slack_oauth_state(conn: DBConnection, state_hash: str) -> None:
     conn.execute("DELETE FROM slack_oauth_states WHERE state_hash=%s", (state_hash,))
 
 
 def finish_slack_installation(
-    conn: Connection, state_hash: str, user_id: str, team_id: str, team_name: str, bot_user_id: str,
+    conn: DBConnection, state_hash: str, user_id: str, team_id: str, team_name: str, bot_user_id: str,
     bot_token: str, request_id: str, encryption_key: bytes,
 ) -> dict[str, Any] | None:
     state = conn.execute(
@@ -513,14 +521,14 @@ def finish_slack_installation(
             "status": "active", "created": current is None}
 
 
-def slack_installation_for_workspace(conn: Connection, workspace_id: str) -> dict[str, Any] | None:
+def slack_installation_for_workspace(conn: DBConnection, workspace_id: str) -> dict[str, Any] | None:
     return conn.execute(
         """SELECT team_id,team_name,endpoint_id,status,created_at FROM slack_installations
            WHERE workspace_id=%s ORDER BY created_at DESC LIMIT 1""", (workspace_id,),
     ).fetchone()
 
 
-def slack_action_credential_id(conn: Connection, workspace_id: str) -> str | None:
+def slack_action_credential_id(conn: DBConnection, workspace_id: str) -> str | None:
     row = conn.execute(
         """SELECT s.credential_id FROM slack_installations s
            JOIN integration_credentials c ON c.id=s.credential_id
@@ -532,7 +540,7 @@ def slack_action_credential_id(conn: Connection, workspace_id: str) -> str | Non
     return row["credential_id"] if row else None
 
 
-def slack_installation_for_delivery(conn: Connection, team_id: str) -> dict[str, Any] | None:
+def slack_installation_for_delivery(conn: DBConnection, team_id: str) -> dict[str, Any] | None:
     return conn.execute(
         """SELECT s.workspace_id,s.endpoint_id,s.credential_id,w.version
            FROM slack_installations s JOIN webhook_secrets w ON w.endpoint_id=s.endpoint_id
@@ -542,7 +550,7 @@ def slack_installation_for_delivery(conn: Connection, team_id: str) -> dict[str,
     ).fetchone()
 
 
-def _revoke_slack_installation(conn: Connection, row: dict[str, Any], request_id: str) -> None:
+def _revoke_slack_installation(conn: DBConnection, row: dict[str, Any], request_id: str) -> None:
     conn.execute("UPDATE webhook_endpoints SET revoked_at=clock_timestamp() WHERE id=%s AND revoked_at IS NULL",
                  (row["endpoint_id"],))
     conn.execute("""UPDATE webhook_secrets SET revoked_at=clock_timestamp()
@@ -555,7 +563,7 @@ def _revoke_slack_installation(conn: Connection, row: dict[str, Any], request_id
                data={"team_id": row["team_id"]})
 
 
-def update_slack_installation_status(conn: Connection, team_id: str, request_id: str) -> bool:
+def update_slack_installation_status(conn: DBConnection, team_id: str, request_id: str) -> bool:
     row = conn.execute(
         """UPDATE slack_installations SET status='revoked',updated_at=clock_timestamp()
            WHERE team_id=%s AND status='active'
@@ -567,7 +575,7 @@ def update_slack_installation_status(conn: Connection, team_id: str, request_id:
     return True
 
 
-def revoke_slack_installation(conn: Connection, workspace_id: str, request_id: str) -> bool:
+def revoke_slack_installation(conn: DBConnection, workspace_id: str, request_id: str) -> bool:
     row = conn.execute(
         """UPDATE slack_installations SET status='revoked',updated_at=clock_timestamp()
            WHERE workspace_id=%s AND status='active'
@@ -580,7 +588,7 @@ def revoke_slack_installation(conn: Connection, workspace_id: str, request_id: s
     return True
 
 
-def create_workspace(conn: Connection, user_id: str, name: str, request_id: str) -> dict[str, Any]:
+def create_workspace(conn: DBConnection, user_id: str, name: str, request_id: str) -> dict[str, Any]:
     workspace_id = str(uuid.uuid4())
     conn.execute("INSERT INTO workspaces(id,name,created_by) VALUES (%s,%s,%s)",
                  (workspace_id, name.strip(), user_id))
@@ -593,7 +601,7 @@ def create_workspace(conn: Connection, user_id: str, name: str, request_id: str)
     return {"id": workspace_id, "name": name.strip(), "role": "OWNER"}
 
 
-def workspace_members(conn: Connection, workspace_id: str) -> list[dict[str, Any]]:
+def workspace_members(conn: DBConnection, workspace_id: str) -> list[dict[str, Any]]:
     return conn.execute(
         """SELECT u.id AS user_id,u.email,u.display_name,m.role,m.created_at,m.updated_at
            FROM workspace_members m JOIN users u ON u.id=m.user_id
@@ -603,7 +611,7 @@ def workspace_members(conn: Connection, workspace_id: str) -> list[dict[str, Any
 
 
 def set_workspace_member(
-    conn: Connection, workspace_id: str, actor_id: str, target_id: str, role: str, request_id: str,
+    conn: DBConnection, workspace_id: str, actor_id: str, target_id: str, role: str, request_id: str,
 ) -> bool:
     conn.execute("SELECT id FROM workspaces WHERE id=%s FOR UPDATE", (workspace_id,))
     target = conn.execute("SELECT id FROM users WHERE id=%s", (target_id,)).fetchone()
@@ -621,10 +629,10 @@ def set_workspace_member(
         if not actor or actor["role"] != "OWNER":
             raise WorkspaceOwnerActionForbidden
     if existing and existing["role"] == "OWNER" and role != "OWNER":
-        owners = conn.execute(
+        owners = _required_row(conn.execute(
             "SELECT count(*) AS n FROM workspace_members WHERE workspace_id=%s AND role='OWNER'",
             (workspace_id,),
-        ).fetchone()["n"]
+        ).fetchone())["n"]
         if owners < 2:
             raise LastWorkspaceOwner
     conn.execute(
@@ -640,7 +648,7 @@ def set_workspace_member(
 
 
 def remove_workspace_member(
-    conn: Connection, workspace_id: str, actor_id: str, target_id: str, request_id: str,
+    conn: DBConnection, workspace_id: str, actor_id: str, target_id: str, request_id: str,
 ) -> bool:
     conn.execute("SELECT id FROM workspaces WHERE id=%s FOR UPDATE", (workspace_id,))
     member = conn.execute(
@@ -656,10 +664,10 @@ def remove_workspace_member(
         ).fetchone()
         if not actor or actor["role"] != "OWNER":
             raise WorkspaceOwnerActionForbidden
-        owners = conn.execute(
+        owners = _required_row(conn.execute(
             "SELECT count(*) AS n FROM workspace_members WHERE workspace_id=%s AND role='OWNER'",
             (workspace_id,),
-        ).fetchone()["n"]
+        ).fetchone())["n"]
         if owners < 2:
             raise LastWorkspaceOwner
     conn.execute("DELETE FROM workspace_members WHERE workspace_id=%s AND user_id=%s",
@@ -670,7 +678,7 @@ def remove_workspace_member(
 
 
 def emit_event(
-    conn: Connection,
+    conn: DBConnection,
     tenant_id: str,
     kind: str,
     *,
@@ -693,7 +701,7 @@ def emit_event(
 
 
 def create_webhook_endpoint(
-    conn: Connection, workspace_id: str, actor_id: str, name: str, idempotency_key: str,
+    conn: DBConnection, workspace_id: str, actor_id: str, name: str, idempotency_key: str,
     request_id: str, encryption_key: bytes,
 ) -> dict[str, Any]:
     fingerprint = hashlib.sha256(name.encode()).hexdigest()
@@ -733,7 +741,7 @@ def create_webhook_endpoint(
     return {"id": endpoint_id, "name": name, "secret": secret, "created": True}
 
 
-def list_webhook_endpoints(conn: Connection, workspace_id: str) -> list[dict[str, Any]]:
+def list_webhook_endpoints(conn: DBConnection, workspace_id: str) -> list[dict[str, Any]]:
     return conn.execute(
         """SELECT id,name,created_at,revoked_at,last_received_at
            FROM webhook_endpoints WHERE workspace_id=%s AND source='custom' ORDER BY created_at DESC""",
@@ -742,7 +750,7 @@ def list_webhook_endpoints(conn: Connection, workspace_id: str) -> list[dict[str
 
 
 def create_workspace_credential(
-    conn: Connection, workspace_id: str, actor_id: str, provider: str, name: str, secret: str,
+    conn: DBConnection, workspace_id: str, actor_id: str, provider: str, name: str, secret: str,
     allowed_host: str | None,
     idempotency_key: str, request_id: str, encryption_key: bytes,
 ) -> dict[str, Any]:
@@ -761,12 +769,12 @@ def create_workspace_credential(
             "created": False}
 
     credential_id = str(uuid.uuid4())
-    created_at = conn.execute(
+    created_at = _required_row(conn.execute(
         """INSERT INTO integration_credentials
            (id,workspace_id,provider,name,allowed_host,created_by,creation_key,creation_fingerprint)
            VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING created_at""",
         (credential_id, workspace_id, provider, name, allowed_host, actor_id, idempotency_key, fingerprint),
-    ).fetchone()
+    ).fetchone())
     conn.execute(
         """INSERT INTO integration_credential_secrets
            (credential_id,version,encrypted_secret,idempotency_key,secret_fingerprint)
@@ -779,7 +787,7 @@ def create_workspace_credential(
             "created_at": created_at["created_at"], "created": True}
 
 
-def list_workspace_credentials(conn: Connection, workspace_id: str) -> list[dict[str, Any]]:
+def list_workspace_credentials(conn: DBConnection, workspace_id: str) -> list[dict[str, Any]]:
     return conn.execute(
         """SELECT id,provider,name,allowed_host,created_at,revoked_at,
                   (SELECT max(version) FROM integration_credential_secrets s WHERE s.credential_id=c.id) AS version
@@ -789,7 +797,7 @@ def list_workspace_credentials(conn: Connection, workspace_id: str) -> list[dict
 
 
 def rotate_workspace_credential(
-    conn: Connection, workspace_id: str, credential_id: str, actor_id: str, secret: str,
+    conn: DBConnection, workspace_id: str, credential_id: str, actor_id: str, secret: str,
     idempotency_key: str, request_id: str, encryption_key: bytes,
 ) -> dict[str, Any] | None:
     credential = conn.execute(
@@ -833,7 +841,7 @@ def rotate_workspace_credential(
 
 
 def revoke_workspace_credential(
-    conn: Connection, workspace_id: str, credential_id: str, actor_id: str, request_id: str,
+    conn: DBConnection, workspace_id: str, credential_id: str, actor_id: str, request_id: str,
 ) -> bool:
     changed = conn.execute(
         """UPDATE integration_credentials SET revoked_at=clock_timestamp()
@@ -851,7 +859,7 @@ def revoke_workspace_credential(
 
 
 def workspace_credential_secret(
-    conn: Connection, workspace_id: str, credential_id: str, encryption_key: bytes,
+    conn: DBConnection, workspace_id: str, credential_id: str, encryption_key: bytes,
 ) -> dict[str, Any] | None:
     row = conn.execute(
         """SELECT c.provider,c.allowed_host,s.encrypted_secret FROM integration_credentials c
@@ -865,7 +873,7 @@ def workspace_credential_secret(
             "secret": decrypt_secret(row["encrypted_secret"], encryption_key)}
 
 
-def active_workspace_credential(conn: Connection, workspace_id: str, credential_id: str,
+def active_workspace_credential(conn: DBConnection, workspace_id: str, credential_id: str,
                                 provider: str, allowed_host: str | None = None) -> bool:
     return bool(conn.execute(
         """SELECT 1 FROM integration_credentials c
@@ -878,7 +886,7 @@ def active_workspace_credential(conn: Connection, workspace_id: str, credential_
 
 
 def rotate_webhook_secret(
-    conn: Connection, workspace_id: str, endpoint_id: str, actor_id: str, idempotency_key: str,
+    conn: DBConnection, workspace_id: str, endpoint_id: str, actor_id: str, idempotency_key: str,
     request_id: str, encryption_key: bytes,
 ) -> dict[str, Any] | None:
     endpoint = conn.execute(
@@ -919,7 +927,7 @@ def rotate_webhook_secret(
 
 
 def revoke_webhook_endpoint(
-    conn: Connection, workspace_id: str, endpoint_id: str, actor_id: str, request_id: str,
+    conn: DBConnection, workspace_id: str, endpoint_id: str, actor_id: str, request_id: str,
 ) -> bool:
     endpoint = conn.execute(
         """UPDATE webhook_endpoints SET revoked_at=clock_timestamp()
@@ -937,7 +945,7 @@ def revoke_webhook_endpoint(
     return True
 
 
-def webhook_signing_info(conn: Connection, endpoint_id: str) -> dict[str, Any] | None:
+def webhook_signing_info(conn: DBConnection, endpoint_id: str) -> dict[str, Any] | None:
     return conn.execute(
         """SELECT e.workspace_id,e.source,s.version,s.encrypted_secret
            FROM webhook_endpoints e JOIN webhook_secrets s ON s.endpoint_id=e.id
@@ -946,7 +954,7 @@ def webhook_signing_info(conn: Connection, endpoint_id: str) -> dict[str, Any] |
 
 
 def persist_webhook_event(
-    conn: Connection, workspace_id: str, endpoint_id: str, secret_version: int, event_key: str,
+    conn: DBConnection, workspace_id: str, endpoint_id: str, secret_version: int, event_key: str,
     request_id: str, body: bytes, payload: dict[str, Any], *, allow_workflow_triggers: bool = False,
     allow_http_workflow_triggers: bool = False,
 ) -> dict[str, Any]:
@@ -975,10 +983,10 @@ def persist_webhook_event(
          Jsonb(payload), stored_event_type),
     ).fetchone()
     if not inserted:
-        previous = conn.execute(
+        previous = _required_row(conn.execute(
             """SELECT id,payload_sha256 FROM incoming_events
                WHERE endpoint_id=%s AND event_key=%s""", (endpoint_id, event_key)
-        ).fetchone()
+        ).fetchone())
         if previous["payload_sha256"] != payload_hash:
             raise IdempotencyConflict
         return {"id": previous["id"], "duplicate": True}
@@ -1023,7 +1031,7 @@ def persist_webhook_event(
 
 
 def list_incoming_events(
-    conn: Connection, workspace_id: str, limit: int,
+    conn: DBConnection, workspace_id: str, limit: int,
     before: tuple[Any, str] | None = None,
 ) -> list[dict[str, Any]]:
     query = """SELECT i.id,i.endpoint_id,e.name AS endpoint_name,i.event_key,
@@ -1038,7 +1046,7 @@ def list_incoming_events(
                         (*params, limit + 1)).fetchall()
 
 
-def expire_webhook_payloads(conn: Connection, batch_size: int = 500) -> int:
+def expire_webhook_payloads(conn: DBConnection, batch_size: int = 500) -> int:
     with conn.transaction():
         candidate_ids = [row["id"] for row in conn.execute(
             """SELECT i.id FROM incoming_events i
@@ -1078,39 +1086,39 @@ def expire_webhook_payloads(conn: Connection, batch_size: int = 500) -> int:
     return len(rows)
 
 
-def _admit(conn: Connection, tenant_id: str) -> None:
+def _admit(conn: DBConnection, tenant_id: str) -> None:
     admit_rate_limit(conn, tenant_id)
-    pending = conn.execute(
+    pending = _required_row(conn.execute(
         "SELECT count(*) AS count FROM tasks WHERE tenant_id=%s AND status IN ('queued','retry_wait','running')",
         (tenant_id,),
-    ).fetchone()["count"]
+    ).fetchone())["count"]
     if pending >= MAX_QUEUE_DEPTH:
         raise QueueFull
 
 
-def admit_rate_limit(conn: Connection, tenant_id: str) -> None:
+def admit_rate_limit(conn: DBConnection, tenant_id: str) -> None:
     conn.execute(
         "DELETE FROM rate_limits WHERE window_start<date_trunc('minute',clock_timestamp())-interval '1 hour'"
     )
-    rate = conn.execute(
+    rate = _required_row(conn.execute(
         """INSERT INTO rate_limits(tenant_id,window_start,request_count)
            VALUES (%s,date_trunc('minute',clock_timestamp()),1)
            ON CONFLICT (tenant_id,window_start) DO UPDATE
              SET request_count=rate_limits.request_count+1
            RETURNING request_count""",
         (tenant_id,),
-    ).fetchone()["request_count"]
+    ).fetchone())["request_count"]
     if rate > RATE_LIMIT_PER_MINUTE:
         raise RateLimited
 
 
-def _lock_tenant(conn: Connection, tenant_id: str) -> None:
+def _lock_tenant(conn: DBConnection, tenant_id: str) -> None:
     conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (tenant_id,))
 
 
 def _workflow_definition(title: str, steps: list[dict[str, Any]],
                          trigger: dict[str, Any] | None = None) -> dict[str, Any]:
-    definition = {"title": title, "steps": steps}
+    definition: dict[str, Any] = {"title": title, "steps": steps}
     if trigger:
         definition["trigger"] = {"type": "webhook", **trigger}
     return definition
@@ -1124,7 +1132,7 @@ def _definition_fingerprint(title: str, steps: list[dict[str, Any]],
 
 
 def _validate_workflow_trigger(
-    conn: Connection, tenant_id: str, trigger: dict[str, Any] | None,
+    conn: DBConnection, tenant_id: str, trigger: dict[str, Any] | None,
 ) -> None:
     if trigger and not conn.execute(
         """SELECT 1 FROM webhook_endpoints WHERE id=%s AND workspace_id=%s AND revoked_at IS NULL""",
@@ -1134,7 +1142,7 @@ def _validate_workflow_trigger(
 
 
 def create_workflow_definition(
-    conn: Connection,
+    conn: DBConnection,
     tenant_id: str,
     title: str,
     steps: list[dict[str, Any]],
@@ -1157,6 +1165,7 @@ def create_workflow_definition(
             "SELECT id FROM workflow_versions WHERE tenant_id=%s AND workflow_id=%s AND version_number=1",
             (tenant_id, existing["id"]),
         ).fetchone()
+        assert version is not None
         return {"id": existing["id"], "version_id": version["id"], "version": 1, "created": False}
 
     _validate_workflow_trigger(conn, tenant_id, trigger)
@@ -1182,7 +1191,7 @@ def create_workflow_definition(
 
 
 def add_workflow_version(
-    conn: Connection,
+    conn: DBConnection,
     tenant_id: str,
     workflow_id: str,
     title: str,
@@ -1235,7 +1244,7 @@ def add_workflow_version(
     return {"id": version_id, "version": version_number, "created": True}
 
 
-def list_workflow_definitions(conn: Connection, tenant_id: str) -> list[dict[str, Any]]:
+def list_workflow_definitions(conn: DBConnection, tenant_id: str) -> list[dict[str, Any]]:
     return conn.execute(
         """SELECT id,title,status,current_version,created_at,updated_at
            FROM workflow_definitions WHERE tenant_id=%s ORDER BY updated_at DESC LIMIT 100""",
@@ -1243,7 +1252,7 @@ def list_workflow_definitions(conn: Connection, tenant_id: str) -> list[dict[str
     ).fetchall()
 
 
-def get_workflow_definition(conn: Connection, tenant_id: str, workflow_id: str) -> dict[str, Any] | None:
+def get_workflow_definition(conn: DBConnection, tenant_id: str, workflow_id: str) -> dict[str, Any] | None:
     workflow = conn.execute(
         """SELECT id,title,status,current_version,created_at,updated_at
            FROM workflow_definitions WHERE tenant_id=%s AND id=%s""",
@@ -1261,7 +1270,7 @@ def get_workflow_definition(conn: Connection, tenant_id: str, workflow_id: str) 
 
 
 def trigger_workflow_definition(
-    conn: Connection,
+    conn: DBConnection,
     tenant_id: str,
     workflow_id: str,
     idempotency_key: str,
@@ -1310,7 +1319,7 @@ def _schedule_fingerprint(workflow_id: str, name: str, interval_seconds: int) ->
 
 
 def workflow_schedule_idempotent_result(
-    conn: Connection, tenant_id: str, workflow_id: str, name: str,
+    conn: DBConnection, tenant_id: str, workflow_id: str, name: str,
     interval_seconds: int, idempotency_key: str,
 ) -> dict[str, Any] | None:
     fingerprint = _schedule_fingerprint(workflow_id, name, interval_seconds)
@@ -1322,10 +1331,11 @@ def workflow_schedule_idempotent_result(
         return None
     if existing["fingerprint"] != fingerprint:
         raise IdempotencyConflict
-    return {**get_workflow_schedule(conn, tenant_id, existing["id"]), "created": False}
+    schedule = get_workflow_schedule(conn, tenant_id, existing["id"])
+    return {**schedule, "created": False} if schedule else None
 
 
-def list_workflow_schedules(conn: Connection, tenant_id: str) -> list[dict[str, Any]]:
+def list_workflow_schedules(conn: DBConnection, tenant_id: str) -> list[dict[str, Any]]:
     return conn.execute(
         """SELECT s.id,s.workflow_id,s.name,s.interval_seconds,s.status,s.next_run_at,
                   s.last_run_at,s.last_run_id,r.status AS last_run_status,s.pause_reason,
@@ -1337,7 +1347,7 @@ def list_workflow_schedules(conn: Connection, tenant_id: str) -> list[dict[str, 
     ).fetchall()
 
 
-def get_workflow_schedule(conn: Connection, tenant_id: str, schedule_id: str) -> dict[str, Any] | None:
+def get_workflow_schedule(conn: DBConnection, tenant_id: str, schedule_id: str) -> dict[str, Any] | None:
     return conn.execute(
         """SELECT s.id,s.workflow_id,s.name,s.interval_seconds,s.status,s.next_run_at,
                   s.last_run_at,s.last_run_id,r.status AS last_run_status,s.pause_reason,
@@ -1350,7 +1360,7 @@ def get_workflow_schedule(conn: Connection, tenant_id: str, schedule_id: str) ->
 
 
 def create_workflow_schedule(
-    conn: Connection, tenant_id: str, workflow_id: str, name: str, interval_seconds: int,
+    conn: DBConnection, tenant_id: str, workflow_id: str, name: str, interval_seconds: int,
     idempotency_key: str, request_id: str, created_by: str | None = None,
 ) -> dict[str, Any] | None:
     _lock_tenant(conn, tenant_id)
@@ -1359,10 +1369,10 @@ def create_workflow_schedule(
     )
     if existing:
         return existing
-    active_count = conn.execute(
+    active_count = _required_row(conn.execute(
         "SELECT count(*) AS count FROM workflow_schedules WHERE tenant_id=%s AND status IN ('active','paused')",
         (tenant_id,),
-    ).fetchone()["count"]
+    ).fetchone())["count"]
     if active_count >= MAX_SCHEDULES_PER_TENANT:
         raise ScheduleLimitReached
     admit_rate_limit(conn, tenant_id)
@@ -1391,11 +1401,12 @@ def create_workflow_schedule(
     emit_event(conn, tenant_id, "schedule.created", request_id=request_id,
                data={"schedule_id": schedule_id, "workflow_id": workflow_id,
                      "interval_seconds": interval_seconds, "actor_user_id": created_by})
-    return {**get_workflow_schedule(conn, tenant_id, schedule_id), "created": True}
+    schedule = get_workflow_schedule(conn, tenant_id, schedule_id)
+    return {**schedule, "created": True} if schedule else None
 
 
 def set_workflow_schedule_status(
-    conn: Connection, tenant_id: str, schedule_id: str, status: str, request_id: str,
+    conn: DBConnection, tenant_id: str, schedule_id: str, status: str, request_id: str,
     actor_user_id: str | None = None,
 ) -> dict[str, Any] | None:
     schedule = conn.execute(
@@ -1438,7 +1449,7 @@ def set_workflow_schedule_status(
     return get_workflow_schedule(conn, tenant_id, schedule_id)
 
 
-def dispatch_due_schedules(conn: Connection, batch_size: int = 20) -> int:
+def dispatch_due_schedules(conn: DBConnection, batch_size: int = 20) -> int:
     dispatched = 0
     blocked_tenants: set[str] = set()
     for _ in range(batch_size):
@@ -1514,7 +1525,7 @@ def dispatch_due_schedules(conn: Connection, batch_size: int = 20) -> int:
 
 
 def create_workflow(
-    conn: Connection,
+    conn: DBConnection,
     tenant_id: str,
     title: str,
     steps: list[dict[str, Any]],
@@ -1576,7 +1587,7 @@ def create_workflow(
 
 
 def ingest_business_event(
-    conn: Connection,
+    conn: DBConnection,
     tenant_id: str,
     event_key: str,
     payload: dict[str, Any],
@@ -1606,12 +1617,12 @@ def ingest_business_event(
         )
         received_count, created = 1, run["created"]
     else:
-        row = conn.execute(
+        row = _required_row(conn.execute(
             """UPDATE business_events SET received_count=received_count+1,
                       last_received_at=clock_timestamp()
                WHERE tenant_id=%s AND event_key=%s RETURNING received_count,run_id,payload""",
             (tenant_id, event_key),
-        ).fetchone()
+        ).fetchone())
         if row["payload"] != payload:
             raise IdempotencyConflict
         received_count, created = row["received_count"], False
@@ -1622,7 +1633,7 @@ def ingest_business_event(
     return {"event_key": event_key, "received": received_count, "workflow_id": run["id"], "created": created}
 
 
-def claim_task(conn: Connection, worker_id: str, lease_seconds: float,
+def claim_task(conn: DBConnection, worker_id: str, lease_seconds: float,
                *, tenant_id: str | None = None) -> dict[str, Any] | None:
     with conn.transaction():
         tenant_filter = "AND t.tenant_id=%s" if tenant_id else ""
@@ -1663,7 +1674,7 @@ def claim_task(conn: Connection, worker_id: str, lease_seconds: float,
         return task
 
 
-def heartbeat(conn: Connection, worker_id: str, task_id: str | None, lease_seconds: float) -> None:
+def heartbeat(conn: DBConnection, worker_id: str, task_id: str | None, lease_seconds: float) -> None:
     with conn.transaction():
         conn.execute(
             """INSERT INTO workers(id,pid,host) VALUES (%s,%s,%s)
@@ -1680,11 +1691,11 @@ def heartbeat(conn: Connection, worker_id: str, task_id: str | None, lease_secon
             )
 
 
-def mark_worker_stopped(conn: Connection, worker_id: str) -> None:
+def mark_worker_stopped(conn: DBConnection, worker_id: str) -> None:
     conn.execute("UPDATE workers SET stopped_at=clock_timestamp() WHERE id=%s", (worker_id,))
 
 
-def recover_expired_leases(conn: Connection, request_id: str = "coordinator") -> int:
+def recover_expired_leases(conn: DBConnection, request_id: str = "coordinator") -> int:
     recovered = 0
     with conn.transaction():
         expired = conn.execute(
@@ -1734,7 +1745,7 @@ def recover_expired_leases(conn: Connection, request_id: str = "coordinator") ->
     return recovered
 
 
-def fail_task(conn: Connection, task: dict[str, Any], worker_id: str, error: Exception, request_id: str) -> None:
+def fail_task(conn: DBConnection, task: dict[str, Any], worker_id: str, error: Exception, request_id: str) -> None:
     data = {"kind": type(error).__name__, "detail": str(error)[:500]}
     with conn.transaction():
         row = conn.execute(
@@ -1781,7 +1792,7 @@ def fail_task(conn: Connection, task: dict[str, Any], worker_id: str, error: Exc
                    data={**data, "attempts": row["attempts"], "max_attempts": row["max_attempts"]})
 
 
-def execute_step(conn: Connection, worker_id: str, task: dict[str, Any], request_id: str) -> None:
+def execute_step(conn: DBConnection, worker_id: str, task: dict[str, Any], request_id: str) -> None:
     definition = task["definition"]
     steps = definition["steps"]
     index = task["step_index"]
@@ -1798,6 +1809,7 @@ def execute_step(conn: Connection, worker_id: str, task: dict[str, Any], request
     step = steps[index]
     action, payload = step["action"], step["payload"]
     external_actions = {"http", "slack_message"}
+    result: dict[str, Any] | None
     if (DEMO_MODE and action in external_actions) or (not DEMO_MODE and action not in external_actions):
         raise PermanentActionError("Workflow action is not allowed in the current execution mode.")
     if action in external_actions:
@@ -1821,6 +1833,7 @@ def execute_step(conn: Connection, worker_id: str, task: dict[str, Any], request
                            task_id=task["id"], worker_id=worker_id, request_id=request_id)
             return
         key = secret_encryption_key(required=True)
+        assert key is not None
         if action == "http":
             from app.http_action import MAX_TIMEOUT_SECONDS, execute_http_action
 
@@ -1909,7 +1922,7 @@ def execute_step(conn: Connection, worker_id: str, task: dict[str, Any], request
                    data={"step_index": index, "step_name": step["name"]})
 
 
-def run_summary(conn: Connection, tenant_id: str, run_id: str) -> dict[str, Any] | None:
+def run_summary(conn: DBConnection, tenant_id: str, run_id: str) -> dict[str, Any] | None:
     run = conn.execute(
         """SELECT w.id,w.title,w.status,w.definition,w.workflow_version_id,w.definition_hash,
                   w.trigger_event_id,i.event_key AS trigger_event_key,
@@ -1949,31 +1962,35 @@ def run_summary(conn: Connection, tenant_id: str, run_id: str) -> dict[str, Any]
     return run
 
 
-def dashboard(conn: Connection, tenant_id: str, *, include_workers: bool = False) -> dict[str, Any]:
-    counts = conn.execute(
+def dashboard(conn: DBConnection, tenant_id: str, *, include_workers: bool = False) -> dict[str, Any]:
+    counts = _required_row(conn.execute(
         """SELECT count(*) FILTER (WHERE status IN ('queued','retry_wait')) AS queue_depth,
                   count(*) FILTER (WHERE status='running') AS running,
                   count(*) FILTER (WHERE status='completed') AS completed,
                   count(*) FILTER (WHERE status='failed') AS failed
            FROM workflow_runs WHERE tenant_id=%s""", (tenant_id,)
-    ).fetchone()
-    queue = conn.execute(
+    ).fetchone())
+    queue = _required_row(conn.execute(
         "SELECT count(*) AS count FROM tasks WHERE tenant_id=%s AND status IN ('queued','retry_wait','running')",
         (tenant_id,),
-    ).fetchone()["count"]
-    events = conn.execute(
+    ).fetchone())["count"]
+    events = _required_row(conn.execute(
         """SELECT count(*) AS received_count,coalesce(sum(received_count-1),0) AS duplicate_count
            FROM business_events WHERE tenant_id=%s""", (tenant_id,)
-    ).fetchone()
-    effects = conn.execute("SELECT count(*) AS count FROM side_effects WHERE tenant_id=%s", (tenant_id,)).fetchone()["count"]
-    dlq = conn.execute("SELECT count(*) AS count FROM dead_letters WHERE tenant_id=%s AND replayed_at IS NULL", (tenant_id,)).fetchone()["count"]
-    operations = conn.execute(
+    ).fetchone())
+    effects = _required_row(conn.execute(
+        "SELECT count(*) AS count FROM side_effects WHERE tenant_id=%s", (tenant_id,)
+    ).fetchone())["count"]
+    dlq = _required_row(conn.execute(
+        "SELECT count(*) AS count FROM dead_letters WHERE tenant_id=%s AND replayed_at IS NULL", (tenant_id,)
+    ).fetchone())["count"]
+    operations = _required_row(conn.execute(
         """SELECT coalesce(extract(epoch FROM (clock_timestamp() - min(available_at) FILTER (
                           WHERE status IN ('queued','retry_wait') AND available_at<=clock_timestamp()
                       ))),0) AS oldest_ready_seconds,
                   count(*) FILTER (WHERE status='running' AND lease_until<=clock_timestamp()) AS expired_leases
            FROM tasks WHERE tenant_id=%s""", (tenant_id,)
-    ).fetchone()
+    ).fetchone())
     workers = []
     if include_workers:
         workers = conn.execute(
@@ -1986,12 +2003,12 @@ def dashboard(conn: Connection, tenant_id: str, *, include_workers: bool = False
            FROM workflow_runs w JOIN tasks t ON t.run_id=w.id
            WHERE w.tenant_id=%s ORDER BY w.created_at DESC LIMIT 30""", (tenant_id,)
     ).fetchall()
-    latencies = conn.execute(
+    latencies = _required_row(conn.execute(
         """SELECT percentile_cont(0.50) WITHIN GROUP (ORDER BY extract(epoch FROM (finished_at-created_at))*1000) AS p50,
                   percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch FROM (finished_at-created_at))*1000) AS p95,
                   percentile_cont(0.99) WITHIN GROUP (ORDER BY extract(epoch FROM (finished_at-created_at))*1000) AS p99
            FROM workflow_runs WHERE tenant_id=%s AND finished_at IS NOT NULL""", (tenant_id,)
-    ).fetchone()
+    ).fetchone())
     return {"counts": counts, "queue_depth": queue, "events": events, "side_effect_count": effects,
             "operations": operations,
             "dlq_size": dlq, "workers": workers, "workflows": workflows, "latency_ms": latencies}

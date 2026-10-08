@@ -31,7 +31,7 @@ def github_settings() -> dict[str, Any] | None:
         "setup_url": "RELAYCORE_GITHUB_SETUP_URL",
         "callback_url": "RELAYCORE_GITHUB_CALLBACK_URL",
     }
-    values = {key: os.environ.get(name, "").strip() for key, name in names.items()}
+    values: dict[str, Any] = {key: os.environ.get(name, "").strip() for key, name in names.items()}
     if not any(values.values()):
         return None
     missing = [names[key] for key, value in values.items() if not value]

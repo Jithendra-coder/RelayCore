@@ -20,6 +20,8 @@ The same queue-ready `SELECT ... ORDER BY available_at, created_at LIMIT 1` ran 
 
 The latest application acceptance suite completed with **113 passed** on an isolated PostgreSQL 17.9 / UTF-8 database on 2026-10-08; app source coverage was **81.84%** against an enforced 80% floor. Ruff, Python compilation, pre-commit, and `git diff --check` passed for that source slice. Commit `4ee7049` passed PostgreSQL 18 CI with **113 tests at 82.64% app coverage**, the PostgreSQL 16 backup/restore drill, both Compose checks, the split API/worker Compose smoke, and Prometheus validation in [run 37794690373](https://github.com/Jithendra-coder/RelayCore/actions/runs/37794690373). Its image security and Python dependency jobs also passed in [runs 37794690468](https://github.com/Jithendra-coder/RelayCore/actions/runs/37794690468) and [37794690517](https://github.com/Jithendra-coder/RelayCore/actions/runs/37794690517). It covers:
 
+The current typing change adds Mypy to development dependencies and CI. Local Mypy reports no issues across 18 application and SDK modules, and the required-row guard regression test passes. Full CI verification for this change is pending.
+
 - API key authentication, role denial, request IDs, and cross-tenant `404` isolation.
 - Idempotent workflow creation, payload conflict, persisted history, step transitions, and fail-once retry.
 - Ten concurrent deliveries for one business key resolve to one workflow; the end-to-end duplicate path records 10 deliveries and three unique step effects.
