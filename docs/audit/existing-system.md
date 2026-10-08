@@ -33,7 +33,7 @@ Custom signed webhooks, GitHub pull-request deliveries, and Slack app mentions c
 
 - **Before public use:** define metadata retention, configure managed backups/disaster recovery, and add edge request limits. Database-held key rotation now has an offline command, but production still needs key custody, backup escrow, and a verified operating procedure. Raw payload expiry is implemented with active-run and DLQ-replay safeguards, and a disposable CI restore drill now passes.
 - **Before staging:** verify worker health and Compose production settings, exercise a real isolated provider workflow, and deploy API and worker as distinct roles using a managed database certificate chain.
-- **After the core is proven:** deploy and exercise the included scrape and alert examples, verify traces with a collector, and consider a small SDK/CLI if the real user flow benefits from them. Mypy checks all application and SDK modules, including untyped function bodies. Scheduling currently covers durable intervals, not cron/timezone calendars.
+- **After the core is proven:** deploy and exercise the included scrape and alert examples, verify traces with a collector, and consider a small SDK/CLI if the real user flow benefits from them. Mypy checks all 24 app, SDK, script, and benchmark modules, including untyped function bodies; production API/worker and key rotation require `sslmode=verify-full`. Scheduling currently covers durable intervals, not cron/timezone calendars.
 
 ## Architecture decision
 

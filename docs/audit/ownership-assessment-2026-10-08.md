@@ -474,3 +474,10 @@ The findings above describe audited revision `0957c1f`; the following follow-up 
 
 The local PostgreSQL 17.9 suite passed **113 tests** at **81.84% app coverage**; Ruff, compileall, pre-commit, and `git diff --check` passed. PostgreSQL 18 CI passed **113 tests at 82.64% coverage**, plus Compose, Prometheus, image-build, and PostgreSQL 16 restore checks in [run 37788306422](https://github.com/Jithendra-coder/RelayCore/actions/runs/37788306422). The dependency audit passed in [run 37788306278](https://github.com/Jithendra-coder/RelayCore/actions/runs/37788306278). Live providers and production deployment remain unverified; external effects still have at-least-once semantics.
 
+## Subsequent security and code-quality closure — 2026-10-08
+
+4. **Database TLS:** the production API, standalone worker, and secret-rotation command now reject a connection string unless it explicitly sets `sslmode=verify-full`. A unit test checks acceptance of verified TLS, rejects weaker modes, and leaves Demo Mode's local PostgreSQL path unchanged. Managed database certificate trust still needs staging verification.
+5. **Static type coverage:** Mypy now checks 24 app, SDK, operational-script, and benchmark modules with untyped function-body checks and `Any`-return warnings. The findings in the script/benchmark paths were resolved with typed Psycopg rows and explicit handling for empty query results and non-object smoke responses.
+
+CI run [37803033807](https://github.com/Jithendra-coder/RelayCore/actions/runs/37803033807) passed all 24 Mypy modules, **116 tests at 82.72% app coverage**, the SDK wheel check, Compose validations and smoke, Prometheus checks, and PostgreSQL 16 restore drill. Container scanning and dependency audit passed in [37803033700](https://github.com/Jithendra-coder/RelayCore/actions/runs/37803033700) and [37803033706](https://github.com/Jithendra-coder/RelayCore/actions/runs/37803033706). Live provider tests, staging, and cloud operations are still open.
+
