@@ -7,7 +7,8 @@ WORKDIR /srv/relaycore
 
 RUN useradd --create-home --uid 10001 relaycore
 RUN --mount=type=bind,source=requirements.txt,target=/tmp/requirements.txt \
-    pip install --no-cache-dir --requirement /tmp/requirements.txt
+    python -m pip install --no-cache-dir --requirement /tmp/requirements.txt \
+    && python -m pip uninstall --yes pip
 COPY app ./app
 USER relaycore
 EXPOSE 8000

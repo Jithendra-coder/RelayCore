@@ -16,6 +16,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Build production image
         run: docker build --pull --tag "relaycore-ci:${GITHUB_SHA}" .
+      - name: Verify runtime image omits pip
+        run: docker run --rm --entrypoint python "relaycore-ci:${GITHUB_SHA}" -c "import importlib.util; assert importlib.util.find_spec('pip') is None, 'pip must not be present in the runtime image'"
       - name: Scan operating-system and Python packages
         id: scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
