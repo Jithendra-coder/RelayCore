@@ -23,11 +23,11 @@ Custom signed webhooks, GitHub pull-request deliveries, and Slack app mentions c
 | **Implemented and locally tested** | Durable workflow execution, retries, lease recovery, cancellation, dead-letter replay, immutable versions, interval schedules, OIDC/session and workspace code, signed webhook intake, HTTP action controls, and event-triggered runs. |
 | **Implemented, provider unverified** | OIDC sign-in, GitHub App installation/webhooks, Slack OAuth/events/message posting, and outbound HTTP. Tests use mocked provider responses or a no-network transport; no live provider credentials are configured. |
 | **Simulated** | Synthetic benchmark traffic and the Demo Mode inventory/payment/shipping story. The `charge` action records a local database effect, not a payment. |
-| **Incomplete** | SDK/CLI, cloud deployment, OpenTelemetry traces and alerts, cleanup of retained event metadata, encryption-key rotation, a full restore drill, and live provider verification. |
+| **Incomplete** | SDK/CLI, cloud deployment, OpenTelemetry traces and deployed alerts, cleanup of retained event metadata, encryption-key rotation, managed backup retention/disaster recovery, and live provider verification. |
 
 ## Priorities
 
-- **Before public use:** bound retained webhook metadata, prove restore/recovery, and add edge request limits and key lifecycle controls. Raw payload expiry is implemented with active-run and DLQ-replay safeguards.
+- **Before public use:** define metadata retention, configure managed backups/disaster recovery, and add edge request limits and key lifecycle controls. Raw payload expiry is implemented with active-run and DLQ-replay safeguards, and a disposable CI restore drill now passes.
 - **Before staging:** verify worker health and Compose production settings, exercise a real isolated provider workflow, and deploy API and worker as distinct roles.
 - **After the core is proven:** add traces/alerts, type and dependency checks, and a small SDK/CLI if the real user flow benefits from them. Scheduling currently covers durable intervals, not cron/timezone calendars.
 

@@ -1586,7 +1586,7 @@ def metrics(user: Principal = Depends(principal), pool: ConnectionPool = Depends
     with pool.connection() as conn:
         data = dashboard(conn, user.tenant_id)
     lines = [
-        "# HELP relaycore_queue_depth Ready or leased tasks for the authenticated tenant.",
+        "# HELP relaycore_queue_depth Queued, retry-waiting, or leased tasks for the authenticated tenant.",
         "# TYPE relaycore_queue_depth gauge",
         f"relaycore_queue_depth {data['queue_depth']}",
         "# HELP relaycore_queue_oldest_ready_seconds Age of the oldest available queued task for the authenticated tenant.",

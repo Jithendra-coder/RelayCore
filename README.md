@@ -22,6 +22,8 @@ In the dashboard:
 4. Click **Create DLQ case**. After three bounded failures, click **Replay** on its DLQ row. The replay action releases this deterministic demo hold, making the terminal transition observable.
 5. Open `/docs` for the API, `/metrics` for Prometheus text, or use the dashboard event timeline.
 
+`/metrics` is tenant-authenticated and includes `relaycore_queue_oldest_ready_seconds` and `relaycore_expired_leases` for queue-lag and lease alerts, alongside queue depth and dead-letter gauges. Configure a scrape credential for each tenant you monitor; the endpoint does not add tenant IDs as metric labels.
+
 The duplicate-event button uses a newly generated event key per click. Reuse an `event_key` through `POST /api/demo/duplicates` to repeat the same business event. Reusing that key with a different payload returns HTTP 409.
 
 ## Signed workspace webhooks

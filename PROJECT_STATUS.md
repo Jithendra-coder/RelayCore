@@ -10,7 +10,7 @@ Identity, workspace authorization, signed durable webhook intake, encrypted work
 |---|---|---|
 | P0 Repository audit and architecture decision | Complete | Preserve the PostgreSQL workflow/worker core; findings and invariants in `docs/architecture.md`. |
 | P1–P5 Durable execution and recovery | Complete locally | Persistent queue, leases, retry/recovery, cancellation, idempotent database effects, DLQ/replay, and process/database restart evidence. |
-| P6–P7 Tenant controls and observability | Complete locally | Demo roles, tenant-scoped authorization, request IDs, structured logs, SSE, Prometheus metrics, and dashboard. OpenTelemetry and operational alerts are still absent. |
+| P6–P7 Tenant controls and observability | Complete locally | Demo roles, tenant-scoped authorization, request IDs, structured logs, SSE, Prometheus gauges for queue age and expired leases, and dashboard. OpenTelemetry and deployed alerts are still absent. |
 | P8–P10 Failure tests and measurement | Complete locally | Worker failure, service/database restart, synthetic worker-count benchmark, and query-plan comparison. Evidence is local, not cloud or production proof. |
 | Workflow versioning | Complete locally | Immutable versions, run/hash pinning, publication idempotency, and migration coverage. OIDC authors are recorded by user ID; sandbox authors retain credential fingerprints. |
 | OIDC identity and workspaces | Complete locally; live provider unverified | Authlib callback, verified issuer/subject/email checks, expiring/revocable hashed sessions, workspace creation, role enforcement, origin checks, and cross-workspace tests. |
@@ -40,6 +40,7 @@ Identity, workspace authorization, signed durable webhook intake, encrypted work
 - Local live Demo Mode evidence: 10 duplicate deliveries -> 1 workflow -> 3 effects; a killed worker was replaced after lease expiry; DLQ replay completed. Queue depth ended at 0. The recorded P95 includes recovery delay.
 - Synthetic 100-workflow P95: 3,096.99 ms (1 worker), 2,364.86 ms (2), 2,289.27 ms (4); 0/100 failures each. A local 20,000-row query measured 15.411 ms before and 0.126 ms after a partial index in one run. See `BENCHMARKS.md` and `docs/evidence.md`.
 - GitHub Actions run [37770598389](https://github.com/Jithendra-coder/RelayCore/actions/runs/37770598389) passed the retention commit on PostgreSQL 18, including Ruff, pre-commit, the full test suite, both Compose configurations, and the image build. The dependency audit passed in run [37771385684](https://github.com/Jithendra-coder/RelayCore/actions/runs/37771385684). Docker, a live OIDC provider, external integrations, and cloud deployment were not run locally.
+- Latest GitHub Actions run [37773472481](https://github.com/Jithendra-coder/RelayCore/actions/runs/37773472481) passed **80 tests** on PostgreSQL 18 with **81% app coverage**, Compose validation, image build, and the PostgreSQL 16 backup/restore drill. Dependency audit run [37773472535](https://github.com/Jithendra-coder/RelayCore/actions/runs/37773472535) also passed.
 
 ## Known limits and technical debt
 
@@ -55,8 +56,8 @@ Identity, workspace authorization, signed durable webhook intake, encrypted work
 
 ## Latest change
 
-Verified the CI backup/restore drill against disposable PostgreSQL 16 databases: the real PowerShell scripts restored all 13 migrations and a known workflow record. Live provider credentials and cloud release remain unverified.
+Added tenant-authenticated Prometheus gauges for the age of the oldest runnable task and the count of expired leases. PostgreSQL tests verify calculated values and tenant isolation. Live provider credentials and cloud release remain unverified.
 
 ## Next milestone
 
-Deepen operations telemetry with correlated traces and alertable queue/lease signals. Live GitHub, Slack, and OIDC credentials are prerequisites for external interoperability checks.
+Correlate worker failure logs with request, run, task, and attempt IDs, then add OpenTelemetry spans and deployable alert rules. Live GitHub, Slack, and OIDC credentials are prerequisites for external interoperability checks.

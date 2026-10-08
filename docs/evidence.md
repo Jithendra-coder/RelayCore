@@ -48,6 +48,8 @@ GitHub Actions run [37772675726](https://github.com/Jithendra-coder/RelayCore/ac
 
 The resolved runtime and development requirements were scanned with `pip-audit` on 2026-10-08; it reported no known vulnerabilities locally and in [GitHub Actions run 37771385684](https://github.com/Jithendra-coder/RelayCore/actions/runs/37771385684). The workflow runs on pushes, pull requests, manual dispatch, and weekly. This check does not scan the container's OS packages or detect malicious packages.
 
+The queue/lease metric integration test creates an hour-old runnable task and an expired lease in a rolled-back PostgreSQL transaction. It checks that queue age and lease count are computed for the authenticated tenant only, and that `/metrics` rejects unauthenticated requests. The latest full run, [37773472481](https://github.com/Jithendra-coder/RelayCore/actions/runs/37773472481), passed 80 tests on PostgreSQL 18 with 81% app source coverage. These are metric correctness checks; no Prometheus server or alert rules have been deployed.
+
 ## Live Demo Mode evidence
 
 The clean local Demo Mode run is recorded in [`demo-run.json`](demo-run.json). It completed on 2026-10-04 against the isolated `relaycore_final` database with two independent worker processes. Ten deliveries of one business key yielded one workflow and three logical effects. A real child worker was killed while it held a lease; the lease expired, the other worker reclaimed it, and four unique step effects completed. A three-attempt failure entered the DLQ, was replayed by admin, and completed. Final queue depth and unreplayed DLQ size were both zero. The run's measured workflow P95 was 6.90 seconds; this includes the failure/retry delay and is separate from the synthetic load results above.
@@ -58,4 +60,4 @@ The PostgreSQL service was stopped immediately and restarted while a real worker
 
 ## Evidence boundaries
 
-The “charge” is a unique local PostgreSQL side-effect record, not a payment. Recovery and process restart were measured in one local deployment. Public-cloud deployment, external-service idempotency, TLS, and distributed tracing with an OpenTelemetry collector are not proven here. The full backup/restore drill is queued in CI but not yet verified. Docker Compose configuration and image build pass in CI, but the stack was not launched locally.
+The “charge” is a unique local PostgreSQL side-effect record, not a payment. Recovery and process restart were measured in one local deployment. Public-cloud deployment, external-service idempotency, TLS, and distributed tracing with an OpenTelemetry collector are not proven here. The CI restore drill passed against disposable PostgreSQL 16 databases; managed retention and disaster recovery remain unverified. Docker Compose configuration and image build pass in CI, but the stack was not launched locally.
