@@ -1,0 +1,56 @@
+rule_files:
+  - relaycore.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: alerts fire when operational conditions persist
+    interval: 1m
+    input_series:
+      - series: 'relaycore_queue_oldest_ready_seconds{job="relaycore",workspace="team-a"}'
+        values: '310+0x10'
+      - series: 'relaycore_expired_leases{job="relaycore",workspace="team-a"}'
+        values: '1+0x10'
+      - series: 'relaycore_dead_letters{job="relaycore",workspace="team-a"}'
+        values: '1+0x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: RelayCoreQueueAgeHigh
+        exp_alerts:
+          - exp_labels:
+              job: relaycore
+              workspace: team-a
+              severity: warning
+      - eval_time: 3m
+        alertname: RelayCoreExpiredLeases
+        exp_alerts:
+          - exp_labels:
+              job: relaycore
+              workspace: team-a
+              severity: critical
+      - eval_time: 3m
+        alertname: RelayCoreDeadLettersPresent
+        exp_alerts:
+          - exp_labels:
+              job: relaycore
+              workspace: team-a
+              severity: warning
+  - name: threshold values do not alert
+    interval: 1m
+    input_series:
+      - series: 'relaycore_queue_oldest_ready_seconds{job="relaycore",workspace="team-a"}'
+        values: '300+0x10'
+      - series: 'relaycore_expired_leases{job="relaycore",workspace="team-a"}'
+        values: '0+0x10'
+      - series: 'relaycore_dead_letters{job="relaycore",workspace="team-a"}'
+        values: '0+0x10'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: RelayCoreQueueAgeHigh
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: RelayCoreExpiredLeases
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: RelayCoreDeadLettersPresent
+        exp_alerts: []

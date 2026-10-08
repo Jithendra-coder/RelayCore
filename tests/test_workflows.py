@@ -128,6 +128,7 @@ def test_prometheus_configuration_and_rules_are_valid_yaml():
     root = Path(__file__).parents[1]
     config = yaml.safe_load((root / "monitoring" / "prometheus.yml").read_text(encoding="utf-8"))
     rules = yaml.safe_load((root / "monitoring" / "relaycore.rules.yml").read_text(encoding="utf-8"))
+    rule_tests = yaml.safe_load((root / "monitoring" / "relaycore.rules.test.yml").read_text(encoding="utf-8"))
     assert config["rule_files"] == ["/etc/prometheus/relaycore.rules.yml"]
     assert config["scrape_configs"][0]["authorization"]["credentials_file"].endswith(
         "relaycore-metrics-token"
@@ -137,6 +138,7 @@ def test_prometheus_configuration_and_rules_are_valid_yaml():
         "RelayCoreQueueAgeHigh", "RelayCoreExpiredLeases", "RelayCoreDeadLettersPresent",
     }
     assert all("expr" in alert and "for" in alert for alert in alerts)
+    assert len(rule_tests["tests"]) == 2
 
 
 def test_queue_operational_metrics_report_ready_age_and_tenant_scoped_expired_leases():

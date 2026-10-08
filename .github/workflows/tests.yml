@@ -42,6 +42,7 @@ jobs:
         run: |
           docker run --rm --entrypoint promtool -v "$PWD/monitoring:/etc/prometheus:ro" prom/prometheus:v3.14.0 check rules /etc/prometheus/relaycore.rules.yml
           docker run --rm --entrypoint promtool -v "$PWD/monitoring:/etc/prometheus:ro" prom/prometheus:v3.14.0 check config --syntax-only /etc/prometheus/prometheus.yml
+          docker run --rm --entrypoint promtool -v "$PWD/monitoring:/etc/prometheus:ro" prom/prometheus:v3.14.0 test rules /etc/prometheus/relaycore.rules.test.yml
       - run: docker build --tag relaycore:ci .
 
   backup-restore:
