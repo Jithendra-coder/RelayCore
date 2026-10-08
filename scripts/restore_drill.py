@@ -50,10 +50,10 @@ def main() -> None:
                 sql.Identifier(name),
             ))
 
-    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+    with psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row) as conn:
         migrate(conn)
         expected_migrations = len(list((ROOT / "app" / "migrations").glob("[0-9]*_*.sql")))
-        source_migrations = conn.execute("SELECT count(*) FROM schema_migrations").fetchone()[0]
+        source_migrations = conn.execute("SELECT count(*) AS count FROM schema_migrations").fetchone()["count"]
         if source_migrations != expected_migrations:
             raise AssertionError(f"Expected {expected_migrations} source migrations, found {source_migrations}.")
         run = create_workflow(
