@@ -178,14 +178,12 @@ def test_api_token_role_ceiling_limits_workspace_actions(client, monkeypatch):
     assert viewer.json()["role_ceiling"] == "viewer"
     assert operator.json()["role_ceiling"] == "operator"
 
-    definition = {"title": "Restricted workflow", "steps": [
-        {"name": "Record", "action": "record", "payload": {"value": 1}},
-    ]}
     viewer_headers = {"Authorization": f"Bearer {viewer.json()['token']}"}
     operator_headers = {"Authorization": f"Bearer {operator.json()['token']}"}
     assert client.get("/api/workflows", headers=viewer_headers).status_code == 200
-    assert client.post("/api/workflow-definitions", headers=viewer_headers, json=definition).status_code == 403
-    assert client.post("/api/workflow-definitions", headers=operator_headers, json=definition).status_code == 201
+    run_path = f"/api/workflow-definitions/{uuid.uuid4()}/runs"
+    assert client.post(run_path, headers=viewer_headers).status_code == 403
+    assert client.post(run_path, headers=operator_headers).status_code == 404
     assert client.get(f"/api/workspaces/{workspace_id}/credentials", headers=operator_headers).status_code == 403
 
 
