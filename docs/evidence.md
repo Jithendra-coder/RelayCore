@@ -41,7 +41,7 @@ The acceptance suite completed with **78 passed** on an isolated PostgreSQL 17.9
 
 The suite emits one dependency deprecation warning from Starlette's current `TestClient` adapter for HTTPX. It does not affect the results. GitHub Actions run [37770598389](https://github.com/Jithendra-coder/RelayCore/actions/runs/37770598389) passed Compose validation and image build for the webhook-retention commit. The full Compose stack was not launched locally because Docker is unavailable in this environment.
 
-The resolved runtime and development requirements were scanned with `pip-audit` on 2026-10-08; it reported no known vulnerabilities. A separate GitHub Actions workflow runs this audit on pushes, pull requests, manual dispatch, and weekly. This check does not scan the container's OS packages or detect malicious packages.
+The resolved runtime and development requirements were scanned with `pip-audit` on 2026-10-08; it reported no known vulnerabilities locally and in [GitHub Actions run 37771385684](https://github.com/Jithendra-coder/RelayCore/actions/runs/37771385684). The workflow runs on pushes, pull requests, manual dispatch, and weekly. This check does not scan the container's OS packages or detect malicious packages.
 
 ## Live Demo Mode evidence
 
