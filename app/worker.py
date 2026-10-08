@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import re
 import signal
@@ -15,6 +16,19 @@ from app.store import claim_task, execute_step, fail_task, heartbeat, mark_worke
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(message)s")
 logger = logging.getLogger("relaycore.worker")
+
+
+def _log_task_failure(worker_id: str, task: dict, error: Exception) -> None:
+    logger.warning(json.dumps({
+        "event": "task.failed_or_retried",
+        "worker_id": worker_id,
+        "request_id": task["request_id"],
+        "run_id": task["run_id"],
+        "task_id": task["id"],
+        "attempt": task["attempts"],
+        "step_index": task["step_index"],
+        "error_type": type(error).__name__,
+    }, separators=(",", ":")))
 
 
 def worker_identifier() -> str:
@@ -65,8 +79,7 @@ def main() -> None:
                             raise
                         except Exception as exc:
                             fail_task(conn, task, worker_id, exc, task["request_id"])
-                            logger.info('{"event":"task.failed_or_retried","worker_id":"%s","task_id":"%s"}',
-                                        worker_id, task["id"])
+                            _log_task_failure(worker_id, task, exc)
                     except psycopg.Error:
                         logger.exception('{"event":"worker.database_connection_lost","worker_id":"%s"}', worker_id)
                         break

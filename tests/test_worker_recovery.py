@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import json
+import logging
 import subprocess
 import sys
 import time
@@ -10,6 +12,28 @@ import psycopg
 from psycopg.rows import dict_row
 from app.supervisor import WorkerSupervisor
 from tests.conftest import ADMIN, get_run, make_workflow
+
+
+def test_task_failure_log_correlates_attempt_without_logging_error_detail(caplog):
+    import app.worker as worker
+
+    task = {"request_id": "api-request-123", "run_id": "workflow-456", "id": "task-789",
+            "attempts": 2, "step_index": 1}
+    with caplog.at_level(logging.WARNING, logger="relaycore.worker"):
+        worker._log_task_failure("worker-1", task, ValueError("secret provider response"))
+
+    event = json.loads(caplog.records[-1].message)
+    assert event == {
+        "event": "task.failed_or_retried",
+        "worker_id": "worker-1",
+        "request_id": "api-request-123",
+        "run_id": "workflow-456",
+        "task_id": "task-789",
+        "attempt": 2,
+        "step_index": 1,
+        "error_type": "ValueError",
+    }
+    assert "secret provider response" not in caplog.records[-1].message
 
 
 def test_external_worker_has_unique_safe_identity(monkeypatch):
