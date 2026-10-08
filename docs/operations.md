@@ -10,7 +10,7 @@ GET    /api/workspaces/{workspace_id}/metrics-tokens
 DELETE /api/workspaces/{workspace_id}/metrics-tokens/{token_id}
 ```
 
-Copy the one-time `token` from the POST response to a file readable only by Prometheus at `/etc/prometheus/secrets/relaycore-metrics-token`. The file contains the token alone, without the `Bearer` prefix. Configure a separate scrape job and token for every monitored workspace, and give each job a static `workspace` label for alert identification. Keep the token out of source control and revoke it when the scraper is removed or compromised.
+Copy the one-time `token` from the POST response to a file readable only by Prometheus at `/etc/prometheus/secrets/relaycore-metrics-token`. The file contains the token alone, without the `Bearer` prefix. Configure a separate scrape job and token for every monitored workspace, and give each job a static `workspace` label for alert identification. To rotate, create a replacement, update and verify the scrape, then revoke the previous token. Keep tokens out of source control and revoke them when a scraper is removed or a credential is compromised.
 
 The example files in `monitoring/` assume Prometheus shares a container network with the Compose API service (`api:8000`). Mount `prometheus.yml`, `relaycore.rules.yml`, and the token file at the paths shown in the config. Add a separate job and secret for each workspace. The included rules are starting thresholds: runnable-task age above five minutes for five minutes, an expired lease persisting two minutes, or unreplayed dead letters persisting two minutes. Prometheus evaluates and displays these rules; configure Alertmanager separately to route notifications to the team's chosen destination.
 
