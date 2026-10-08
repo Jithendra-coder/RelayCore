@@ -18,7 +18,7 @@ The same queue-ready `SELECT ... ORDER BY available_at, created_at LIMIT 1` ran 
 
 ## Correctness and failure checks
 
-The acceptance suite completed with **106 passed** on an isolated PostgreSQL 17.9 / UTF-8 database on 2026-10-08; app source coverage was **81.51%** against an enforced 80% floor. The current phase also ran Ruff, pre-commit, Python compilation, dashboard JavaScript syntax validation, package installation/CLI help, and `git diff --check`. GitHub Actions runs the suite on PostgreSQL 18. It covers:
+The latest acceptance suite completed with **113 passed** on an isolated PostgreSQL 17.9 / UTF-8 database on 2026-10-08; app source coverage was **81.84%** against an enforced 80% floor. Ruff, Python compilation, pre-commit, and `git diff --check` passed for the latest slice. GitHub Actions runs the suite on PostgreSQL 18. It covers:
 
 - API key authentication, role denial, request IDs, and cross-tenant `404` isolation.
 - Idempotent workflow creation, payload conflict, persisted history, step transitions, and fail-once retry.
@@ -35,6 +35,7 @@ The acceptance suite completed with **106 passed** on an isolated PostgreSQL 17.
 - A signed production webhook starts one immutable HTTP workflow, duplicate delivery does not enqueue another, the run retains only safe source-event metadata, the worker receives the event for body mapping, and publishing version 2 does not alter an already queued version 1 run.
 - Webhook payload cleanup clears raw bytes and parsed JSON after expiry, retains hash/type/dedupe metadata, protects nonterminal runs, skips active events so they cannot stall later cleanup, and rejects event-dependent DLQ replay without changing its dead-letter or task state.
 - Slack message action tests verify active workspace credential lookup, production workflow execution, bounded JSON requests, redirect rejection, and rate-limit retry delays. Live Slack delivery remains unverified; the at-least-once worker model can duplicate an accepted post after an ambiguous response.
+- SSE integration tests revoke the active cookie session, API token, or workspace membership while a stream is open and verify the next poll closes the stream. HTTP and Slack actions share one DNS-plus-request deadline capped at half the worker lease; tests verify DNS consumes that budget and timed-out HTTP DNS opens no provider connection.
 - A production worker rejects an old queued simulated action and dead-letters it without writing an effect.
 - A worker health check reports healthy only while a same-host database heartbeat is recent; runtime configuration rejects invalid worker, retry, queue, rate, and lease limits.
 - Durable schedules are workspace-scoped and idempotent; the API coordinator dispatches a due row, two concurrent passes dispatch it only once, queue saturation leaves it due while another tenant proceeds, each run pins the then-current immutable version, and event-dependent versions pause safely.
