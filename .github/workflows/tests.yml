@@ -35,6 +35,10 @@ jobs:
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m pip install --no-deps -e .
       - run: relaycore --help
+      - name: Build the typed SDK wheel
+        run: |
+          python -m pip wheel --no-deps --wheel-dir "$RUNNER_TEMP/wheels" .
+          python -c 'from pathlib import Path; from zipfile import ZipFile; import os; wheel = next((Path(os.environ["RUNNER_TEMP"]) / "wheels").glob("*.whl")); assert "relaycore_sdk/py.typed" in ZipFile(wheel).namelist()'
       - run: python -m ruff check app tests benchmarks scripts sdk
       - run: python -m mypy
       - run: python -m pre_commit run --all-files
