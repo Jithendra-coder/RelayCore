@@ -40,8 +40,8 @@ jobs:
       - run: docker compose -f compose.yaml -f compose.workers.yaml config --quiet
       - name: Validate Prometheus rules and config
         run: |
-          docker run --rm -v "$PWD/monitoring:/etc/prometheus:ro" prom/prometheus:v3.14.0 promtool check rules /etc/prometheus/relaycore.rules.yml
-          docker run --rm -v "$PWD/monitoring:/etc/prometheus:ro" prom/prometheus:v3.14.0 promtool check config --syntax-only /etc/prometheus/prometheus.yml
+          docker run --rm --entrypoint promtool -v "$PWD/monitoring:/etc/prometheus:ro" prom/prometheus:v3.14.0 check rules /etc/prometheus/relaycore.rules.yml
+          docker run --rm --entrypoint promtool -v "$PWD/monitoring:/etc/prometheus:ro" prom/prometheus:v3.14.0 check config --syntax-only /etc/prometheus/prometheus.yml
       - run: docker build --tag relaycore:ci .
 
   backup-restore:
