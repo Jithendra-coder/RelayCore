@@ -117,6 +117,7 @@ def test_workspace_api_token_is_scoped_hashed_revocable_and_one_time(client, mon
     result = created.json()
     token = result["token"]
     assert token.startswith("rca_")
+    assert result["role_ceiling"] == "operator"
     assert "token" not in client.get(f"/api/workspaces/{workspace_id}/api-tokens", headers=session_headers).json()[0]
 
     with client.app.state.pool.connection() as conn:
@@ -129,7 +130,7 @@ def test_workspace_api_token_is_scoped_hashed_revocable_and_one_time(client, mon
     assert listed.status_code == 200
     assert [workspace["id"] for workspace in listed.json()] == [workspace_id]
     assert [workspace["id"] for workspace in client.get("/api/me", headers=bearer).json()["workspaces"]] == [workspace_id]
-    assert client.get(f"/api/workspaces/{workspace_id}/api-tokens", headers=bearer).status_code == 200
+    assert client.get(f"/api/workspaces/{workspace_id}/api-tokens", headers=bearer).status_code == 403
     assert client.get("/api/workspaces/not-the-bound-workspace/api-tokens", headers=bearer).status_code == 404
 
     revoked = client.delete(f"/api/workspaces/{workspace_id}/api-tokens/{result['id']}", headers=session_headers)
@@ -142,11 +143,14 @@ def test_workspace_api_token_expiry_and_current_membership_role(client, monkeypa
     client.post("/api/workspaces", headers=session_headers, json={"name": "Another workspace"})
     use_production_auth(monkeypatch)
     created = client.post(f"/api/workspaces/{workspace_id}/api-tokens", headers=session_headers,
-                          json={"name": "Short-lived"})
+                          json={"name": "Short-lived", "role_ceiling": "admin"})
     assert created.status_code == 201, created.text
     token = created.json()["token"]
     token_id = created.json()["id"]
     bearer = {"Authorization": f"Bearer {token}"}
+    assert client.get(f"/api/workspaces/{workspace_id}/api-tokens", headers=bearer).status_code == 200
+    assert client.post(f"/api/workspaces/{workspace_id}/api-tokens", headers=bearer,
+                       json={"name": "Delegated token"}).status_code == 403
 
     with client.app.state.pool.connection() as conn, conn.transaction():
         conn.execute("UPDATE workspace_members SET role='DEVELOPER' WHERE workspace_id=%s AND user_id=%s",
@@ -161,6 +165,28 @@ def test_workspace_api_token_expiry_and_current_membership_role(client, monkeypa
         conn.execute("""UPDATE workspace_api_tokens SET created_at=created_at-interval '2 days',
                        expires_at=clock_timestamp()-interval '1 second' WHERE id=%s""", (token_id,))
     assert client.get("/api/workspaces", headers=bearer).status_code == 401
+
+
+def test_api_token_role_ceiling_limits_workspace_actions(client, monkeypatch):
+    _, workspace_id, session_headers = create_workspace(client, f"token-ceiling-{uuid.uuid4()}@example.test")
+    use_production_auth(monkeypatch)
+    path = f"/api/workspaces/{workspace_id}/api-tokens"
+    viewer = client.post(path, headers=session_headers,
+                         json={"name": "Read-only", "role_ceiling": "viewer"})
+    operator = client.post(path, headers=session_headers, json={"name": "Workflow runner"})
+    assert viewer.status_code == operator.status_code == 201
+    assert viewer.json()["role_ceiling"] == "viewer"
+    assert operator.json()["role_ceiling"] == "operator"
+
+    definition = {"title": "Restricted workflow", "steps": [
+        {"name": "Record", "action": "record", "payload": {"value": 1}},
+    ]}
+    viewer_headers = {"Authorization": f"Bearer {viewer.json()['token']}"}
+    operator_headers = {"Authorization": f"Bearer {operator.json()['token']}"}
+    assert client.get("/api/workflows", headers=viewer_headers).status_code == 200
+    assert client.post("/api/workflow-definitions", headers=viewer_headers, json=definition).status_code == 403
+    assert client.post("/api/workflow-definitions", headers=operator_headers, json=definition).status_code == 201
+    assert client.get(f"/api/workspaces/{workspace_id}/credentials", headers=operator_headers).status_code == 403
 
 
 def test_api_tokens_are_not_available_in_demo_mode(client, monkeypatch):

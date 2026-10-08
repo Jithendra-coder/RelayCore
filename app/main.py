@@ -597,7 +597,7 @@ def new_api_token(workspace_id: str, body: ApiTokenCreateRequest, request: Reque
     if user.tenant_id != workspace_id:
         raise HTTPException(404, "Workspace not found.")
     authorize(user, "admin")
-    if user.user_id is None:
+    if user.user_id is None or user.session_token_hash is None:
         raise HTTPException(403, "API tokens require a signed-in workspace administrator.")
     raw_token = "rca_" + secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
@@ -605,7 +605,7 @@ def new_api_token(workspace_id: str, body: ApiTokenCreateRequest, request: Reque
         with pool.connection() as conn, conn.transaction():
             admit_rate_limit(conn, workspace_id)
             result = create_workspace_api_token(conn, workspace_id, user.user_id, body.name, token_hash,
-                                                body.expires_in_days, request_id(request))
+                                                body.expires_in_days, body.role_ceiling, request_id(request))
     except RateLimited as exc:
         rate_limit_error(exc)
     return {**result, "token": raw_token}

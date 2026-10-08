@@ -48,7 +48,7 @@ Create an authenticated workspace schedule with `POST /api/workspaces/{workspace
 
 ## Python SDK and CLI
 
-Production workspace owners and admins can create expiring, workspace-bound API tokens from the dashboard's **API access** panel. Tokens are shown once, stored only as hashes, inherit the owner's current workspace role, and can be revoked from the same panel. Install the typed, standard-library client from this checkout with `python -m pip install -e .`, then use `relaycore workflow list`, `relaycore workflow run <id>`, and `relaycore runs list`. Set `RELAYCORE_URL`, `RELAYCORE_WORKSPACE_ID`, and `RELAYCORE_API_TOKEN` in the process environment. The complete command and Python usage guide is in [docs/sdk-cli.md](docs/sdk-cli.md).
+Production workspace owners and admins can create expiring, workspace-bound API tokens from the dashboard's **API access** panel. New tokens default to operator access; viewers are read-only, and admin access must be selected explicitly. The effective permission never exceeds the owner's current workspace role. Tokens are shown once, stored only as hashes, and can be revoked from the same panel. Install the typed, standard-library client from this checkout with `python -m pip install -e .`, then use `relaycore workflow list`, `relaycore workflow run <id>`, and `relaycore runs list`. Set `RELAYCORE_URL`, `RELAYCORE_WORKSPACE_ID`, and `RELAYCORE_API_TOKEN` in the process environment. The complete command and Python usage guide is in [docs/sdk-cli.md](docs/sdk-cli.md).
 
 ## GitHub App events
 

@@ -1509,7 +1509,7 @@ def test_versioned_migrations_bootstrap_and_skip_applied_files():
                 {"version": "004"}, {"version": "005"}, {"version": "006"}, {"version": "007"},
                 {"version": "008"}, {"version": "009"}, {"version": "010"}, {"version": "011"},
                 {"version": "012"}, {"version": "013"}, {"version": "014"}, {"version": "015"},
-                {"version": "016"}
+                {"version": "016"}, {"version": "017"}
             ]
             assert conn.execute("SELECT count(*) AS n FROM tasks").fetchone()["n"] == 0
             assert conn.execute(
@@ -1564,6 +1564,11 @@ def test_versioned_migrations_bootstrap_and_skip_applied_files():
                 """SELECT table_name FROM information_schema.tables
                    WHERE table_schema=current_schema() AND table_name='workspace_api_tokens'"""
             ).fetchone() == {"table_name": "workspace_api_tokens"}
+            assert conn.execute(
+                """SELECT column_default FROM information_schema.columns
+                   WHERE table_schema=current_schema() AND table_name='workspace_api_tokens'
+                     AND column_name='role_ceiling'"""
+            ).fetchone() == {"column_default": "'admin'::text"}
         finally:
             conn.execute("SET search_path TO public")
             conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
@@ -1591,7 +1596,7 @@ def test_workflow_version_migration_upgrades_an_existing_001_database():
                 {"version": "004"}, {"version": "005"}, {"version": "006"}, {"version": "007"},
                 {"version": "008"}, {"version": "009"}, {"version": "010"}, {"version": "011"},
                 {"version": "012"}, {"version": "013"}, {"version": "014"}, {"version": "015"},
-                {"version": "016"}
+                {"version": "016"}, {"version": "017"}
             ]
             columns = conn.execute(
                 """SELECT column_name FROM information_schema.columns

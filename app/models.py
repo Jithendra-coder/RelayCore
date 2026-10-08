@@ -184,6 +184,7 @@ class ApiTokenCreateRequest(BaseModel):
 
     name: str = Field(min_length=1, max_length=100)
     expires_in_days: int = Field(default=30, ge=1, le=90)
+    role_ceiling: Literal["viewer", "operator", "admin"] = "operator"
 
     @field_validator("name")
     @classmethod

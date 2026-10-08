@@ -31,6 +31,7 @@ class Identity:
     demo_tenant: str | None = None
     demo_role: str | None = None
     workspace_id: str | None = None
+    role_ceiling: str | None = None
 
 
 @dataclass(frozen=True)
@@ -63,7 +64,8 @@ def authenticated_identity(
                 token_record = workspace_api_token(conn, hashlib.sha256(supplied.encode()).hexdigest())
             if token_record:
                 return Identity(token_record["user_id"], token_record["email"], token_record["display_name"],
-                                token_record["token_hash"], workspace_id=token_record["workspace_id"])
+                                token_record["token_hash"], workspace_id=token_record["workspace_id"],
+                                role_ceiling=token_record["role_ceiling"])
         raise HTTPException(401, "Bearer token is not valid.", headers={"WWW-Authenticate": "Bearer"})
 
     token = request.cookies.get(SESSION_COOKIE)
@@ -110,6 +112,10 @@ def principal_for_identity(
 
     role = membership["role"]
     effective_role = {"OWNER": "admin", "ADMIN": "admin", "DEVELOPER": "operator", "VIEWER": "viewer"}[role]
+    if identity.role_ceiling:
+        rank = {"viewer": 0, "operator": 1, "admin": 2}
+        if rank[identity.role_ceiling] < rank[effective_role]:
+            effective_role = identity.role_ceiling
     return Principal(membership["workspace_id"], effective_role, identity.credential_fingerprint,
                      user_id=identity.user_id, workspace_role=role,
                      session_token_hash=identity.session_token_hash, email=identity.email)

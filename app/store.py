@@ -200,24 +200,24 @@ def revoke_workspace_metrics_token(
 
 def create_workspace_api_token(
     conn: DBConnection, workspace_id: str, actor_id: str, name: str, token_hash: str,
-    expires_in_days: int, request_id: str,
+    expires_in_days: int, role_ceiling: str, request_id: str,
 ) -> dict[str, Any]:
     token = _required_row(conn.execute(
-        """INSERT INTO workspace_api_tokens(id,workspace_id,user_id,name,token_hash,expires_at)
-           VALUES (%s,%s,%s,%s,%s,clock_timestamp()+(%s * interval '1 day'))
-           RETURNING id,name,created_at,expires_at""",
-        (str(uuid.uuid4()), workspace_id, actor_id, name, token_hash, expires_in_days),
+        """INSERT INTO workspace_api_tokens(id,workspace_id,user_id,name,token_hash,expires_at,role_ceiling)
+           VALUES (%s,%s,%s,%s,%s,clock_timestamp()+(%s * interval '1 day'),%s)
+           RETURNING id,name,created_at,expires_at,role_ceiling""",
+        (str(uuid.uuid4()), workspace_id, actor_id, name, token_hash, expires_in_days, role_ceiling),
     ).fetchone())
     token["id"] = str(token["id"])
     emit_event(conn, workspace_id, "workspace.api_token_created", request_id=request_id,
                data={"token_id": token["id"], "name": name, "actor_user_id": actor_id,
-                     "expires_in_days": expires_in_days})
+                     "expires_in_days": expires_in_days, "role_ceiling": role_ceiling})
     return token
 
 
 def workspace_api_token(conn: DBConnection, token_hash: str) -> dict[str, Any] | None:
     return conn.execute(
-        """SELECT t.workspace_id,t.user_id,t.token_hash,u.email,u.display_name
+        """SELECT t.workspace_id,t.user_id,t.token_hash,t.role_ceiling,u.email,u.display_name
            FROM workspace_api_tokens t JOIN users u ON u.id=t.user_id
            WHERE t.token_hash=%s AND t.revoked_at IS NULL AND t.expires_at>clock_timestamp()
              AND u.status='active'""",
@@ -227,7 +227,7 @@ def workspace_api_token(conn: DBConnection, token_hash: str) -> dict[str, Any] |
 
 def list_workspace_api_tokens(conn: DBConnection, workspace_id: str) -> list[dict[str, Any]]:
     return conn.execute(
-        """SELECT id,name,created_at,expires_at,revoked_at FROM workspace_api_tokens
+        """SELECT id,name,created_at,expires_at,revoked_at,role_ceiling FROM workspace_api_tokens
            WHERE workspace_id=%s ORDER BY created_at DESC""", (workspace_id,),
     ).fetchall()
 

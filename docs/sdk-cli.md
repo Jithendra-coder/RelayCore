@@ -4,9 +4,9 @@ RelayCore includes a typed, synchronous Python client and an API-backed `relayco
 
 ## Create a token
 
-Sign in through the RelayCore dashboard, choose a workspace where you are an owner or administrator, and use **API access** to create a token. Choose an expiry from 1 to 90 days and copy the secret when it appears; RelayCore stores only its SHA-256 hash and will not show it again. Tokens inherit the creator's current workspace role, so role changes and membership removal take effect immediately. Revoke a token from the same dashboard panel.
+Sign in through the RelayCore dashboard, choose a workspace where you are an owner or administrator, and use **API access** to create a token. Choose a permission level and expiry from 1 to 90 days, then copy the secret when it appears; RelayCore stores only its SHA-256 hash and will not show it again. The default `operator` ceiling permits workflow operations without workspace administration. `viewer` is read-only; `admin` must be chosen explicitly. The effective role is capped by the user's current workspace membership, so role changes and membership removal take effect immediately. Revoke a token from the same dashboard panel.
 
-An API token grants the full permissions of its owner's current workspace role. Tokens are workspace-bound, but fine-grained scopes are not implemented. Keep the token in a secret manager or process environment, not in source control or command history. The client requires HTTPS outside loopback.
+Tokens are workspace-bound. Fine-grained per-action scopes are not implemented; the role ceiling uses RelayCore's existing viewer/operator/admin permission groups. Keep the token in a secret manager or process environment, not in source control or command history. The client requires HTTPS outside loopback.
 
 ## Install from a checkout
 
