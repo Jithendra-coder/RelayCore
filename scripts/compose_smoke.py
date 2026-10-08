@@ -94,8 +94,8 @@ def main() -> None:
             if run.get("status") == "completed":
                 effects = len(run.get("side_effects", []))
                 if effects != 4:
-                    raise RuntimeError(f"Compose workflow completed with {effects} effects; expected 4.")
-                print("Compose smoke passed: separate API and worker completed one four-step durable workflow.")
+                    raise RuntimeError(f"Compose workflow persisted {effects} side-effect rows; expected 4.")
+                print("Compose smoke passed: separate API and worker completed four durable step results.")
                 return
             if run.get("status") in {"failed", "cancelled"}:
                 raise RuntimeError(f"Compose workflow ended with status {run.get('status')}.")
