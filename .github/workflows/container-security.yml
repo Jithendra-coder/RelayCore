@@ -17,6 +17,7 @@ jobs:
       - name: Build production image
         run: docker build --pull --tag "relaycore-ci:${GITHUB_SHA}" .
       - name: Scan operating-system and Python packages
+        id: scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: "relaycore-ci:${{ github.sha }}"
@@ -26,3 +27,11 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
           timeout: 10m0s
+      - name: Show vulnerable package paths
+        if: failure() && steps.scan.outcome == 'failure'
+        run: |
+          trivy image --exit-code 0 --ignore-unfixed --scanners vuln --vuln-type os,library \
+            --severity HIGH,CRITICAL --format json --output trivy-results.json "relaycore-ci:${GITHUB_SHA}"
+          jq -r '.Results[]? as $target | $target.Vulnerabilities[]? |
+            "\($target.Target)\t\(.PkgName)\t\(.InstalledVersion)\t\(.FixedVersion)\t\(.VulnerabilityID)\t\(.PkgPath // "-")"' \
+            trivy-results.json
