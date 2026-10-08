@@ -15,6 +15,6 @@ Accepted for the first durable inbox implementation.
 ## Consequences and limits
 
 - The local per-workspace fixed-window limiter counts requests after endpoint lookup, including invalid signatures. Production ingress should also have edge-level IP/network controls.
-- Request payloads are retained as raw bytes and JSON without automatic expiry; an explicit retention policy is required before sustained production use.
+- Raw bytes and parsed JSON expire after `RELAYCORE_WEBHOOK_PAYLOAD_RETENTION_DAYS` (30 days by default), except while a nonterminal workflow run needs the source event. Event IDs, hashes, types, and dedupe keys remain for history and duplicate detection; their retention is still unbounded.
 - Demo Mode matches an exact JSON `type`, endpoint ID, and immutable current workflow version. Production workflow creation remains disabled, so production webhook events are durably stored but do not queue runs.
 - See [ADR 005](005-secrets-management.md) for secret encryption and master-key limits.

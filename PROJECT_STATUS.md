@@ -27,17 +27,18 @@ Identity, workspace authorization, signed durable webhook intake, encrypted work
 | GitHub App linking and pull-request webhooks | Complete locally; live provider unverified | One-use workspace-admin state with PKCE; user access and App ownership checks; temporary token discarded; signed raw-body delivery, UUID dedupe, normalized PR events, installation status changes, dashboard controls, and durable workflow triggers covered by tests. GitHub API actions and live credentials remain absent. |
 | Slack OAuth, Events API, and message action | Complete locally; live provider unverified | Workspace-admin OAuth state requests app-mention and message-post scopes; encrypted bot credential, active team uniqueness, raw-body HMAC plus five-minute timestamp check, URL verification, app-mention normalization, event dedupe, uninstall revocation, dashboard controls, durable workflow triggers, and bounded message posts are covered by tests. Live credentials remain absent. |
 | Durable interval schedules | Complete locally; operations/UI limited | PostgreSQL stores schedule state; concurrent coordinator polls use `SKIP LOCKED`; queue pressure preserves a due occurrence; pause/resume/cancel are tenant-scoped; runs pin the current immutable version. Integration tests cover idempotency, lifecycle, concurrent dispatch, queue-full retention, version changes, event-dependent pauses, and schema upgrades. Cron/timezones and dashboard controls are absent. |
+| Webhook payload retention | Complete locally; metadata expiry remains open | Coordinator clears raw bodies and parsed JSON after the configured retention period, protects nonterminal runs, retains dedupe/history metadata, and rejects DLQ replay after a referenced body expires. PostgreSQL integration coverage verifies expiry, duplicate delivery, and replay behavior. |
 | Production secrets, deployment, SDK/CLI | Incomplete | See `LIMITATIONS.md`. |
 
 ## Latest validation
 
-- PostgreSQL integration suite: **77 passed** on an isolated PostgreSQL 17.9 / UTF-8 database, 2026-10-08; **80% app source coverage**. Schedule coverage includes workspace RBAC, idempotency, pause/resume/cancel, two concurrent dispatchers, queue-full fairness across tenants, API coordinator dispatch, version pinning, and safe pause when event data becomes required. The current GitHub Actions workflow also runs the suite on PostgreSQL 18.
+- PostgreSQL integration suite: **78 passed** on an isolated PostgreSQL 17.9 / UTF-8 database, 2026-10-08; **80% app source coverage**. Schedule coverage includes workspace RBAC, idempotency, pause/resume/cancel, two concurrent dispatchers, queue-full fairness across tenants, API coordinator dispatch, version pinning, and safe pause when event data becomes required. Webhook retention coverage verifies active-run protection, post-expiry duplicate detection, metadata history, and safe DLQ rejection. The current GitHub Actions workflow also runs the suite on PostgreSQL 18.
 - Ruff, pre-commit, compilation, and `git diff --check` pass. Coverage is a report, not a configured threshold.
 - The logical backup helper created a valid PostgreSQL custom archive; `restore.ps1 -WhatIf` validated its catalog without changing a database. A successful restore drill is still pending.
-- `python -m compileall -q app tests benchmarks scripts` passes. Runtime limits fail fast when worker count, attempt range, queue/schedule/rate limits, or lease duration are invalid.
+- `python -m compileall -q app tests benchmarks scripts` passes. Runtime limits fail fast when worker count, attempt range, queue/schedule/rate limits, payload retention, or lease duration are invalid.
 - Local live Demo Mode evidence: 10 duplicate deliveries -> 1 workflow -> 3 effects; a killed worker was replaced after lease expiry; DLQ replay completed. Queue depth ended at 0. The recorded P95 includes recovery delay.
 - Synthetic 100-workflow P95: 3,096.99 ms (1 worker), 2,364.86 ms (2), 2,289.27 ms (4); 0/100 failures each. A local 20,000-row query measured 15.411 ms before and 0.126 ms after a partial index in one run. See `BENCHMARKS.md` and `docs/evidence.md`.
-- Docker, a live OIDC provider, external integrations, and cloud deployment were not run locally. CI will validate the changed Compose file after this slice is pushed.
+- Docker, a live OIDC provider, external integrations, and cloud deployment were not run locally. The retention slice has not yet run through GitHub Actions; its CI result is pending push.
 
 ## Known limits and technical debt
 
@@ -45,7 +46,7 @@ Identity, workspace authorization, signed durable webhook intake, encrypted work
 - Production API startup requires OIDC and a Fernet encryption key; static keys are Demo Mode only. Production workflow submission accepts constrained HTTP and connected-workspace Slack message steps, with manual starts, exact event triggers, or durable interval schedules.
 - GitHub App linking and pull-request webhook intake, Slack OAuth/app-mention intake, and Slack message posting are locally tested with mocked provider responses; no live GitHub, Slack, or OIDC credentials are configured. GitHub API actions, provider-side GitHub uninstall, HTTP response mapping, and dynamic URL/header/message mapping remain open. External actions remain at least once; HTTP providers must honor the stable idempotency key, while Slack can duplicate posts after ambiguous responses. An in-flight call can finish after cancellation, with its response recorded. The worker rejects sandbox actions in production even if old demo rows remain queued.
 - Workflow conditions/branches, approvals, cron/timezone schedules, and a transactional external-action outbox remain open. Slack `Retry-After` delays are honored; richer provider-specific limit handling remains open.
-- Incoming webhook payloads have no retention/cleanup or endpoint-specific schema. The encryption master key has no automated rotation; public deployment also needs edge IP/network limits.
+- Raw webhook bodies and parsed JSON expire on a configurable schedule; event metadata and dedupe keys remain indefinitely, and endpoint-specific schemas are absent. The encryption master key has no automated rotation; public deployment also needs edge IP/network limits.
 - PostgreSQL is the source of truth and queue. The per-tenant event-order lock can bottleneck high-volume writes. Independent broker scaling/replay has not been measured or justified.
 - The default local stack can supervise worker children under the API. For separate roles, set `RELAYCORE_WORKERS=0` on the API and run standalone worker processes with unique IDs before scaling API replicas.
 - OpenTelemetry traces, pool metrics, Grafana dashboards, alert rules, mypy/Pyright, a coverage threshold, dependency scanning, staging, infrastructure-as-code, rollback, and production deployment remain missing.
@@ -53,8 +54,8 @@ Identity, workspace authorization, signed durable webhook intake, encrypted work
 
 ## Latest change
 
-Added durable interval schedules. Due occurrences are claimed transactionally across coordinators, deferred without loss under queue/rate limits, and admitted using the current published version. Paused/cancelled states and schedule audit events are persisted. Live provider credentials and cloud release remain unverified.
+Added configurable webhook payload expiry with run-safe cleanup, durable duplicate detection after expiry, and explicit 409 handling for DLQ replay after a required source body is purged. Schedule support remains in the prior milestone. Live provider credentials and cloud release remain unverified.
 
 ## Next milestone
 
-Continue with SDK/CLI, telemetry, and deployment. Live GitHub, Slack, and OIDC credentials are prerequisites for external interoperability checks.
+Complete the existing PostgreSQL backup/restore drill, then add dependency vulnerability scanning. Live GitHub, Slack, and OIDC credentials are prerequisites for external interoperability checks.

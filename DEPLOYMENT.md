@@ -18,7 +18,7 @@ Production requires a UTF-8 PostgreSQL database and all of the following environ
 - Optional Slack App support: `RELAYCORE_SLACK_CLIENT_ID`, `RELAYCORE_SLACK_CLIENT_SECRET`, `RELAYCORE_SLACK_APP_ID`, `RELAYCORE_SLACK_SIGNING_SECRET`, and `RELAYCORE_SLACK_CALLBACK_URL`. Store secrets in a secret manager. Register the HTTPS callback ending in `/integrations/slack/callback`, set Events API Request URL to `/integrations/slack/events`, subscribe to `app_mention` and `app_uninstalled`, and grant `app_mentions:read` and `chat:write`.
 - Optional `RELAYCORE_OIDC_DISCOVERY_URL`; by default it is derived from the issuer.
 - `RELAYCORE_AUTH_SESSION_SECONDS`: 300–604800 seconds, default 43200.
-- Runtime limits: `RELAYCORE_WORKERS` must be zero or greater (`0` means an external worker is required), `RELAYCORE_MAX_ATTEMPTS` must be 1–10, `RELAYCORE_QUEUE_LIMIT`, `RELAYCORE_SCHEDULE_LIMIT`, and `RELAYCORE_RATE_LIMIT_PER_MINUTE` must be positive, and `RELAYCORE_LEASE_SECONDS` must be finite and positive.
+- Runtime limits: `RELAYCORE_WORKERS` must be zero or greater (`0` means an external worker is required), `RELAYCORE_MAX_ATTEMPTS` must be 1–10, `RELAYCORE_QUEUE_LIMIT`, `RELAYCORE_SCHEDULE_LIMIT`, and `RELAYCORE_RATE_LIMIT_PER_MINUTE` must be positive, `RELAYCORE_WEBHOOK_PAYLOAD_RETENTION_DAYS` must be 1–3650, and `RELAYCORE_LEASE_SECONDS` must be finite and positive.
 
 Issuer, discovery, and redirect URLs must use HTTPS. Register the exact callback `/auth/callback` at the identity provider and serve the UI over HTTPS so the secure session cookie is sent. Put secrets in a secret manager; do not commit them to `.env` or source control. The OIDC provider flow has not been live-tested because provider credentials are not available here.
 

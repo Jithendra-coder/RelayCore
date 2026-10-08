@@ -42,6 +42,7 @@ from tests.conftest import (ADMIN, OTHER, OTHER_TENANT, TEST_TENANT, VIEWER, dri
     ("RELAYCORE_QUEUE_LIMIT", "0"),
     ("RELAYCORE_SCHEDULE_LIMIT", "0"),
     ("RELAYCORE_RATE_LIMIT_PER_MINUTE", "0"),
+    ("RELAYCORE_WEBHOOK_PAYLOAD_RETENTION_DAYS", "0"),
     ("RELAYCORE_LEASE_SECONDS", "0"),
     ("RELAYCORE_LEASE_SECONDS", "nan"),
 ])
@@ -432,6 +433,46 @@ def test_production_workflow_runs_only_allowlisted_http_steps(client, monkeypatc
     duplicate = client.post(endpoint_url, content=raw_event, headers=event_headers)
     assert duplicate.status_code == 202 and duplicate.json()["duplicate"]
     assert duplicate.json()["triggered_runs"] == []
+    event_id = accepted.json()["event_id"]
+    from psycopg.types.json import Jsonb
+
+    with client.app.state.pool.connection() as conn, conn.transaction():
+        conn.execute("UPDATE incoming_events SET received_at=clock_timestamp()-interval '32 days' WHERE id=%s",
+                     (event_id,))
+        version_hash = conn.execute(
+            "SELECT definition_hash FROM workflow_versions WHERE id=%s",
+            (triggered_definition.json()["version_id"],),
+        ).fetchone()["definition_hash"]
+        failed_run = store.create_workflow(
+            conn, workspace_id, "Expired event replay test", [{"name": "mapped call", "action": "http",
+            "payload": {"body": {"$event": "/type"}}}], f"expired-event:{uuid.uuid4()}",
+            "expired-event-test", workflow_version_id=triggered_definition.json()["version_id"],
+            definition_hash=version_hash, trigger_event_id=event_id,
+        )
+        conn.execute("UPDATE tasks SET status='dead' WHERE id=%s", (failed_run["task_id"],))
+        conn.execute("UPDATE workflow_runs SET status='failed',finished_at=clock_timestamp() WHERE id=%s",
+                     (failed_run["id"],))
+        dead_letter_id = conn.execute(
+            """INSERT INTO dead_letters(tenant_id,run_id,task_id,attempts,error)
+               VALUES (%s,%s,%s,1,%s) RETURNING id""",
+            (workspace_id, failed_run["id"], failed_run["task_id"],
+             Jsonb({"kind": "test", "message": "expired event replay"})),
+        ).fetchone()["id"]
+        other_id = str(uuid.uuid4())
+        other_body = b'{"type":"older-unreferenced"}'
+        conn.execute(
+            """INSERT INTO incoming_events
+               (id,workspace_id,endpoint_id,event_key,request_id,payload_sha256,raw_body,payload,event_type,received_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,clock_timestamp()-interval '31 days')""",
+            (other_id, workspace_id, webhook.json()["id"], f"old:{uuid.uuid4()}", "retention-test",
+             hashlib.sha256(other_body).hexdigest(), other_body, Jsonb({"type": "older-unreferenced"}),
+             "older-unreferenced"),
+        )
+        assert store.expire_webhook_payloads(conn, batch_size=1) == 1
+        assert conn.execute("SELECT payload IS NOT NULL AS has_payload FROM incoming_events WHERE id=%s",
+                            (event_id,)).fetchone()["has_payload"]
+        assert conn.execute("SELECT payload IS NULL AS cleared FROM incoming_events WHERE id=%s",
+                            (other_id,)).fetchone()["cleared"]
 
     next_steps = [{"name": "notify after v2", "action": "http", "payload": {
         **mapped_steps[0]["payload"], "body": {"event": "v2"},
@@ -449,6 +490,26 @@ def test_production_workflow_runs_only_allowlisted_http_steps(client, monkeypatc
     assert triggered_result["trigger_event"]["type"] == "push"
     assert "payload" not in triggered_result["trigger_event"]
     assert calls[-1][4] == event_payload
+    with client.app.state.pool.connection() as conn:
+        assert store.expire_webhook_payloads(conn) == 1
+        expired_event = conn.execute(
+            "SELECT raw_body,payload,payload_sha256,event_type FROM incoming_events WHERE id=%s",
+            (event_id,),
+        ).fetchone()
+    assert expired_event == {"raw_body": None, "payload": None,
+                             "payload_sha256": hashlib.sha256(raw_event).hexdigest(), "event_type": "push"}
+    duplicate_after_expiry = client.post(endpoint_url, content=raw_event,
+                                         headers=event_headers)
+    assert duplicate_after_expiry.status_code == 202 and duplicate_after_expiry.json()["duplicate"] is True
+    replay_expired = client.post(f"/api/dead-letters/{dead_letter_id}/replay", headers=scoped_headers)
+    assert replay_expired.status_code == 409 and "payload expired" in replay_expired.text
+    with client.app.state.pool.connection() as conn:
+        state = conn.execute(
+            """SELECT d.replayed_at,t.status AS task_status,w.status AS run_status
+               FROM dead_letters d JOIN tasks t ON t.id=d.task_id JOIN workflow_runs w ON w.id=d.run_id
+               WHERE d.id=%s""", (dead_letter_id,),
+        ).fetchone()
+    assert state == {"replayed_at": None, "task_status": "dead", "run_status": "failed"}
     response_text = client.get(f"/api/workflows/{triggered_run['run_id']}", headers=scoped_headers).text
     assert "example/service" not in response_text and "octocat" not in response_text
 
@@ -1307,7 +1368,7 @@ def test_versioned_migrations_bootstrap_and_skip_applied_files():
                 {"version": "001"}, {"version": "002"}, {"version": "003"},
                 {"version": "004"}, {"version": "005"}, {"version": "006"}, {"version": "007"},
                 {"version": "008"}, {"version": "009"}, {"version": "010"}, {"version": "011"},
-                {"version": "012"}
+                {"version": "012"}, {"version": "013"}
             ]
             assert conn.execute("SELECT count(*) AS n FROM tasks").fetchone()["n"] == 0
             assert conn.execute(
@@ -1384,7 +1445,7 @@ def test_workflow_version_migration_upgrades_an_existing_001_database():
                 {"version": "001"}, {"version": "002"}, {"version": "003"},
                 {"version": "004"}, {"version": "005"}, {"version": "006"}, {"version": "007"},
                 {"version": "008"}, {"version": "009"}, {"version": "010"}, {"version": "011"},
-                {"version": "012"}
+                {"version": "012"}, {"version": "013"}
             ]
             columns = conn.execute(
                 """SELECT column_name FROM information_schema.columns

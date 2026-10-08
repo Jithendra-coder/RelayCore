@@ -15,7 +15,7 @@ from psycopg.types.json import Jsonb
 from app.secretbox import decrypt_secret, encrypt_secret
 from app.http_action import PermanentActionError, RetryableActionError, has_event_references
 from app.settings import (DEMO_MODE, MAX_ATTEMPTS, MAX_QUEUE_DEPTH, MAX_SCHEDULES_PER_TENANT,
-                          RATE_LIMIT_PER_MINUTE)
+                          RATE_LIMIT_PER_MINUTE, WEBHOOK_PAYLOAD_RETENTION_DAYS)
 
 
 class QueueFull(Exception):
@@ -876,13 +876,16 @@ def persist_webhook_event(
     if active["version"] != secret_version:
         raise WebhookSecretRotated
     payload_hash = hashlib.sha256(body).hexdigest()
+    event_type = payload.get("type")
+    stored_event_type = event_type if isinstance(event_type, str) and len(event_type) <= 120 else None
     event_id = str(uuid.uuid4())
     inserted = conn.execute(
         """INSERT INTO incoming_events
-           (id,workspace_id,endpoint_id,event_key,request_id,payload_sha256,raw_body,payload)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (endpoint_id,event_key) DO NOTHING
+           (id,workspace_id,endpoint_id,event_key,request_id,payload_sha256,raw_body,payload,event_type)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (endpoint_id,event_key) DO NOTHING
            RETURNING id""",
-        (event_id, workspace_id, endpoint_id, event_key, request_id, payload_hash, body, Jsonb(payload)),
+        (event_id, workspace_id, endpoint_id, event_key, request_id, payload_hash, body,
+         Jsonb(payload), stored_event_type),
     ).fetchone()
     if not inserted:
         previous = conn.execute(
@@ -937,7 +940,7 @@ def list_incoming_events(
     before: tuple[Any, str] | None = None,
 ) -> list[dict[str, Any]]:
     query = """SELECT i.id,i.endpoint_id,e.name AS endpoint_name,i.event_key,
-                      i.request_id,i.payload_sha256,i.payload->>'type' AS event_type,i.received_at
+                      i.request_id,i.payload_sha256,i.event_type,i.received_at
                FROM incoming_events i JOIN webhook_endpoints e ON e.id=i.endpoint_id
                WHERE i.workspace_id=%s"""
     params: tuple[Any, ...] = (workspace_id,)
@@ -946,6 +949,46 @@ def list_incoming_events(
         params += before
     return conn.execute(query + " ORDER BY i.received_at DESC,i.id DESC LIMIT %s",
                         (*params, limit + 1)).fetchall()
+
+
+def expire_webhook_payloads(conn: Connection, batch_size: int = 500) -> int:
+    with conn.transaction():
+        candidate_ids = [row["id"] for row in conn.execute(
+            """SELECT i.id FROM incoming_events i
+               WHERE i.payload IS NOT NULL
+                 AND i.received_at < clock_timestamp()-(%s * interval '1 day')
+                 AND NOT EXISTS (
+                     SELECT 1 FROM workflow_runs w
+                     WHERE w.tenant_id=i.workspace_id AND w.trigger_event_id=i.id
+                       AND w.status NOT IN ('completed','failed','cancelled')
+                 )
+               ORDER BY i.received_at,i.id LIMIT %s""",
+            (WEBHOOK_PAYLOAD_RETENTION_DAYS, batch_size),
+        ).fetchall()]
+        if not candidate_ids:
+            return 0
+        # Lock runs before events so replay and cleanup serialize in the same order.
+        conn.execute(
+            "SELECT id FROM workflow_runs WHERE trigger_event_id=ANY(%s) ORDER BY id FOR UPDATE",
+            (candidate_ids,),
+        ).fetchall()
+        rows = conn.execute(
+            """WITH expired AS (
+                   SELECT i.id FROM incoming_events i
+                   WHERE i.id=ANY(%s) AND i.payload IS NOT NULL
+                     AND i.received_at < clock_timestamp()-(%s * interval '1 day')
+                     AND NOT EXISTS (
+                         SELECT 1 FROM workflow_runs w
+                         WHERE w.tenant_id=i.workspace_id AND w.trigger_event_id=i.id
+                           AND w.status NOT IN ('completed','failed','cancelled')
+                     )
+                   ORDER BY i.received_at,i.id FOR UPDATE OF i SKIP LOCKED LIMIT %s
+               )
+               UPDATE incoming_events i SET raw_body=NULL,payload=NULL
+               FROM expired WHERE i.id=expired.id RETURNING i.id""",
+            (candidate_ids, WEBHOOK_PAYLOAD_RETENTION_DAYS, batch_size),
+        ).fetchall()
+    return len(rows)
 
 
 def _admit(conn: Connection, tenant_id: str) -> None:
@@ -1781,7 +1824,7 @@ def run_summary(conn: Connection, tenant_id: str, run_id: str) -> dict[str, Any]
         """SELECT w.id,w.title,w.status,w.definition,w.workflow_version_id,w.definition_hash,
                   w.trigger_event_id,i.event_key AS trigger_event_key,
                   i.payload_sha256 AS trigger_event_payload_sha256,
-                  i.payload->>'type' AS trigger_event_type,
+                  i.event_type AS trigger_event_type,
                   i.received_at AS trigger_event_received_at,
                   w.created_at,w.finished_at,
                   t.id AS task_id,t.status AS task_status,t.step_index,t.attempts,t.max_attempts,

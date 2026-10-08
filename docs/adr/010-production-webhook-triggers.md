@@ -13,6 +13,6 @@ Accepted for the first production event-driven path.
 
 ## Consequences and limits
 
-- A run can resume after worker restart with its original source event and version. Current webhook rows are retained indefinitely because there is no retention policy yet.
+- A run can resume after worker restart with its original source event and version; nonterminal runs prevent source-payload cleanup. After expiry, a DLQ replay that needs the source body returns HTTP 409 and leaves the dead letter unchanged.
 - Selecting an event field explicitly sends that data to the credential's one bound external host. Workspace administrators are responsible for reviewing mappings and data destination.
 - Delivery remains at least once. The destination must honor RelayCore's idempotency key. No GitHub/Slack provider-native trigger, schema validation, response mapping, or external endpoint interoperability is included in this slice.

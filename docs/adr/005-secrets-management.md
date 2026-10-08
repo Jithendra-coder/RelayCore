@@ -17,4 +17,4 @@ Accepted for custom webhook credentials.
 - Losing or changing the encryption key makes persisted webhook secrets unreadable. Master-key rotation currently requires an offline decrypt/re-encrypt operation and is not automated.
 - Fernet protects database contents when the application key remains outside PostgreSQL. Production still requires secret-manager access controls and disk/database encryption.
 - Endpoint secret rotation revokes the prior signing key immediately. The caller must install the new key before sending further events.
-- Event trigger matching exists only in Demo Mode and is documented in ADR 007. Per-endpoint JSON schemas, retention/cleanup, and edge IP rate limits remain future work.
+- Exact event triggers are supported in production for constrained versioned workflows. Raw webhook bodies and parsed JSON expire after a configurable period; metadata/dedupe retention, per-endpoint JSON schemas, and edge IP rate limits remain open work.

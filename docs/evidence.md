@@ -18,7 +18,7 @@ The same queue-ready `SELECT ... ORDER BY available_at, created_at LIMIT 1` ran 
 
 ## Correctness and failure checks
 
-The acceptance suite completed with **77 passed** on an isolated PostgreSQL 17.9 / UTF-8 database on 2026-10-08; app source coverage was **80%**. The current phase also ran Ruff, pre-commit, Python compilation, and `git diff --check`. GitHub Actions runs the suite on PostgreSQL 18. It covers:
+The acceptance suite completed with **78 passed** on an isolated PostgreSQL 17.9 / UTF-8 database on 2026-10-08; app source coverage was **80%**. The current phase also ran Ruff, pre-commit, Python compilation, and `git diff --check`. GitHub Actions runs the suite on PostgreSQL 18. It covers:
 
 - API key authentication, role denial, request IDs, and cross-tenant `404` isolation.
 - Idempotent workflow creation, payload conflict, persisted history, step transitions, and fail-once retry.
@@ -33,12 +33,13 @@ The acceptance suite completed with **77 passed** on an isolated PostgreSQL 17.9
 - A bounded-failure demo reaches DLQ; admin replay releases the deterministic demo hold, completes the workflow, and retains the audit history.
 - HTTP action validation rejects non-allowlisted/private destinations and host/credential mismatches before connecting; a no-network transport checks address pinning, verified TLS context setup, response caps/redaction, status retry classification, and the production workflow path.
 - A signed production webhook starts one immutable HTTP workflow, duplicate delivery does not enqueue another, the run retains only safe source-event metadata, the worker receives the event for body mapping, and publishing version 2 does not alter an already queued version 1 run.
+- Webhook payload cleanup clears raw bytes and parsed JSON after expiry, retains hash/type/dedupe metadata, protects nonterminal runs, skips active events so they cannot stall later cleanup, and rejects event-dependent DLQ replay without changing its dead-letter or task state.
 - Slack message action tests verify active workspace credential lookup, production workflow execution, bounded JSON requests, redirect rejection, and rate-limit retry delays. Live Slack delivery remains unverified; the at-least-once worker model can duplicate an accepted post after an ambiguous response.
 - A production worker rejects an old queued simulated action and dead-letters it without writing an effect.
 - A worker health check reports healthy only while a same-host database heartbeat is recent; runtime configuration rejects invalid worker, retry, queue, rate, and lease limits.
 - Durable schedules are workspace-scoped and idempotent; the API coordinator dispatches a due row, two concurrent passes dispatch it only once, queue saturation leaves it due while another tenant proceeds, each run pins the then-current immutable version, and event-dependent versions pause safely.
 
-The suite emits one dependency deprecation warning from Starlette's current `TestClient` adapter for HTTPX. It does not affect the results. CI validates both Compose configurations and builds the image; the full Compose stack was not launched locally because Docker is unavailable in this environment.
+The suite emits one dependency deprecation warning from Starlette's current `TestClient` adapter for HTTPX. It does not affect the results. The prior schedule change passed CI Compose validation and image build; the current webhook-retention change is awaiting its CI run. The full Compose stack was not launched locally because Docker is unavailable in this environment.
 
 ## Live Demo Mode evidence
 

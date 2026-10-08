@@ -1439,6 +1439,19 @@ def replay(dead_letter_id: int, request: Request, user: Principal = Depends(prin
             raise HTTPException(404, "Dead letter not found.")
         if item["replayed_at"]:
             raise HTTPException(409, "This dead letter has already been replayed.")
+        run = conn.execute(
+            "SELECT trigger_event_id,definition FROM workflow_runs WHERE tenant_id=%s AND id=%s FOR UPDATE",
+            (user.tenant_id, item["run_id"]),
+        ).fetchone()
+        if run and run["trigger_event_id"] and any(
+            has_event_references(step["payload"].get("body")) for step in run["definition"]["steps"]
+        ):
+            source_event = conn.execute(
+                "SELECT payload FROM incoming_events WHERE id=%s AND workspace_id=%s FOR UPDATE",
+                (run["trigger_event_id"], user.tenant_id),
+            ).fetchone()
+            if not source_event or source_event["payload"] is None:
+                raise HTTPException(409, "The source webhook payload expired; this run cannot be replayed.")
         conn.execute("UPDATE dead_letters SET replayed_at=clock_timestamp() WHERE id=%s", (dead_letter_id,))
         conn.execute("UPDATE tasks SET status='queued',attempts=0,last_error=NULL,available_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=%s",
                      (item["task_id"],))
