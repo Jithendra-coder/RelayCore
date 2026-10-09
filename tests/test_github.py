@@ -227,6 +227,28 @@ def test_github_secondary_rate_limits_are_retryable_and_permission_errors_are_no
             github._raise_github_action_error(caught.value)
 
 
+def test_github_primary_rate_limit_uses_reset_header(monkeypatch):
+    import app.github as github
+
+    monkeypatch.setattr(github.time, "time", lambda: 1_000.0)
+    error = HTTPError("https://api.github.com/test", 403, "Forbidden", {
+        "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1042",
+    }, BytesIO(b'{"message":"API rate limit exceeded"}'))
+
+    class ErrorOpener:
+        def open(self, *_args, **_kwargs):
+            raise error
+
+    monkeypatch.setattr(github, "build_opener", lambda *_args: ErrorOpener())
+    with pytest.raises(github.GitHubHTTPError) as caught:
+        github._github_request("https://api.github.com/test", method="GET", headers={})
+    assert caught.value.rate_limited
+    assert caught.value.retry_after == 42.0
+    with pytest.raises(RetryableActionError) as retry:
+        github._raise_github_action_error(caught.value)
+    assert retry.value.retry_after == 42.0
+
+
 def test_github_issue_comment_maps_missing_or_invalid_event_values(monkeypatch):
     import app.github as github
 

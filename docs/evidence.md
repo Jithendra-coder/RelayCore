@@ -83,6 +83,12 @@ The dashboard capture [`relaycore-dashboard.png`](relaycore-dashboard.png) shows
 
 The PostgreSQL service was stopped immediately and restarted while a real worker held a lease. The API pool reconnected, the coordinator recorded lease expiry, worker-2 reclaimed the work, and the workflow completed with two logical step effects. Details are in [`database-restart.json`](database-restart.json). This proves recovery from one local database-process restart, not failover to another database node.
 
+## GitHub pull-request comment action
+
+The PostgreSQL integration test sends a signed pull-request delivery into a workspace, admits its version-pinned run, drives the worker, and verifies that only the validated comment ID and URL are persisted. The GitHub API is mocked, so this proves the RelayCore transaction and action path rather than live GitHub interoperability. Unit tests verify repository-scoped installation tokens with `Issues: write`, retry handling for primary and secondary rate limits (including `Retry-After` and the 60-second fallback), and permanent handling of permission denials.
+
+GitHub Actions run [37946831485](https://github.com/Jithendra-coder/RelayCore/actions/runs/37946831485) passed **130 tests at 82.89% app coverage**, the separate API/worker browser smoke, both Compose validations, Mypy, Ruff, pre-commit, the typed SDK wheel check, and Prometheus checks. Its PostgreSQL 16 restore job recovered all **17 migrations** and a workflow marker. The image scan [37946831571](https://github.com/Jithendra-coder/RelayCore/actions/runs/37946831571) and dependency audit [37946831516](https://github.com/Jithendra-coder/RelayCore/actions/runs/37946831516) passed. No live GitHub credentials were used.
+
 ## Evidence boundaries
 
 The “charge” is a unique local PostgreSQL side-effect record, not a payment. Recovery and process restart were measured in one local deployment. Public-cloud deployment, external-service idempotency, TLS, and distributed tracing with an OpenTelemetry collector are not proven here. The CI restore drill passed against disposable PostgreSQL 16 databases; managed retention and disaster recovery remain unverified. Docker Compose configuration and image build pass in CI, but the stack was not launched locally.
