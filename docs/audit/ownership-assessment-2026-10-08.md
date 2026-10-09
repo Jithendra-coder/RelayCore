@@ -1,8 +1,8 @@
 # RelayCore ownership audit and transformation plan
 
-**Snapshot:** 2026-10-08
+**Snapshot:** 2026-10-09
 
-**Audited revision:** 0957c1fbb76542a8dc48069968714bf4becf9461 on main
+**Audited revision:** `ce2b62ca9a6c0a6a97530ee700083555fc1d6ce3` on main (documentation-only commit; runtime code at `20a77d060359e63b9a82aa6e3b222c2eb71c043f`)
 
 **Target role:** Python Engineer
 
@@ -18,7 +18,7 @@ RelayCore has a real engineering core: it commits workflow admission and state i
 
 The actual product today is a locally verifiable, self-hostable workflow engine with production-oriented authentication and provider code whose third-party behavior is still unverified. Demo Mode is explicit and isolated. The default Compose stack is loopback-only.
 
-**Architecture decision: Option A — incremental evolution.** Keep the PostgreSQL-backed modular monolith and its worker model. Fix the live-stream authorization gap, bound the DNS/action lease interaction, then prove one real external workflow in staging. There is no checked-in workload evidence that justifies Redis, Kafka, Kubernetes, or a full rebuild.
+**Architecture decision: Option A — incremental evolution.** Keep the PostgreSQL-backed modular monolith and its worker model. The previously identified SSE revocation and DNS/action lease issues have follow-up fixes and regression tests in the current tree. The next meaningful proof is one real external workflow in staging, followed by an explicit retention policy and managed recovery evidence. There is no checked-in workload evidence that justifies Redis, Kafka, Kubernetes, or a full rebuild.
 
 **Release position:** prototype. Do not describe it as production-ready until live identity/provider checks, a staging deployment, operational retention and recovery policies, and a real external-action failure test pass.
 
@@ -57,7 +57,7 @@ The repository provides deployable containers and a local Compose stack, a separ
 | MOCKED | Provider behavior | GitHub, Slack, OIDC, and outbound provider transports are tested locally through mocks or controlled transports, not live provider accounts. |
 | SIMULATED | Performance and failures | The load test uses synthetic database-only workflows. Worker failure, duplicate events, and deterministic failure injection are controlled test scenarios. |
 | DEMO-ONLY | Payment/inventory/shipment narrative | The charge action writes a local effect record. It does not charge money or connect to an inventory or shipping provider. |
-| BROKEN | Confirmed current defect | A long-lived SSE connection can continue returning tenant event metadata after the initiating session/token or workspace membership is revoked. See finding 1. |
+| REAL locally | Authorization revocation | SSE polls revalidate workspace membership and the backing session/API token; regression tests cover revocation during an open stream. Live multi-user deployment behavior remains unverified. |
 | PLANNED-ONLY / absent | Product and operating features | Live provider verification, staging/production, a visual workflow editor, cron/time-zone schedules, fine-grained API-token scopes, provider reconciliation, managed retention, and hosted SDK distribution are absent. |
 
 ## Part D — Demo and mock inventory
@@ -75,29 +75,31 @@ The project labels these boundaries honestly in README.md, PROJECT_STATUS.md, LI
 
 ### P0 — Must fix before shared production use
 
-1. **Open SSE streams outlive authorization changes** — app/main.py:1723-1737. Authorization and workspace membership are resolved when the request starts. The stream then polls indefinitely without rechecking session validity, token revocation, or membership. If an admin removes a user while the browser remains connected, that connection can still receive future workspace event metadata. Close streams when the credential/membership ceases to be valid, or enforce a short reauthorization window; add an integration test that revokes access while streaming.
-
-2. **DNS lookup is outside the configured HTTP timeout and worker lease** — app/http_action.py:191-207, 220 onward; app/worker.py:74-92; app/settings.py:19. The action timeout bounds socket connect/read work, but socket.getaddrinfo has no deadline. If the OS resolver stalls longer than the task lease, the coordinator can requeue the step while the original worker is still waiting; both attempts may then perform the external action. Use a bounded resolver/egress proxy or a heartbeat/lease strategy that covers resolution, and test a stalled resolver with a short lease. Preserve the documented at-least-once contract and require downstream idempotency where available.
-
-3. **No provider-backed release gate exists yet** — docs/DEPLOYMENT.md and LIMITATIONS.md. No live OIDC, GitHub, or Slack credentials or staging endpoint are configured. Mocked integration tests cannot prove callback URLs, installed scopes, external signatures, provider retries, or secrets/network settings. Keep public release claims blocked until one isolated end-to-end provider workflow and its failure path pass in staging.
+1. **No provider-backed release gate exists yet** — docs/DEPLOYMENT.md and LIMITATIONS.md. This environment has no configured live OIDC, GitHub App, Slack App, or staging endpoint. Mocked provider tests cannot prove callback URLs, installed scopes, external signatures, provider retries, or deployment network/secret settings. Keep production-readiness claims gated on one isolated end-to-end provider workflow and its failure path in staging.
 
 ### P1 — Major security and operations work
 
-4. **Database TLS is an operator requirement but not checked at startup** — app/settings.py:11 and app/main.py:224-230 pass DATABASE_URL directly into the pool. A misconfigured production URL can connect without certificate verification. Require TLS with hostname verification in the deployment contract and, preferably, reject insecure production DSNs; test both accepted and rejected configurations.
+2. **Webhook metadata and backup/WAL retention have no complete deletion policy.** Raw bodies and parsed JSON expire, but event hashes, IDs, types, dedupe keys, and history remain. Backups and WAL may outlive live-row cleanup. Choose a tenant/legal retention period and define backup/WAL expiry before real customer payloads are stored.
 
-5. **Webhook metadata has no expiry or deletion policy** — app/store.py:1041 onward clears the raw body and parsed JSON, but event hashes, IDs, type, dedupe keys, and history remain indefinitely. Database backups and WAL may retain earlier bodies after live-row cleanup. Pick a tenant/legal retention policy, define deletion of metadata and backup/WAL expiry, then test the full lifecycle. The current code behavior is useful for dedupe but is not a complete retention policy.
+3. **External action outcomes remain ambiguous after a lost response.** A provider may accept an action while RelayCore loses the response or crashes before recording it. HTTP sends a stable idempotency key, but only the target can enforce it; Slack messages and GitHub comments can duplicate after ambiguity. Keep the at-least-once contract explicit and add provider receipts/reconciliation only where a real provider supports them.
 
-6. **External delivery can repeat after an ambiguous response** — app/store.py execution path and docs/LIMITATIONS.md. A worker may lose its lease or process after the provider accepts a request but before the result is committed. HTTP sends a stable idempotency key, but the destination must honor it. Slack does not provide a dedupe key in this action, so duplicate posts are possible. Keep this limitation visible; before using non-idempotent actions, add a provider receipt/reconciliation or approval strategy.
+4. **No managed staging/recovery operation is evidenced.** CI validates container setup and a disposable PostgreSQL restore, but there is no managed deployment, backup retention, migration rollback drill, deployed alert delivery, or collector/trace backend. Complete a controlled staging run before shared production use.
 
-7. **Workspace API token blast radius (resolved for new tokens)** — the audited revision let every token inherit its owner's whole current role. Migration 017 adds `viewer`/`operator`/`admin` ceilings, defaults new tokens to `operator`, caps access by current membership, and preserves existing tokens' previously granted access. Token minting now requires a signed-in session. Fine-grained per-action scopes remain open if real SDK users need narrower grants.
+### Closed findings verified in the current tree
+
+- **SSE revocation:** each poll checks current membership and the backing session/API token; integration tests close streams after session, token, and membership revocation.
+- **DNS/action lease budget:** DNS uses a timeout and bounded resolver slots; action deadlines are capped at half the task lease with heartbeats around provider calls. Tests cover resolver stalls, no outbound connection after timeout, and shared DNS/HTTPS timeout budget. A timed-out OS resolver thread itself cannot be cancelled, but its concurrency is bounded.
+- **Database TLS:** production API, worker, and rotation paths require PostgreSQL `sslmode=verify-full`; staging certificate trust remains unverified.
+- **New API-token authority:** new tokens have a role ceiling and are capped by current membership. Existing tokens retain their migrated authority; narrower scopes remain optional.
+- **Static and image checks:** Mypy covers 24 modules; CI runs container image scanning and Python dependency audit.
 
 ### P2 — Valuable improvements after the release blockers
 
-8. **No browser end-to-end journey is automated.** API/database coverage is substantial, but it does not exercise login through the dashboard, workspace switching, token reveal/copy, live event updates, and reconnect behavior in a browser. Add one browser test when a staging identity provider is available.
+5. **No complete browser user journey is automated.** CI has a browser dashboard/separate-worker smoke, but not OIDC login through workspace selection, token operations, live event updates, and reconnect behavior. Add that journey when a staging identity provider is available.
 
-9. **Type checking and container/OS image scanning are absent.** Ruff and dependency advisory scanning run in CI; a mypy/Pyright check and image/SBOM scan would catch different error classes. Add them as CI gates before production deployment, not as substitutes for live security review.
+6. **The API module has several product responsibilities in one file.** app/main.py contains identity, token/credential administration, provider callbacks, webhooks, workflow/schedule control, SSE, and metrics. It is still a modular monolith, not an architecture defect by itself; split routes only when it improves test isolation or ownership.
 
-10. **The API module has several product responsibilities in one file.** app/main.py contains the routes for identity, token/credential administration, provider callbacks, webhooks, workflow/schedule control, SSE, and metrics. This is still a modular monolith, not an architecture defect by itself; after the auth/SSE work, move route groups only where it improves test isolation and ownership. Do not split solely to reduce line count.
+7. **Independent production security review and edge controls remain.** Add deployed ingress limits, secret-manager custody, and environment-specific review before exposing provider callbacks publicly.
 
 ### P3 — Optional, only with validated user need
 
@@ -111,7 +113,7 @@ The project labels these boundaries honestly in README.md, PROJECT_STATUS.md, LI
 1. Prove one narrow real workflow: a GitHub pull-request event starts a version-pinned workflow, sends a bounded HTTP request, and posts a Slack result. Record the provider event, queue/run trace, retries, and duplicate handling.
 2. Turn provider uncertainty into a repeatable staging contract test: real test workspace/app, callback validation, delivery signature, permissions, rate-limit response, uninstall/revoke, and safe cleanup.
 3. Improve end-to-end action semantics only where providers support it: stable idempotency, provider request IDs, receipts, retry classification, and reconciliation for ambiguous completion.
-4. Make the control plane safe to operate: auth revocation during SSE, enforce database TLS, define metadata/backup retention, and exercise restore and key rotation with the same deployment configuration.
+4. Make the control plane safe to operate: select metadata/backup retention, then exercise restore, key rotation, alert delivery, and traces with the staging deployment configuration.
 5. Add operational visibility to the deployed system: API/worker/database health, queue age, failed actions, provider latency, and alert delivery.
 6. Improve the developer path with the existing SDK/CLI and a real release runbook before building a large visual editor.
 
@@ -124,11 +126,11 @@ Scores are judgment calls based on code evidence, not measured outcomes.
 | Area | Score | Why; what moves it higher |
 |---|---:|---|
 | Python engineering relevance | 9/10 | Real service, typed models/SDK, database transactions, workers, API, integrations, and tests. Add live deployment and operation evidence. |
-| Engineering depth | 8/10 | Durable state, leases, recovery, idempotency, and integration security are interview-worthy. Close the DNS/lease and live-stream reauthorization gaps. |
+| Engineering depth | 8/10 | Durable state, leases, recovery, idempotency, and integration security are interview-worthy. Add live provider and managed staging evidence. |
 | Reliability evidence | 8/10 locally; 4/10 in production | Failure and restore tests exist, but only local/disposable environments are proven. Run the same drills in staging. |
 | Technical distinctiveness | 7/10 | PostgreSQL as a durable queue with immutable versions is a defensible core; a generic “automation platform” pitch weakens it. Show a real developer event workflow. |
 | User usefulness | 6/10 | The use case is useful to engineering teams, but live interoperability and a complete authoring journey are missing. Make one release/incident workflow excellent. |
-| Security maturity | 7/10 in source; not production-reviewed | Strong tenant, secret, webhook, and egress controls; stream reauthorization and operator lifecycle remain. |
+| Security maturity | 8/10 in source; not production-reviewed | Strong tenant, secret, webhook, and egress controls; live integration setup and operator lifecycle remain. |
 | Operational maturity | 5/10 | Runbooks, metrics, alerts, backups, rotation, and CI exist; no deployed staging, managed backup policy, or live alert/trace delivery. |
 | Deployability | 4/10 | Local containerization is credible; no infrastructure, staging, cloud release, migration rollback, or live smoke test. |
 | Evidence quality | 7/10 | Repeatable test/benchmark/restore evidence is stored and measured honestly. Add staging traces and provider failure evidence. |
@@ -141,16 +143,39 @@ A recruiter should remember: “A PostgreSQL-backed workflow engine that survive
 |---|---|---|
 | PostgreSQL state machine and queue | KEEP | Durable, tested core; no measured reason to add a broker. |
 | Immutable workflow versions and run snapshots | KEEP | Gives replay/history stable semantics. |
-| Worker leases, coordinator, recovery, DLQ | IMPROVE | Strong base; cover resolver stalls and external-action ambiguity. |
-| Workspace identity and role checks | IMPROVE | Preserve OIDC/RBAC model; revalidate long-lived streams and harden deployed DB TLS. |
+| Worker leases, coordinator, recovery, DLQ | IMPROVE | Strong base; keep provider ambiguity visible and validate lease behavior in staging. |
+| Workspace identity and role checks | IMPROVE | Preserve OIDC/RBAC model; stream revalidation and production TLS enforcement are implemented, but need staging verification. |
 | Webhook inbox and event matching | KEEP | Signed, deduplicated, transactionally triggers runs. Complete metadata retention policy. |
-| HTTP action | IMPROVE | Bounded host/TLS/response controls are good; DNS needs bounded behavior within lease. |
+| HTTP action | IMPROVE | Host/TLS/response bounds and DNS/action deadlines are implemented; validate provider idempotency and ambiguous outcomes. |
 | Slack/GitHub integration | IMPROVE | Preserve the shared event path; validate against live provider accounts. |
 | API tokens / SDK / CLI | KEEP, IMPROVE | Useful developer access path; role ceilings reduce delegated authority. Add per-action scopes only if real SDK users need them. |
 | FastAPI modular monolith | KEEP | Suitable for current scale and simplifies transactions. Split route modules only to improve test/ownership boundaries. |
 | Demo sandbox | KEEP, clearly label | Reproducible failure demonstration; never represent its charge action as payment. |
 | Dashboard | IMPROVE | Good operator visibility and controls; add browser E2E and guided real workflow, not decorative complexity. |
 | Redis/Kafka/Kubernetes/AI | REMOVE from near-term plan | No measured or product requirement supports the cost today. |
+
+### Upgrade gap analysis
+
+| Area | Current | Target | Gap | Priority | Action |
+|---|---|---|---|---|---|
+| Product | Durable developer-event workflows and operator history | One live, repeatable release/incident runbook | No live reference workflow or user validation | P0 | Verify one GitHub event to useful action in isolated staging. |
+| Architecture | FastAPI modular monolith; PostgreSQL queue; separate worker role supported | Same code deployed as independently operated API/worker roles | No managed multi-process deployment evidence | P1 | Deploy the existing roles to staging; split services only if ownership/scaling requires it. |
+| Python quality | Ruff, Mypy, pre-commit, typed SDK; 24 modules type-checked | Reproducible, reviewed release dependencies | No hosted release artifact; dependency ranges rather than a published lock/build provenance | P2 | Add a reproducible SDK release process if distribution is needed. |
+| Backend | Authenticated workspace API, webhooks, SDK/CLI | Stable externally usable integration contract | Real external provider behavior is unverified | P0 | Run provider-backed smoke and failure contract checks. |
+| Database | PostgreSQL stores definitions, queue, events, leases, and history; CI restore drill | Managed TLS database with tested lifecycle | No managed retention, migration rollback, or recovery evidence | P1 | Execute staging migration, backup/restore, and rollback/forward-fix drills. |
+| Integrations | GitHub/Slack/OIDC code plus constrained HTTP; tests use mocks | One real provider-triggered workflow | No credentials/test workspace/staging configured | P0 | Configure isolated provider apps outside chat and run the real path. |
+| Async/concurrency | Worker claims, leases, coordinator recovery, subprocess and restart coverage | Independently operated workers with measured behavior | No managed deployment or cross-host evidence | P1 | Validate unique worker IDs, drain/restart, and recovery in staging. |
+| Distributed systems | At-least-once execution, dedupe, retries, DLQ/replay | Explicit recovery and provider outcome evidence | Ambiguous accepted side effects can repeat | P1 | Exercise provider duplicate/timeout cases; reconcile only when provider semantics permit. |
+| AI/ML | None; not needed for workflow correctness | None unless a user problem justifies it | No gap | P3 | Keep AI/ML out of the core roadmap. |
+| Testing | Broad PostgreSQL integration/failure tests, 80% coverage gate, CI restore and container smoke | Provider-backed contract, staging, full browser journey | No live provider/deployed or full OIDC browser proof | P0/P1 | Add opt-in provider checks and staging/browser smoke. |
+| Security/data lifecycle | OIDC/RBAC, token ceilings, encryption, signed events, TLS enforcement, bounded egress | Same controls reviewed in deployment, with complete data lifecycle | No chosen event/backup/WAL retention policy, edge controls, or live review | P1 | Set retention and deploy with least privilege, ingress limits, and secret custody. |
+| Observability | Request/run/task IDs, OTLP traces, Prometheus metrics/rules | Delivered alerts and useful deployed dashboards | Collector, Prometheus/Alertmanager, and alert delivery are not deployed | P1 | Verify trace export and one alert firing/recovery in staging. |
+| Performance | Synthetic local workflow and query measurements | Reproducible staging baseline with resource conditions | No production-like workload/resource envelope | P2 | Capture throughput, queue wait, P50/P95/P99, DB contention, CPU, and memory before tuning. |
+| Cloud | Container image and Compose, no cloud environment | Small single-region staging with managed PostgreSQL | No cloud account/IaC/environment selected | P1 | Choose a low-cost provider and provision only after a staging workflow is agreed. |
+| Deployment/CI | GitHub Actions tests, security/dependency scans, restore and Compose smoke | Staging promotion and tested rollback/recovery | No deployment pipeline or managed release rollback evidence | P1 | Add a manually promoted staging release with health and migration gates. |
+| UX | Dashboard for workspaces, integrations, run/event history | Complete configure → publish → run → inspect/recover journey | Authoring is API-heavy; full browser journey absent | P2 | Improve only around the proven workflow and automate its browser path. |
+| Documentation | Architecture, deployment, security, status, limitations, evidence, ADRs | One current source of truth plus executed operator runbooks | Historical audit snapshots can disagree with current status | P2 | Keep this audit snapshot and `PROJECT_STATUS.md` current; retain older audits as history. |
+| Portfolio evidence | CI, local synthetic benchmark, restore evidence, screenshots/demo | Live workflow, failure trace, deployment/recovery record | No live provider/staging artifact | P1 | Save redacted workflow/recovery evidence with exact versions and measured conditions. |
 
 ## Part I — Final project vision
 
@@ -196,6 +221,21 @@ RelayCore is not a novel workflow product category. Its differentiator is engine
 
 It risks looking generic if presented as a broad no-code automation or Zapier clone, if Demo Mode is mistaken for live payment, or if the README lists integrations without one live path. Narrow the message to developer release and incident runbooks, then show the real event-to-action history and failure case.
 
+| Dimension | Current /10 | Target /10 | How to raise any score below 8 |
+|---|---:|---:|---|
+| Problem uniqueness | 5 | 7 | Own the narrow developer runbook use case and prove it with one live workflow. |
+| Architecture depth | 8 | 9 | Show managed staging, worker recovery, and ambiguous external action behavior. |
+| Technical creativity | 6 | 8 | Explain the transactional PostgreSQL/lease trade-offs with failure evidence, not technology count. |
+| Real-world usefulness | 6 | 8 | Validate a real release/incident flow with an isolated engineering team. |
+| Engineering difficulty | 8 | 9 | Add cross-host deployment and real provider failure/recovery evidence. |
+| Interview potential | 8 | 9 | Publish the operating decisions and measured limitations. |
+| Deployability | 4 | 8 | Deploy staging and prove migrations, restore, rollback, alerts, and secrets. |
+| Demonstration strength | 8 | 9 | Pair the deterministic local demo with a short live provider run. |
+| Measurable evidence | 7 | 8 | Repeat benchmarks with workload, hardware, DB size, and worker metadata. |
+| Python Engineer relevance | 9 | 9 | Preserve depth and add real deployment operations; no keyword expansion needed. |
+
+Scores are an evidence-based assessment, not measured product metrics. Target scores are goals, not claims.
+
 ## Part K — Target architecture
 
 Keep the current modular monolith and PostgreSQL queue for the assumed small-team workload. Deploy API and worker roles separately in staging/production; the API should use RELAYCORE_WORKERS=0 when horizontally replicated. Keep the coordinator's lease/schedule/cleanup work behind safe PostgreSQL locking. Add a broker only after staging measurements demonstrate database queue contention or independent consumer scaling needs.
@@ -208,17 +248,20 @@ Retain the shared database schema as the source of truth. Add provider receipts/
 
 ## Part L — Final tech stack
 
-| Technology | Keep? | Justification |
-|---|---|---|
-| Python 3.13 / FastAPI | Yes | Fits the existing API, workers, SDK, tests, and async request surface. |
-| PostgreSQL 18 target | Yes | Durable state, transactions, queue claims, uniqueness, schedules, and event history in one source of truth. |
-| Psycopg 3 | Yes | Explicit transaction and pool behavior already tested. |
-| Authlib / OIDC | Yes | Real protocol implementation; complete provider-backed staging verification. |
-| Fernet / cryptography | Yes, with operational key custody | At-rest credential encryption is implemented; rotate with backups and maintenance controls. |
-| Standard-library SDK/CLI | Yes | Keeps the API client small and avoids a runtime dependency for simple HTTP calls. |
-| Docker Compose | Yes for local development | Reproducible local stack; it is not a production deployment architecture by itself. |
-| OpenTelemetry + Prometheus format | Yes | Useful correlation and queue/lease signals; deploy collector and alert delivery. |
-| Redis, Kafka, Kubernetes, AI/ML | No for now | No measured need; they add operating burden without fixing current gaps. |
+| Technology | Class | Why it exists; alternative considered | Operational complexity |
+|---|---|---|---|
+| Python 3.13 | ESSENTIAL | Existing backend, worker, SDK, tests, and libraries; replacing with Go/Node would rewrite working code without a measured benefit. | Runtime updates and dependency compatibility. |
+| FastAPI + Pydantic | ESSENTIAL | Typed HTTP API and validation; Django would add an ORM/admin stack and require a rewrite, while current service needs a compact API. | ASGI lifecycle, framework upgrades, and request validation discipline. |
+| PostgreSQL 18 + Psycopg 3 | ESSENTIAL | Transactions, row locks, uniqueness, leases, schedule state, and queue in one durable authority; Redis/SQS/Kafka add another consistency and operations boundary without load evidence. | Managed DB cost, connections, backups/WAL, vacuum, and migrations. |
+| Process workers + coordinator | ESSENTIAL | Current durable execution path and crash/lease semantics; Celery or an external broker is unnecessary before a measured need. | Separate role lifecycle, unique worker IDs, shutdown, and lease tuning. |
+| Authlib + OIDC | ESSENTIAL | Real user identity and verified issuer/session flow; static credentials remain demo-only. | Provider configuration, session lifecycle, callbacks, and live verification. |
+| Fernet / cryptography | ESSENTIAL | Encrypt provider/webhook secrets stored in PostgreSQL; cloud KMS is a later custody option, not a substitute for key lifecycle design. | Master-key custody, backup compatibility, and rotation operations. |
+| Uvicorn | USEFUL | Standard ASGI server for FastAPI; no custom server is warranted. | Process startup, health, and graceful shutdown configuration. |
+| Docker + Compose | USEFUL | Reproducible local stack and CI split-role smoke; Compose alone is not production orchestration. | Image patching, secrets, storage, and deployment-specific config. |
+| GitHub/Slack API clients | USEFUL | Real developer event sources/actions; additional connectors add little until this workflow is proven. | Scopes, provider changes, rate limits, and test installations. |
+| OpenTelemetry + Prometheus format | USEFUL | Correlation and queue/lease metrics already implemented; a vendor agent could replace exporters but would couple operations to one vendor. | Collector/backend, alert routing, dashboards, and retention are not yet deployed. |
+| Standard-library SDK/CLI | USEFUL | Simple authenticated API access without a client runtime dependency; package-index hosting is optional. | Compatibility/versioning and release maintenance if published. |
+| Redis, Kafka, Celery, Kubernetes, AI/ML | REMOVE for now | No measured scale or product requirement needs them; they add cost, failure modes, and maintenance without closing current release gaps. | Additional infrastructure, security boundaries, and operational expertise. |
 
 ## Part M — Real integrations
 
@@ -238,18 +281,18 @@ Retain the shared database schema as the source of truth. Add provider receipts/
 - Verified OIDC issuer/subject/email checks; opaque hashed application sessions; current workspace membership and role lookup.
 - Cookie mutation origin checks; parameterized SQL; strict Pydantic input validation; fixed workflow action allow-list; no user Python/shell execution.
 - High-entropy API tokens shown once and stored as SHA-256 hashes; workspace binding, expiry, current role checks, revocation.
+- Long-lived SSE polls revalidate workspace membership and session/token status; production PostgreSQL connections require `sslmode=verify-full`.
 - Fernet-encrypted webhook and provider credentials; webhook HMAC over timestamp, event ID, and raw body; freshness, payload-size, and dedupe controls.
-- HTTPS-only HTTP action with exact host allowlist, public DNS check/address pinning, hostname TLS verification, no redirects, bounded response, and safe history.
+- HTTPS-only HTTP action with exact host allowlist, bounded public DNS resolution/address pinning, hostname TLS verification, no redirects, bounded response, and safe history; the worker caps provider action time to half its lease.
 - Sandbox action separation and production rejection; request IDs and structured failure logs omit exception contents and secrets.
 
 ### Security priorities
 
-1. Close the open SSE authorization lifetime described in finding 1.
-2. Bound DNS resolution and keep leases/action behavior consistent as described in finding 2.
-3. Enforce verified database TLS in the production connection policy, not only in operator documentation.
-4. Define webhook metadata, backup, and WAL retention together.
-5. Keep API tokens short-lived; decide whether full-role delegation is acceptable before inviting external SDK users.
-6. Add edge network/rate limits, secret-manager custody, container scanning, and a live security review before broad public ingress.
+1. Verify live OIDC/provider setup and authorization behavior in a controlled staging environment.
+2. Define webhook event metadata, database backups, and WAL retention together.
+3. Keep API tokens short-lived and retain current role ceilings; add finer scopes only if actual SDK use requires them.
+4. Preserve the at-least-once external action contract and add provider receipts/reconciliation only where supported.
+5. Add deployed ingress limits, secret-manager custody, alert/trace delivery, and an environment-specific security review before broad public ingress.
 
 SSRF, XSS, CSRF, SQL injection, and prompt injection were reviewed at the source/design level. No AI or arbitrary-code execution path exists, so prompt-injection controls are not applicable.
 
@@ -258,10 +301,10 @@ SSRF, XSS, CSRF, SQL injection, and prompt injection were reviewed at the source
 | Failure | Current behavior | Remaining limit / expected target |
 |---|---|---|
 | Database unavailable | API/worker requests fail; worker reconnect loop and recovery tests cover interruption. | Stage with managed failover and test accepted work after recovery. |
-| Worker exits or lease expires | Coordinator retries with bounded backoff or dead-letters; another worker may claim. | Include resolver stalls and long provider delays in lease tests. |
+| Worker exits or lease expires | Coordinator retries with bounded backoff or dead-letters; another worker may claim. HTTP/Slack actions renew before the provider call and use an action deadline capped at half the lease. | Verify provider delays and operational behavior in staging; timed-out DNS resolver threads cannot be cancelled, but concurrency is bounded. |
 | Duplicate input | Unique event/idempotency constraints avoid duplicate runs for the same key/payload; mismatched payload conflicts. | Keep key-retention behavior aligned with metadata cleanup. |
 | Queue full / rate limit | Admission returns a bounded error rather than growing an in-memory backlog. | Measure client retry/backoff behavior in staging. |
-| HTTP provider timeout/5xx/429 | Retryable classification; stable idempotency key; bounded response; permanent failures dead-letter. | Destination must honor idempotency; DNS can exceed configured timeout. |
+| HTTP provider timeout/5xx/429 | Retryable classification; stable idempotency key; bounded response; permanent failures dead-letter. DNS and HTTPS share one deadline; timeout does not open a connection. | Destination must honor idempotency; outcome can still be ambiguous if the provider accepted a request before a response was lost. |
 | Slack 429/provider error | Retry delay is persisted where available; permanent errors dead-letter. | Slack message may duplicate after accepted request and lost response. |
 | Cancellation during provider call | New steps stop; in-flight action may finish and its result is recorded after cancel. | Expose this terminal state clearly and verify it with live providers. |
 | Event payload expires | Bodies clear in batches; nonterminal runs protected; expired event-dependent DLQ replay is rejected. | Metadata and backups remain until a product policy is chosen. |
@@ -283,18 +326,16 @@ Useful correlation chain: request_id → webhook event ID → workflow run ID an
 ### Current coverage
 
 - PostgreSQL integration tests cover transactions, migrations, idempotency, queue saturation, concurrent dispatch, versions, tenancy/RBAC, webhook verification/expiry, OAuth state, credentials, SDK/CLI, action classification, worker recovery, service restart, secret rotation, telemetry, and restore-drill guardrails.
-- CI runs Ruff, pre-commit, pytest with an 80% app-source coverage floor, both Compose config checks, Prometheus rule/config tests, a Docker image build, a PostgreSQL 16 backup/restore job, and a Python dependency audit.
+- CI runs Ruff, Mypy, pre-commit, pytest with an 80% app-source coverage floor, both Compose config checks, browser/separate-worker smoke, Prometheus rule/config tests, a Docker image build and scan, a PostgreSQL 16 backup/restore job, and a Python dependency audit.
 - There are real child-process and PostgreSQL restart tests, not only mocked unit tests.
 
 ### Gaps
 
-- No browser E2E from login through workspace selection and live dashboard stream.
+- No full browser journey from OIDC login through workspace selection, token operations, live dashboard updates, and reconnect. CI has a narrower dashboard/separate-worker browser smoke.
 - No live provider contract test or deployed smoke test.
-- No test revokes membership/session/token during an open SSE stream.
-- No bounded-resolver/short-lease duplicate test.
-- No production load or resource benchmark, property-based suite, static type check, image/OS scan, or deployed alert/collector test.
+- No managed production load/resource benchmark, property-based suite, or deployed alert/collector test.
 
-Tests that matter next: streaming authorization revocation; DNS stall while a leased task is active; real provider happy path plus duplicate/429/outage path; staging migrations/restore; and browser smoke once an OIDC test provider exists. Keep synthetic results labeled as simulated or local measured data.
+Tests that matter next: real provider happy path plus duplicate/429/outage path; staging migrations/restore; deployed alert/trace delivery; and a complete browser journey once an OIDC test provider exists. Keep synthetic results labeled as simulated or local measured data.
 
 ## Part R — Performance and benchmark plan
 
@@ -335,16 +376,16 @@ Start with one modest API instance, one or two workers, and a small managed Post
 
 ## Part U — Transformation roadmap
 
-### Phase 1 — Close authorization and action-lease gaps
+### Phase 1 — Close authorization and action-lease gaps (implemented and locally/CI tested)
 
-- **Objective:** ensure revoked users stop receiving stream data; prevent unbounded DNS delay from silently exceeding task lease assumptions.
+- **Objective:** ensure revoked users stop receiving stream data; prevent DNS and provider action deadlines from silently exceeding task lease assumptions.
 - **Existing code:** app/main.py SSE route and identity dependencies; app/http_action.py DNS/HTTP path; worker lease heartbeat/recovery; tests/test_workflows.py and tests/test_http_action.py.
 - **Keep:** workspace scoping, pinned HTTPS, immutable workflow state, at-least-once contract.
-- **Change:** periodically revalidate/terminate SSE sessions; put DNS under an explicit bounded strategy and align action execution with lease renewal.
+- **Change:** revalidate/terminate SSE streams on each poll; bound DNS resolution, renew the task lease before provider execution, and cap provider action time to half the lease.
 - **Capability:** reliable revocation and bounded external request lifecycle.
-- **Tests/security:** revoke session, API token, and membership mid-stream; stall resolver longer than lease; check whether any duplicate action occurs.
+- **Tests/security:** session, API token, and membership revocation during a stream; stalled resolver; shared DNS/HTTPS timeout budget; no outbound connection after timeout. CI also exercises the full PostgreSQL suite.
 - **Observability:** log stream close reason and action timeout/lease outcome without payload or secret.
-- **Acceptance/evidence:** no post-revocation events; resolver delay cannot cause uncontrolled overlapping action; tests pass on PostgreSQL 18 CI; record the exact failure scenario and result.
+- **Acceptance/evidence:** no post-revocation events; timed-out resolver does not connect and action deadlines leave lease headroom. Regression coverage is present; the latest source CI run passed these checks.
 
 ### Phase 2 — Prove one live developer workflow
 
@@ -362,7 +403,7 @@ Start with one modest API instance, one or two workers, and a small managed Post
 - **Objective:** move from local reproducibility to controlled deploy/recovery.
 - **Existing code:** Dockerfile, Compose worker role, migrations, scripts/backup.ps1, scripts/restore.ps1, scripts/rotate_secrets.py, deployment/runbooks.
 - **Keep:** non-root container, separate worker mode, tested restore and offline key rotation.
-- **Change:** enforce verified database TLS; add image digest release, migration compatibility/rollback process, secret manager configuration, external backups/WAL retention, health/readiness policy, and ingress limits.
+- **Change:** verify managed-database TLS trust; add image digest release, migration compatibility/rollback process, secret manager configuration, external backups/WAL retention, health/readiness policy, and ingress limits.
 - **Capability:** safe staged upgrade and recoverable service operation.
 - **Tests/security:** configuration rejection for insecure DB DSN; restore to clean target; rotation with previous backup key; worker drain/restart; ingress cap/rate tests.
 - **Observability:** deployed alerts and traces; attach release/schema versions to logs.
@@ -394,8 +435,8 @@ Start with one modest API instance, one or two workers, and a small managed Post
 
 A phase is complete only when its acceptance checks pass in CI or the target staging environment and the evidence is saved:
 
-1. No stream delivers events after session, token, or membership revocation.
-2. Resolver/action timeouts cannot outlive the chosen lease policy without an explicit in-flight state and idempotency outcome.
+1. **Passed in current code/CI:** no stream delivers events after session, token, or membership revocation.
+2. **Passed for timeout budget in current code/CI:** a timed-out resolver does not open a network connection; provider action deadlines are capped at half the worker lease. Ambiguous accepted-provider outcomes remain at-least-once and are not claimed solved.
 3. One real signed provider delivery triggers one immutable workflow in staging.
 4. Staging verifies TLS, deployment roles, migrations, backup/restore, rollback, key rotation, alert delivery, and trace export.
 5. Retention includes live rows plus backups/WAL and has an owner-approved policy.
@@ -444,28 +485,30 @@ The project can support a grounded 30-minute discussion on:
 ## Part Z — Final verdict
 
 1. **Is the current foundation worth preserving?** Yes. PostgreSQL-backed durable execution is the strongest part.
-2. **Should any subsystem be rebuilt?** No full rebuild. Fix SSE authorization lifetime and the bounded DNS/lease action boundary; evolve deployment and reconciliation selectively.
+2. **Should any subsystem be rebuilt?** No full rebuild. SSE reauthorization, the bounded DNS/action deadline, TLS startup enforcement, and token role ceilings are implemented. Evolve provider reconciliation and deployment operations selectively.
 3. **Is the project unique enough?** It is technically credible, but not a novel product category. Its defensible identity is a tested PostgreSQL-centered developer workflow engine with failure evidence.
-4. **Five highest-value improvements?** (a) close SSE revocation; (b) bound resolver/action behavior against lease expiry; (c) complete one live provider flow; (d) deploy staging with verified DB TLS, migrations, restore, alerts, and traces; (e) define metadata/backup retention and token authority.
+4. **Five highest-value improvements?** (a) complete one live provider flow; (b) establish managed staging and verify migrations, restore, alerts, and traces; (c) define event/backup/WAL retention; (d) exercise duplicate, rate-limit, outage, and ambiguous-action behavior against a real test provider; (e) complete the browser user journey and measured staging benchmark.
 5. **What should not be added?** AI/ML, Redis/Kafka, Kubernetes, multi-region, connector sprawl, or a broad visual builder before actual user demand and measurement.
 6. **What would make this exceptional?** One live GitHub-to-action workflow, tested under duplicate delivery, worker loss, provider outage, restore, and staged deployment, with evidence another engineer can reproduce.
 7. **What would make it look generic?** Calling it a no-code automation clone, claiming exactly-once/production scale, or presenting simulated charge/payment effects as real integrations.
-8. **What should be built first?** Fix stream reauthorization and resolver/lease behavior. Then use real test credentials to verify one end-to-end workflow.
+8. **What should be built first?** The core security/timeout fixes are already present. The next phase is a narrow staging integration test once an isolated test provider and staging environment are configured.
 
-## Validation performed for this audit
+## Current snapshot verification — 2026-10-09
 
-- Local full suite on the disposable PostgreSQL 17.9 database: **106 passed**, **81.51% app coverage** (80% floor).
-- Current GitHub Actions at the audited revision: [tests and PostgreSQL 16 restore drill](https://github.com/Jithendra-coder/RelayCore/actions/runs/37783826558) passed; PostgreSQL 18 test job reports **106 passed, 82.37% app coverage**. [Dependency advisory audit](https://github.com/Jithendra-coder/RelayCore/actions/runs/37783826609) passed.
-- Local Ruff and Python compileall passed; relaycore --help works. CI also passed pre-commit, editable package install, both Compose config validations, Prometheus config/rule tests, and Docker image build.
-- Working tree was clean before this report. Runtime/application code was not changed for this audit.
+- Local Ruff passed for `app`, `tests`, `benchmarks`, `scripts`, and `sdk`; Mypy passed for all 24 configured source files; pre-commit passed after putting the project Python 3.13 environment first on `PATH`.
+- **25 database-independent tests passed** across `tests/test_http_action.py` and `tests/test_store_types.py`.
+- The complete local PostgreSQL suite could not run: the configured disposable database at `127.0.0.1:55433` is unavailable and Docker is not installed on this machine. Compose validation and image/runtime smoke are therefore delegated to CI.
+- Runtime code at `20a77d0` passed GitHub Actions run [37947393988](https://github.com/Jithendra-coder/RelayCore/actions/runs/37947393988): **131 tests, 82.98% app coverage**, browser/separate-worker smoke, Compose, Prometheus, SDK wheel, type/lint/pre-commit, and restore checks. Container security [37947393997](https://github.com/Jithendra-coder/RelayCore/actions/runs/37947393997) and dependency audit [37947393982](https://github.com/Jithendra-coder/RelayCore/actions/runs/37947393982) passed.
+- Documentation-only revision `ce2b62c` passed GitHub Actions run [37947783510](https://github.com/Jithendra-coder/RelayCore/actions/runs/37947783510): **131 tests at 82.98% app coverage**, browser/separate-worker smoke, Compose, Prometheus, SDK wheel, type/lint/pre-commit, and PostgreSQL 16 restore of 17 migrations. Container security [37947783589](https://github.com/Jithendra-coder/RelayCore/actions/runs/37947783589) and dependency audit [37947783702](https://github.com/Jithendra-coder/RelayCore/actions/runs/37947783702) passed.
+- No live OIDC, GitHub, or Slack credentials, `.env`, staging service, cloud environment, deployed Prometheus/Alertmanager/collector, or managed backup policy is configured here.
 
-## Not checked
+## Audit boundary
 
-No live OIDC/GitHub/Slack account, cloud environment, deployed Prometheus/Alertmanager/collector, browser E2E, production network, or managed-backup policy was available. Docker was unavailable locally; Compose/image checks were verified in CI. The source review focused on trust boundaries, persistence, workers, integrations, tests, and operations; it did not line-read every static CSS/HTML statement or each historical migration constraint.
+The inspection covered source/API/auth, integrations, persistence and migrations, worker/coordinator behavior, tests, SDK/CLI, deployment/configuration, CI, observability, benchmarks, and product documentation. It did not line-read every static HTML/CSS statement or every historical migration constraint. No runtime/application code was changed as part of this audit refresh.
 
-## Remediation follow-up — 2026-10-08
+## Historical remediation follow-up — 2026-10-08
 
-The findings above describe audited revision `0957c1f`; the following follow-up is against the current working tree:
+This section records the changes that followed the original `0957c1f` audit snapshot; current findings and status are summarized above.
 
 1. **SSE revocation:** each poll now validates current workspace membership and the backing session or API token. Regression tests revoke each credential/membership during an open stream and confirm it closes on the next poll.
 2. **DNS and lease budget:** outbound HTTP and Slack actions use one total deadline across DNS, connection, and response handling. The worker renews the task lease immediately before the provider call and caps the action deadline at half the lease. DNS calls that cannot be cancelled are bounded by a four-slot semaphore; timeout/capacity failures do not open an outbound connection. Lease settings below 0.2 seconds are rejected.
