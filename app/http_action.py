@@ -9,6 +9,7 @@ import socket
 import ssl
 import threading
 import time
+from collections.abc import Iterator
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 from uuid import UUID
 
@@ -19,6 +20,7 @@ _HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _FORBIDDEN_HEADERS = {"authorization", "connection", "content-length", "cookie", "host", "idempotency-key",
                       "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"}
 _EVENT_REFERENCE = "$event"
+_STEP_REFERENCE = "$step"
 _DNS_RESOLVER_SLOTS = threading.BoundedSemaphore(4)
 _SENSITIVE_KEYS = {"access_token", "accesstoken", "api_key", "apikey", "authorization", "client_secret",
                    "clientsecret", "password", "private_key", "refresh_token", "refreshtoken", "secret",
@@ -137,26 +139,51 @@ def validate_http_step(payload: dict) -> None:
             json.dumps(payload["body"], ensure_ascii=False, allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise ValueError("HTTP action body must be valid JSON.") from exc
-        _validate_event_references(payload["body"])
+        _validate_body_references(payload["body"])
     timeout = payload.get("timeout_seconds", MAX_TIMEOUT_SECONDS)
     if (not isinstance(timeout, (int, float)) or isinstance(timeout, bool)
             or not 0.1 <= timeout <= MAX_TIMEOUT_SECONDS):
         raise ValueError(f"HTTP action timeout_seconds must be between 0.1 and {MAX_TIMEOUT_SECONDS}.")
 
 
-def _validate_event_references(value) -> None:
+def _valid_json_pointer(value: object) -> bool:
+    return (isinstance(value, str) and value.startswith("/") and len(value) <= 512
+            and re.search(r"~(?![01])", value) is None)
+
+
+def _validate_body_references(value) -> None:
     if isinstance(value, dict):
         if _EVENT_REFERENCE in value:
             pointer = value[_EVENT_REFERENCE]
-            if (set(value) != {_EVENT_REFERENCE} or not isinstance(pointer, str) or not pointer.startswith("/")
-                    or len(pointer) > 512 or re.search(r"~(?![01])", pointer)):
+            if set(value) != {_EVENT_REFERENCE} or not _valid_json_pointer(pointer):
                 raise ValueError("HTTP body event references must be {$event: '/json/pointer'} objects.")
             return
+        if _STEP_REFERENCE in value:
+            reference = value[_STEP_REFERENCE]
+            if (set(value) != {_STEP_REFERENCE} or not isinstance(reference, dict)
+                    or set(reference) != {"index", "pointer"} or type(reference["index"]) is not int
+                    or reference["index"] < 0 or not _valid_json_pointer(reference["pointer"])):
+                raise ValueError("HTTP body step references must be {$step: {index, pointer}} objects.")
+            return
         for item in value.values():
-            _validate_event_references(item)
+            _validate_body_references(item)
     elif isinstance(value, list):
         for item in value:
-            _validate_event_references(item)
+            _validate_body_references(item)
+
+
+def step_references(value) -> Iterator[tuple[int, str]]:
+    if isinstance(value, dict):
+        if _STEP_REFERENCE in value:
+            reference = value[_STEP_REFERENCE]
+            if isinstance(reference, dict) and type(reference.get("index")) is int:
+                yield reference["index"], reference.get("pointer", "")
+            return
+        for item in value.values():
+            yield from step_references(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from step_references(item)
 
 
 def has_event_references(value) -> bool:
@@ -167,27 +194,37 @@ def has_event_references(value) -> bool:
     return False
 
 
-def _resolve_event_references(value, event_payload):
+def _resolve_json_pointer(document, pointer: str, label: str):
+    current = document
+    for part in pointer[1:].split("/"):
+        part = part.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        elif isinstance(current, list) and part.isdigit() and (part == "0" or not part.startswith("0")):
+            index = int(part)
+            if index >= len(current):
+                raise PermanentActionError(f"HTTP action {label} was not present.")
+            current = current[index]
+        else:
+            raise PermanentActionError(f"HTTP action {label} was not present.")
+    return current
+
+
+def _resolve_body_references(value, event_payload, step_results):
     if isinstance(value, dict):
         if _EVENT_REFERENCE in value:
             if not isinstance(event_payload, dict):
                 raise PermanentActionError("HTTP action requires a webhook event payload.")
-            current = event_payload
-            for part in value[_EVENT_REFERENCE][1:].split("/"):
-                part = part.replace("~1", "/").replace("~0", "~")
-                if isinstance(current, dict) and part in current:
-                    current = current[part]
-                elif isinstance(current, list) and part.isdigit() and (part == "0" or not part.startswith("0")):
-                    index = int(part)
-                    if index >= len(current):
-                        raise PermanentActionError("HTTP action event reference was not present.")
-                    current = current[index]
-                else:
-                    raise PermanentActionError("HTTP action event reference was not present.")
-            return current
-        return {key: _resolve_event_references(item, event_payload) for key, item in value.items()}
+            return _resolve_json_pointer(event_payload, value[_EVENT_REFERENCE], "event reference")
+        if _STEP_REFERENCE in value:
+            reference = value[_STEP_REFERENCE]
+            result = step_results.get(reference["index"]) if isinstance(step_results, dict) else None
+            if not isinstance(result, dict):
+                raise PermanentActionError("HTTP action step result was not present.")
+            return _resolve_json_pointer(result, reference["pointer"], "step result reference")
+        return {key: _resolve_body_references(item, event_payload, step_results) for key, item in value.items()}
     if isinstance(value, list):
-        return [_resolve_event_references(item, event_payload) for item in value]
+        return [_resolve_body_references(item, event_payload, step_results) for item in value]
     return value
 
 
@@ -243,7 +280,8 @@ def _redact_json(value, credential: str):
 
 
 def execute_http_action(payload: dict, credential: str, idempotency_key: str,
-                        credential_host: str | None, event_payload: dict | None = None) -> dict:
+                        credential_host: str | None, event_payload: dict | None = None,
+                        step_results: dict[int, dict] | None = None) -> dict:
     validate_http_step(payload)
     if not credential or any(ord(c) < 32 or ord(c) == 127 for c in credential):
         raise PermanentActionError("HTTP action credential is invalid.")
@@ -255,7 +293,7 @@ def execute_http_action(payload: dict, credential: str, idempotency_key: str,
     headers = {"Accept": "application/json", "Authorization": f"Bearer {credential}",
                "Idempotency-Key": idempotency_key, "User-Agent": "RelayCore/0.1"}
     if "body" in payload:
-        resolved_body = _resolve_event_references(payload["body"], event_payload)
+        resolved_body = _resolve_body_references(payload["body"], event_payload, step_results)
         body = json.dumps(resolved_body, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
         if len(body) > 4096:
             raise PermanentActionError("Rendered HTTP action body exceeded the 4 KiB limit.")

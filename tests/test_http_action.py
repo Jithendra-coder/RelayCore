@@ -8,6 +8,7 @@ import time
 import pytest
 
 import app.http_action as http_action
+from app.models import WorkflowRequest
 
 PinnedHTTPSConnection = http_action._PinnedHTTPSConnection
 
@@ -205,6 +206,20 @@ def test_http_action_resolves_limited_event_references_in_json_body(monkeypatch)
     )
 
 
+def test_http_action_resolves_prior_step_response_references(monkeypatch):
+    connections = fake_transport(monkeypatch)
+    request = payload(body={
+        "task_id": {"$step": {"index": 0, "pointer": "/body/task/id"}},
+        "status": "ready",
+    })
+    previous_results = {0: {"status_code": 201, "body": {"task": {"id": "task-42"}}}}
+
+    http_action.execute_http_action(request, "workspace-token-123456", "run:1", "hooks.example.com",
+                                    step_results=previous_results)
+
+    assert connections[0].args[2] == b'{"task_id":"task-42","status":"ready"}'
+
+
 @pytest.mark.parametrize("reference", [
     {"$event": "type"}, {"$event": "/type~2name"}, {"$event": "/type", "fixed": True},
 ])
@@ -212,6 +227,56 @@ def test_http_action_rejects_invalid_event_references(monkeypatch, reference):
     monkeypatch.setenv("RELAYCORE_HTTP_ALLOWED_HOSTS", "hooks.example.com")
     with pytest.raises(ValueError, match="event references"):
         http_action.validate_http_step(payload(body={"value": reference}))
+
+
+@pytest.mark.parametrize("reference", [
+    {"$step": {"index": True, "pointer": "/body/id"}},
+    {"$step": {"index": 0, "pointer": "body/id"}},
+    {"$step": {"index": 0, "pointer": "/body/id~2"}},
+    {"$step": {"index": 0, "pointer": "/body/id", "extra": True}},
+])
+def test_http_action_rejects_invalid_step_references(monkeypatch, reference):
+    monkeypatch.setenv("RELAYCORE_HTTP_ALLOWED_HOSTS", "hooks.example.com")
+    with pytest.raises(ValueError, match="step references"):
+        http_action.validate_http_step(payload(body={"value": reference}))
+
+
+def test_http_action_dead_letters_missing_or_oversized_step_mappings(monkeypatch):
+    connections = fake_transport(monkeypatch)
+    request = payload(body={"value": {"$step": {"index": 0, "pointer": "/body/id"}}})
+    with pytest.raises(http_action.PermanentActionError, match="step result"):
+        http_action.execute_http_action(request, "workspace-token-123456", "run:1", "hooks.example.com")
+    with pytest.raises(http_action.PermanentActionError, match="4 KiB"):
+        http_action.execute_http_action(request, "workspace-token-123456", "run:1", "hooks.example.com",
+                                        step_results={0: {"body": {"id": "x" * 4096}}})
+    assert connections == []
+
+
+def test_workflow_step_references_require_an_earlier_http_action(monkeypatch):
+    monkeypatch.setenv("RELAYCORE_HTTP_ALLOWED_HOSTS", "hooks.example.com")
+    credential = "55c1be96-88c5-4bc4-841e-5c9dc6e8b229"
+
+    def http_step(body):
+        return {"name": "HTTP", "action": "http", "payload": {
+            "method": "POST", "url": "https://hooks.example.com/events", "credential_id": credential,
+            "body": body,
+        }}
+
+    reference = {"$step": {"index": 0, "pointer": "/body/id"}}
+    workflow = WorkflowRequest(title="Map response", steps=[http_step({}), http_step({"id": reference})])
+    assert len(workflow.steps) == 2
+
+    with pytest.raises(ValueError, match="earlier workflow step"):
+        WorkflowRequest(title="Forward reference", steps=[http_step({"id": reference}), http_step({})])
+    with pytest.raises(ValueError, match="earlier workflow step"):
+        WorkflowRequest(title="Self reference", steps=[http_step({"id": {"$step": {
+            "index": 0, "pointer": "/body/id",
+        }}})])
+    with pytest.raises(ValueError, match="earlier HTTP action"):
+        WorkflowRequest(title="Non-HTTP source", steps=[
+            {"name": "Slack", "action": "slack_message", "payload": {"channel": "C12345678", "text": "ready"}},
+            http_step({"id": reference}),
+        ])
 
 
 def test_http_action_dead_letters_missing_or_oversized_event_mappings(monkeypatch):

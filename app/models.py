@@ -8,7 +8,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
-from app.http_action import validate_http_host, validate_http_step
+from app.http_action import step_references, validate_http_host, validate_http_step
 from app.slack import validate_message_step
 
 
@@ -58,6 +58,18 @@ class WorkflowRequest(BaseModel):
     title: str = Field(min_length=1, max_length=120)
     steps: list[WorkflowStep] = Field(min_length=1, max_length=20)
     trigger: WebhookTriggerRequest | None = None
+
+    @model_validator(mode="after")
+    def validate_step_references(self) -> "WorkflowRequest":
+        for index, step in enumerate(self.steps):
+            if step.action != "http":
+                continue
+            for source_index, _ in step_references(step.payload.get("body")):
+                if source_index >= index:
+                    raise ValueError("HTTP step references must point to an earlier workflow step.")
+                if self.steps[source_index].action != "http":
+                    raise ValueError("HTTP step references can only read an earlier HTTP action result.")
+        return self
 
 
 class ScheduleCreateRequest(BaseModel):

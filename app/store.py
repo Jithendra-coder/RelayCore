@@ -12,7 +12,7 @@ from psycopg import Connection as PsycopgConnection
 from psycopg.types.json import Jsonb
 
 from app.secretbox import credential_fingerprint, decrypt_secret, encrypt_secret
-from app.http_action import PermanentActionError, RetryableActionError, has_event_references
+from app.http_action import (PermanentActionError, RetryableActionError, has_event_references, step_references)
 from app.telemetry import current_traceparent
 from app.settings import (DEMO_MODE, MAX_ATTEMPTS, MAX_QUEUE_DEPTH, MAX_SCHEDULES_PER_TENANT,
                           RATE_LIMIT_PER_MINUTE, WEBHOOK_PAYLOAD_RETENTION_DAYS)
@@ -1843,9 +1843,19 @@ def execute_step(conn: DBConnection, worker_id: str, task: dict[str, Any], reque
             action_payload = {**payload, "timeout_seconds": min(
                 float(payload.get("timeout_seconds", MAX_TIMEOUT_SECONDS)), MAX_TIMEOUT_SECONDS, LEASE_SECONDS / 2,
             )}
+            referenced_indices = sorted({source for source, _ in step_references(payload.get("body"))})
+            step_results: dict[int, dict[str, Any]] = {}
+            if referenced_indices:
+                rows = conn.execute(
+                    """SELECT step_index,result FROM side_effects
+                       WHERE tenant_id=%s AND run_id=%s AND step_index<%s AND step_index=ANY(%s)""",
+                    (task["tenant_id"], task["run_id"], index, referenced_indices),
+                ).fetchall()
+                step_results = {row["step_index"]: row["result"] for row in rows}
             heartbeat(conn, worker_id, task["id"], LEASE_SECONDS)
             result = execute_http_action(action_payload, credential["secret"], f"{task['run_id']}:{index}",
-                                         credential["allowed_host"], task.get("trigger_payload"))
+                                         credential["allowed_host"], task.get("trigger_payload"),
+                                         step_results=step_results)
         else:
             from app.slack import post_message
 

@@ -517,9 +517,10 @@ def test_production_workflow_runs_only_allowlisted_http_steps(client, monkeypatc
 
     calls = []
 
-    def send(payload, credential, idempotency_key, allowed_host, event_payload=None):
-        calls.append((payload, credential, idempotency_key, allowed_host, event_payload))
-        return {"status_code": 202, "response_bytes": 0, "content_type": "application/json"}
+    def send(payload, credential, idempotency_key, allowed_host, event_payload=None, step_results=None):
+        calls.append((payload, credential, idempotency_key, allowed_host, event_payload, step_results))
+        return {"status_code": 202, "response_bytes": 0, "content_type": "application/json",
+                "body": {"id": "created-id"}}
 
     monkeypatch.setattr(http_action, "execute_http_action", send)
     run_headers = {**scoped_headers, "Idempotency-Key": "http:workflow:run"}
@@ -530,8 +531,27 @@ def test_production_workflow_runs_only_allowlisted_http_steps(client, monkeypatc
     assert completed["status"] == "completed"
     assert completed["side_effects"][0]["result"]["status_code"] == 202
     assert calls == [({**steps[0]["payload"], "timeout_seconds": 0.6}, stored_secret,
-                       f"{run.json()['id']}:0", "hooks.example.com", None)]
+                       f"{run.json()['id']}:0", "hooks.example.com", None, {})]
     assert "timeout_seconds" not in steps[0]["payload"]
+
+    chained_steps = [steps[0], {"name": "forward task id", "action": "http", "payload": {
+        "method": "POST", "url": "https://hooks.example.com/v1/tasks",
+        "credential_id": stored.json()["id"],
+        "body": {"created_task": {"$step": {"index": 0, "pointer": "/body/id"}}},
+    }}]
+    chained = client.post("/api/workflow-definitions", headers={**scoped_headers,
+                          "Idempotency-Key": "http:workflow:chain"},
+                          json={"title": "Chain HTTP response", "steps": chained_steps})
+    assert chained.status_code == 201, chained.text
+    chained_run = client.post(f"/api/workflow-definitions/{chained.json()['id']}/runs",
+                              headers={**scoped_headers, "Idempotency-Key": "http:workflow:chain:run"})
+    assert chained_run.status_code == 202, chained_run.text
+    drive_run(client, workspace_id, worker_id="production-http-chain-worker")
+    chained_result = get_run(client, chained_run.json()["id"], workspace_id)
+    assert chained_result["status"] == "completed" and len(chained_result["side_effects"]) == 2
+    assert calls[-2][5] == {}
+    assert calls[-1][5] == {0: {"status_code": 202, "response_bytes": 0, "content_type": "application/json",
+                                "body": {"id": "created-id"}}}
     repeated = client.post(f"/api/workflow-definitions/{definition.json()['id']}/runs", headers=run_headers)
     assert repeated.status_code == 202 and repeated.json()["created"] is False
 
@@ -664,7 +684,7 @@ def test_production_workflow_runs_only_allowlisted_http_steps(client, monkeypatc
     assert cancelled_run.status_code == 202, cancelled_run.text
     started, release = threading.Event(), threading.Event()
 
-    def slow_send(_payload, _credential, _idempotency_key, _allowed_host, _event_payload=None):
+    def slow_send(_payload, _credential, _idempotency_key, _allowed_host, _event_payload=None, step_results=None):
         started.set()
         assert release.wait(5)
         return {"status_code": 202, "response_bytes": 0, "content_type": "application/json"}
