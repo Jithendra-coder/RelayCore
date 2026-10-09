@@ -313,6 +313,8 @@ def test_dashboard_uses_session_auth_and_requires_workspace_selection():
     assert "if(cfg.worker_count===0)" in html
     assert "button.remove()" in html
     assert "managed outside API" in html
+    assert "RelayCore API is unreachable. For the local demo" in html
+    assert "throw apiError(e)" in html
 
 
 def test_oidc_configuration_requires_complete_https_credentials(monkeypatch):
