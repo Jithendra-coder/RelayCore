@@ -12,6 +12,8 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from playwright.sync_api import expect, sync_playwright
+
 
 ROOT = Path(__file__).resolve().parents[1]
 API_KEY = "relaycore-compose-smoke-admin"
@@ -39,6 +41,35 @@ def _request_json(
             return payload
     except HTTPError as exc:
         raise RuntimeError(f"Compose smoke request returned HTTP {exc.code}: {method} {path}") from exc
+
+
+def _dashboard_run(base_url: str) -> str:
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.add_init_script(f"sessionStorage.setItem('relaycore-key', {json.dumps(API_KEY)});")
+            page_errors: list[str] = []
+            page.on("pageerror", lambda error: page_errors.append(str(error)))
+            page.goto(base_url, wait_until="domcontentloaded")
+            expect(page.get_by_role("heading", name="Workflow operations")).to_be_visible()
+            expect(page.locator("#healthText")).to_have_text("Operational", timeout=15_000)
+            expect(page.locator("#modeTag")).to_have_text("SANDBOX MODE")
+
+            run_button = page.get_by_role("button", name="Run demo")
+            run_button.focus()
+            page.keyboard.press("Enter")
+            run = page.locator("#runs .run.selected")
+            expect(run).to_be_visible(timeout=10_000)
+            run_id = run.get_attribute("data-run")
+            if not run_id:
+                raise RuntimeError("Dashboard did not select the newly created workflow run.")
+            expect(run.locator(".status")).to_have_text("completed", timeout=40_000)
+            if page_errors:
+                raise RuntimeError("Dashboard raised a JavaScript error: " + "; ".join(page_errors))
+            return run_id
+        finally:
+            browser.close()
 
 
 def _environment(port: int, database_password: str) -> dict[str, str]:
@@ -91,9 +122,7 @@ def main() -> None:
         else:
             raise RuntimeError("Compose API did not become reachable after its health check passed.")
 
-        run_id = _request_json(base_url, "/api/demo/start", method="POST").get("id")
-        if not run_id:
-            raise RuntimeError("Demo Mode did not return a workflow run ID.")
+        run_id = _dashboard_run(base_url)
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             run = _request_json(base_url, f"/api/workflows/{run_id}")
@@ -101,7 +130,7 @@ def main() -> None:
                 effects = len(run.get("side_effects", []))
                 if effects != 4:
                     raise RuntimeError(f"Compose workflow persisted {effects} side-effect rows; expected 4.")
-                print("Compose smoke passed: separate API and worker completed four durable step results.")
+                print("Browser smoke passed: dashboard keyboard action and separate worker completed four durable steps.")
                 return
             if run.get("status") in {"failed", "cancelled"}:
                 raise RuntimeError(f"Compose workflow ended with status {run.get('status')}.")

@@ -7,3 +7,4 @@ pre-commit>=4,<5
 pytest-cov>=6,<7
 PyYAML>=6,<7
 setuptools>=83,<84
+playwright==1.63.0
