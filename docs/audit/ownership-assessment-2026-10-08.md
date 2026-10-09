@@ -89,7 +89,7 @@ The project labels these boundaries honestly in README.md, PROJECT_STATUS.md, LI
 
 6. **External delivery can repeat after an ambiguous response** — app/store.py execution path and docs/LIMITATIONS.md. A worker may lose its lease or process after the provider accepts a request but before the result is committed. HTTP sends a stable idempotency key, but the destination must honor it. Slack does not provide a dedupe key in this action, so duplicate posts are possible. Keep this limitation visible; before using non-idempotent actions, add a provider receipt/reconciliation or approval strategy.
 
-7. **Workspace API tokens inherit the owner's whole current role** — docs/adr/011-workspace-api-tokens.md and app/auth.py:88-117. A leaked admin token can manage the workspace until revoked or expired, up to 90 days. Hash-only storage, one-time display, live membership checks, and revocation are strong controls; shorter defaults or fine-grained scopes would reduce the blast radius before wider adoption.
+7. **Workspace API token blast radius (resolved for new tokens)** — the audited revision let every token inherit its owner's whole current role. Migration 017 adds `viewer`/`operator`/`admin` ceilings, defaults new tokens to `operator`, caps access by current membership, and preserves existing tokens' previously granted access. Token minting now requires a signed-in session. Fine-grained per-action scopes remain open if real SDK users need narrower grants.
 
 ### P2 — Valuable improvements after the release blockers
 
@@ -146,7 +146,7 @@ A recruiter should remember: “A PostgreSQL-backed workflow engine that survive
 | Webhook inbox and event matching | KEEP | Signed, deduplicated, transactionally triggers runs. Complete metadata retention policy. |
 | HTTP action | IMPROVE | Bounded host/TLS/response controls are good; DNS needs bounded behavior within lease. |
 | Slack/GitHub integration | IMPROVE | Preserve the shared event path; validate against live provider accounts. |
-| API tokens / SDK / CLI | KEEP | Useful developer access path; reduce delegated authority when real need is proven. |
+| API tokens / SDK / CLI | KEEP, IMPROVE | Useful developer access path; role ceilings reduce delegated authority. Add per-action scopes only if real SDK users need them. |
 | FastAPI modular monolith | KEEP | Suitable for current scale and simplifies transactions. Split route modules only to improve test/ownership boundaries. |
 | Demo sandbox | KEEP, clearly label | Reproducible failure demonstration; never represent its charge action as payment. |
 | Dashboard | IMPROVE | Good operator visibility and controls; add browser E2E and guided real workflow, not decorative complexity. |
@@ -480,4 +480,8 @@ The local PostgreSQL 17.9 suite passed **113 tests** at **81.84% app coverage**;
 5. **Static type coverage:** Mypy now checks 24 app, SDK, operational-script, and benchmark modules with untyped function-body checks and `Any`-return warnings. The findings in the script/benchmark paths were resolved with typed Psycopg rows and explicit handling for empty query results and non-object smoke responses.
 
 CI run [37803033807](https://github.com/Jithendra-coder/RelayCore/actions/runs/37803033807) passed all 24 Mypy modules, **116 tests at 82.72% app coverage**, the SDK wheel check, Compose validations and smoke, Prometheus checks, and PostgreSQL 16 restore drill. Container scanning and dependency audit passed in [37803033700](https://github.com/Jithendra-coder/RelayCore/actions/runs/37803033700) and [37803033706](https://github.com/Jithendra-coder/RelayCore/actions/runs/37803033706). Live provider tests, staging, and cloud operations are still open.
+
+6. **API token authority:** new tokens default to `operator`; a signed-in workspace session can select `viewer` or explicitly choose `admin`. The current membership role caps the effective permission on each request. Existing tokens retain their old authority after migration 017, and a bearer token cannot mint another token. Run [37805748982](https://github.com/Jithendra-coder/RelayCore/actions/runs/37805748982) passed PostgreSQL 18 integration tests (**118 tests, 82.82% app coverage**), Compose validations, split-role smoke, Prometheus checks, and PostgreSQL 16 restore; container and dependency checks passed in [37805749071](https://github.com/Jithendra-coder/RelayCore/actions/runs/37805749071) and [37805749276](https://github.com/Jithendra-coder/RelayCore/actions/runs/37805749276).
+
+The live OIDC/provider and staging limitations above still apply. Local PostgreSQL was unavailable during this follow-up; the complete database suite passed in CI.
 

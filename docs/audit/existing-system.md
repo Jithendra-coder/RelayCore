@@ -26,7 +26,7 @@ Custom signed webhooks, GitHub pull-request deliveries, and Slack app mentions c
 | **Implemented and locally tested** | Durable workflow execution, retries, lease recovery, cancellation, dead-letter replay, immutable versions, interval schedules, OIDC/session and workspace code, signed webhook intake, HTTP action controls, and event-triggered runs. |
 | **Implemented, provider unverified** | OIDC sign-in, GitHub App installation/webhooks, Slack OAuth/events/message posting, and outbound HTTP. Tests use mocked provider responses or a no-network transport; no live provider credentials are configured. |
 | **Simulated** | Synthetic benchmark traffic and the Demo Mode inventory/payment/shipping story. The `charge` action records a local database effect, not a payment. |
-| **Implemented, locally tested** | Expiring workspace-bound API tokens, typed standard-library Python SDK, and API-backed CLI. Tokens are one-time shown, hashed at rest, and use current workspace membership/role checks. |
+| **Implemented and CI-tested** | Expiring workspace-bound API tokens, typed standard-library Python SDK, and API-backed CLI. New tokens default to an operator ceiling, can be limited to viewer, and require explicit admin access; live membership still caps the role. Token issuance requires a signed-in session. Existing tokens keep their prior access. |
 | **Incomplete** | Cloud deployment, deployed Prometheus/Alertmanager and collector-verified OpenTelemetry export, cleanup of retained event metadata, managed backup retention/disaster recovery, package-index release, and live provider verification. The offline key-rotation command passes PostgreSQL 18 CI. |
 
 ## Priorities
