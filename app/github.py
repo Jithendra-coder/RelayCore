@@ -15,8 +15,26 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
+from app.http_action import PermanentActionError, RetryableActionError
+
+
+_EVENT_REFERENCE = "$event"
+_REPOSITORY_SLUG = re.compile(r"^([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9_.-]{1,100})$")
+
 
 class GitHubError(Exception):
+    pass
+
+
+class GitHubHTTPError(GitHubError):
+    def __init__(self, status: int, retry_after: float | None, rate_limited: bool):
+        super().__init__(f"GitHub returned HTTP {status}.")
+        self.status = status
+        self.retry_after = retry_after
+        self.rate_limited = rate_limited
+
+
+class GitHubTransportError(GitHubError):
     pass
 
 
@@ -103,13 +121,41 @@ class _NoRedirect(HTTPRedirectHandler):
         return None
 
 
-def _github_request(url: str, *, method: str, headers: dict[str, str], body: bytes | None = None) -> dict[str, Any]:
+def _github_request(url: str, *, method: str, headers: dict[str, str], body: bytes | None = None,
+                    timeout: float = 8) -> dict[str, Any]:
     request = Request(url, data=body, headers=headers, method=method)
     try:
-        with build_opener(_NoRedirect).open(request, timeout=8) as response:
+        with build_opener(_NoRedirect).open(request, timeout=timeout) as response:
             raw = response.read(1_000_001)
-    except (HTTPError, URLError, TimeoutError, OSError) as exc:
-        raise GitHubError("GitHub request failed.") from exc
+    except HTTPError as exc:
+        retry_after = exc.headers.get("Retry-After")
+        try:
+            delay = max(0.0, min(float(retry_after), 3600.0)) if retry_after is not None else None
+        except (TypeError, ValueError):
+            delay = None
+        primary_rate_limit = exc.headers.get("X-RateLimit-Remaining") == "0"
+        secondary_rate_limit = False
+        if exc.code == 403 and not primary_rate_limit and retry_after is None:
+            try:
+                body = json.loads(exc.read(16_385))
+                message = body.get("message", "") if isinstance(body, dict) else ""
+                secondary_rate_limit = isinstance(message, str) and "secondary rate limit" in message.casefold()
+            except (OSError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError):
+                pass
+        rate_limited = primary_rate_limit or secondary_rate_limit or exc.code == 429 or retry_after is not None
+        if delay is None and primary_rate_limit:
+            try:
+                reset_at = float(exc.headers.get("X-RateLimit-Reset", ""))
+                delay = max(0.0, min(reset_at - time.time(), 3600.0))
+            except (TypeError, ValueError):
+                pass
+        if delay is None and rate_limited:
+            # GitHub recommends waiting at least one minute when a secondary limit has no Retry-After header.
+            delay = 60.0
+        exc.close()
+        raise GitHubHTTPError(exc.code, delay, rate_limited) from exc
+    except (URLError, TimeoutError, OSError) as exc:
+        raise GitHubTransportError("GitHub request failed.") from exc
     if len(raw) > 1_000_000:
         raise GitHubError("GitHub response exceeded the size limit.")
     try:
@@ -119,6 +165,147 @@ def _github_request(url: str, *, method: str, headers: dict[str, str], body: byt
     if not isinstance(result, dict):
         raise GitHubError("GitHub returned an invalid response.")
     return result
+
+
+def _repository_slug(value: object) -> tuple[str, str]:
+    match = _REPOSITORY_SLUG.fullmatch(value) if isinstance(value, str) else None
+    if not match or match.group(2) in {".", ".."}:
+        raise ValueError("GitHub issue comments require an owner/repository name.")
+    return match.group(1), match.group(2)
+
+
+def _event_pointer(value: object) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    pointer = value.get(_EVENT_REFERENCE)
+    if (set(value) != {_EVENT_REFERENCE} or not isinstance(pointer, str) or not pointer.startswith("/")
+            or len(pointer) > 512 or re.search(r"~(?![01])", pointer)):
+        raise ValueError("GitHub action event references must be {$event: '/json/pointer'} objects.")
+    return pointer
+
+
+def _validate_issue_number(value: object) -> None:
+    if type(value) is not int or not 0 < value <= 2_147_483_647:
+        raise ValueError("GitHub issue_number must be a positive 32-bit integer or an event reference.")
+
+
+def _validate_comment_body(value: object) -> None:
+    if (not isinstance(value, str) or not value.strip() or len(value) > 4000
+            or any((ord(char) < 32 and char not in "\n\r\t") or ord(char) == 127 for char in value)):
+        raise ValueError("GitHub comment body must contain 1–4000 printable characters or an event reference.")
+
+
+def validate_issue_comment_step(payload: dict[str, Any]) -> None:
+    if set(payload) != {"repository", "issue_number", "body"}:
+        raise ValueError("GitHub issue comments require repository, issue_number, body, and no other fields.")
+    repository_reference = _event_pointer(payload["repository"])
+    if repository_reference is None:
+        _repository_slug(payload["repository"])
+    number_reference = _event_pointer(payload["issue_number"])
+    if number_reference is None:
+        _validate_issue_number(payload["issue_number"])
+    body_reference = _event_pointer(payload["body"])
+    if body_reference is None:
+        _validate_comment_body(payload["body"])
+
+
+def _event_value(payload: dict[str, Any] | None, reference: object, field: str) -> Any:
+    pointer = _event_pointer(reference)
+    if pointer is None:
+        return reference
+    if not isinstance(payload, dict):
+        raise PermanentActionError("GitHub action requires a webhook event payload.")
+    current: Any = payload
+    for part in pointer[1:].split("/"):
+        part = part.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        elif isinstance(current, list) and part.isdigit() and (part == "0" or not part.startswith("0")):
+            index = int(part)
+            if index < len(current):
+                current = current[index]
+            else:
+                raise PermanentActionError(f"GitHub action {field} event field was not present.")
+        else:
+            raise PermanentActionError(f"GitHub action {field} event field was not present.")
+    return current
+
+
+def _raise_github_action_error(error: GitHubError) -> None:
+    if isinstance(error, GitHubTransportError):
+        raise RetryableActionError("GitHub request failed or timed out.") from None
+    if isinstance(error, GitHubHTTPError):
+        retryable = error.status in {408, 429} or error.status >= 500 or (error.status == 403 and error.rate_limited)
+        if retryable:
+            raise RetryableActionError("GitHub temporarily rejected the action.",
+                                       retry_after=error.retry_after) from None
+        if error.status in {401, 403, 404, 422}:
+            raise PermanentActionError(
+                "GitHub denied the action; verify the linked installation, repository access, and Issues write permission."
+            ) from None
+        raise PermanentActionError(f"GitHub rejected the action with HTTP {error.status}.") from None
+    raise PermanentActionError("GitHub returned an invalid action response.") from None
+
+
+def execute_issue_comment_action(config: dict[str, Any], installation: dict[str, Any], payload: dict[str, Any],
+                                 *, event_payload: dict[str, Any] | None = None,
+                                 timeout_seconds: float = 8) -> dict[str, Any]:
+    validate_issue_comment_step(payload)
+    repository = _event_value(event_payload, payload["repository"], "repository")
+    issue_number = _event_value(event_payload, payload["issue_number"], "issue_number")
+    comment_body = _event_value(event_payload, payload["body"], "comment body")
+    owner, repository_name = _repository_slug(repository)
+    _validate_issue_number(issue_number)
+    _validate_comment_body(comment_body)
+    installation_id = installation.get("installation_id")
+    account_login = installation.get("account_login")
+    if (type(installation_id) is not int or installation_id <= 0 or installation.get("status") != "active"
+            or not isinstance(account_login, str) or owner.casefold() != account_login.casefold()):
+        raise PermanentActionError("GitHub repository does not belong to the active workspace installation.")
+
+    deadline = time.monotonic() + timeout_seconds
+
+    def remaining() -> float:
+        seconds = deadline - time.monotonic()
+        if seconds <= 0:
+            raise RetryableActionError("GitHub action timed out.")
+        return seconds
+
+    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
+               "User-Agent": "RelayCore"}
+    try:
+        token_response = _github_request(
+            f"https://api.github.com/app/installations/{installation_id}/access_tokens", method="POST",
+            headers={**headers, "Authorization": f"Bearer {app_jwt(config)}"},
+            body=json.dumps({"repositories": [repository_name], "permissions": {"issues": "write"}},
+                            separators=(",", ":")).encode(),
+            timeout=remaining(),
+        )
+        token = token_response.get("token")
+        if (not isinstance(token, str) or not token.startswith("ghs_") or len(token) > 4096
+                or any(ord(char) < 32 or ord(char) == 127 for char in token)):
+            raise GitHubError("GitHub returned an invalid installation token.")
+        comment = _github_request(
+            f"https://api.github.com/repos/{owner}/{repository_name}/issues/{issue_number}/comments",
+            method="POST", headers={**headers, "Authorization": f"Bearer {token}",
+                                     "Content-Type": "application/json"},
+            body=json.dumps({"body": comment_body}, ensure_ascii=False, separators=(",", ":"),
+                            allow_nan=False).encode(),
+            timeout=remaining(),
+        )
+    except GitHubError as exc:
+        _raise_github_action_error(exc)
+    comment_id = comment.get("id")
+    html_url = comment.get("html_url")
+    if type(comment_id) is not int or comment_id <= 0 or not isinstance(html_url, str):
+        raise PermanentActionError("GitHub returned an invalid issue comment.")
+    url = urlsplit(html_url)
+    valid_paths = {f"/{owner}/{repository_name}/issues/{issue_number}".casefold(),
+                   f"/{owner}/{repository_name}/pull/{issue_number}".casefold()}
+    if (url.scheme != "https" or url.hostname != "github.com" or url.username or url.password
+            or url.path.casefold() not in valid_paths or url.query or url.fragment != f"issuecomment-{comment_id}"):
+        raise PermanentActionError("GitHub returned an invalid issue-comment URL.")
+    return {"comment_id": comment_id, "html_url": html_url}
 
 
 def exchange_code(config: dict[str, Any], code: str, verifier: str) -> str:

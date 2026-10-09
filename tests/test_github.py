@@ -5,13 +5,17 @@ import hashlib
 import hmac
 import json
 import uuid
+from io import BytesIO
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 
+import pytest
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from app.auth import SESSION_COOKIE
 from app.github import app_jwt, github_settings, normalize_pull_request, verify_webhook
+from app.http_action import PermanentActionError, RetryableActionError
 from app.store import create_auth_session, upsert_oidc_user
 
 
@@ -140,6 +144,152 @@ def test_github_user_installation_lookup_uses_the_documented_paged_endpoint(monk
     found = github.user_installation({}, "ephemeral-token", 987654)
     assert found["app_id"] == 12345
     assert len(calls) == 2 and all("/user/installations?" in url for url in calls)
+
+
+def test_github_issue_comment_scopes_token_and_maps_pull_request_fields(monkeypatch):
+    import app.github as github
+
+    configure_github(monkeypatch)
+    calls = []
+
+    def fake_request(url, *, method, headers, body=None, timeout=8):
+        calls.append((url, method, headers, body, timeout))
+        return ({"token": "ghs_test-installation-token"} if url.endswith("/access_tokens") else
+                {"id": 1234, "html_url": "https://github.com/acme/relay/issues/17#issuecomment-1234"})
+
+    monkeypatch.setattr(github, "_github_request", fake_request)
+    result = github.execute_issue_comment_action(github_settings(), {
+        "installation_id": 456, "account_login": "acme", "status": "active",
+    }, {
+        "repository": {"$event": "/repository/full_name"},
+        "issue_number": {"$event": "/pull_request/number"},
+        "body": "RelayCore verified this pull request.",
+    }, event_payload={"repository": {"full_name": "acme/relay"}, "pull_request": {"number": 17}},
+       timeout_seconds=2)
+
+    token_url, token_method, token_headers, token_body, token_timeout = calls[0]
+    comment_url, comment_method, comment_headers, comment_body, comment_timeout = calls[1]
+    assert token_url == "https://api.github.com/app/installations/456/access_tokens"
+    assert token_method == "POST" and token_headers["Authorization"].startswith("Bearer ")
+    assert json.loads(token_body) == {"repositories": ["relay"], "permissions": {"issues": "write"}}
+    assert 0 < token_timeout <= 2
+    assert comment_url == "https://api.github.com/repos/acme/relay/issues/17/comments"
+    assert comment_method == "POST" and comment_headers["Authorization"] == "Bearer ghs_test-installation-token"
+    assert json.loads(comment_body) == {"body": "RelayCore verified this pull request."}
+    assert 0 < comment_timeout <= token_timeout
+    assert result == {"comment_id": 1234, "html_url": "https://github.com/acme/relay/issues/17#issuecomment-1234"}
+
+
+def test_github_issue_comment_checks_owner_and_classifies_rate_limits(monkeypatch):
+    import app.github as github
+
+    configure_github(monkeypatch)
+    calls = []
+    payload = {"repository": "acme/relay", "issue_number": 17, "body": "Verified."}
+    integration = {"installation_id": 456, "account_login": "acme", "status": "active"}
+
+    def unexpected_request(*_args, **_kwargs):
+        calls.append(True)
+        raise github.GitHubHTTPError(429, 2.5, False)
+
+    monkeypatch.setattr(github, "_github_request", unexpected_request)
+    with pytest.raises(PermanentActionError, match="does not belong"):
+        github.execute_issue_comment_action(github_settings(), {**integration, "account_login": "other"}, payload)
+    assert calls == []
+    with pytest.raises(RetryableActionError) as retry:
+        github.execute_issue_comment_action(github_settings(), integration, payload)
+    assert retry.value.retry_after == 2.5
+
+
+def test_github_secondary_rate_limits_are_retryable_and_permission_errors_are_not(monkeypatch):
+    import app.github as github
+
+    cases = [
+        (403, {"Retry-After": "17"}, b'{"message":"You have exceeded a secondary rate limit."}', 17.0, True),
+        (403, {}, b'{"message":"You have exceeded a secondary rate limit."}', 60.0, True),
+        (429, {}, b'{"message":"Too many requests"}', 60.0, True),
+        (403, {}, b'{"message":"Resource not accessible by integration"}', None, False),
+    ]
+    for status, headers, body, expected_delay, rate_limited in cases:
+        error = HTTPError("https://api.github.com/test", status, "Forbidden", headers, BytesIO(body))
+
+        class ErrorOpener:
+            def open(self, *_args, **_kwargs):
+                raise error
+
+        monkeypatch.setattr(github, "build_opener", lambda *_args: ErrorOpener())
+        with pytest.raises(github.GitHubHTTPError) as caught:
+            github._github_request("https://api.github.com/test", method="GET", headers={})
+        assert caught.value.rate_limited is rate_limited
+        assert caught.value.retry_after == expected_delay
+        action_error = RetryableActionError if rate_limited else PermanentActionError
+        with pytest.raises(action_error):
+            github._raise_github_action_error(caught.value)
+
+
+def test_github_issue_comment_maps_missing_or_invalid_event_values(monkeypatch):
+    import app.github as github
+
+    configure_github(monkeypatch)
+    monkeypatch.setattr(github, "_github_request", lambda *_args, **_kwargs: pytest.fail("No request expected."))
+    integration = {"installation_id": 456, "account_login": "acme", "status": "active"}
+    payload = {"repository": {"$event": "/repository/full_name"},
+               "issue_number": {"$event": "/pull_request/number"}, "body": "Verified."}
+    with pytest.raises(PermanentActionError, match="issue_number event field was not present"):
+        github.execute_issue_comment_action(github_settings(), integration, payload,
+                                            event_payload={"repository": {"full_name": "acme/relay"}})
+    with pytest.raises(ValueError, match="event references"):
+        github.validate_issue_comment_step({**payload, "body": {"$event": "pull_request/title"}})
+
+
+def test_signed_pull_request_runs_repository_scoped_comment_action(client, monkeypatch):
+    _, secret = configure_github(monkeypatch)
+    import app.github as github
+    import app.main as main
+    import app.store as store
+
+    monkeypatch.setattr(main, "DEMO_MODE", False)
+    monkeypatch.setattr(store, "DEMO_MODE", False)
+    _, workspace_id, headers = create_workspace(client, f"github-comment-{uuid.uuid4()}@example.test")
+    installation_id = uuid.uuid4().int % 9_000_000_000_000 + 1_000_000_000
+    link_installation(client, monkeypatch, headers, installation_id)
+    connection = client.get(f"/api/workspaces/{workspace_id}/github", headers=headers).json()
+    definition = client.post("/api/workflow-definitions", headers={**headers, "Idempotency-Key": "github:comment"},
+                             json={"title": "Comment on pull request", "steps": [{
+                                 "name": "comment", "action": "github_issue_comment", "payload": {
+                                     "repository": {"$event": "/repository/full_name"},
+                                     "issue_number": {"$event": "/pull_request/number"},
+                                     "body": "RelayCore verified this pull request.",
+                                 },
+                             }], "trigger": {"endpoint_id": connection["endpoint_id"],
+                                            "event_type": "github.pull_request.opened"}})
+    assert definition.status_code == 201, definition.text
+
+    calls = []
+
+    def fake_request(url, *, method, headers, body=None, timeout=8):
+        calls.append((url, method, headers, body, timeout))
+        return ({"token": "ghs_test-installation-token"} if url.endswith("/access_tokens") else
+                {"id": 9876, "html_url": "https://github.com/acme/relay/issues/17#issuecomment-9876"})
+
+    monkeypatch.setattr(github, "_github_request", fake_request)
+    event_body = pull_request_payload(installation_id)
+    accepted = client.post("/integrations/github/webhook", content=event_body,
+                           headers=sign_github(event_body, str(uuid.uuid4()), secret))
+    assert accepted.status_code == 202 and len(accepted.json()["triggered_runs"]) == 1
+    run_id = accepted.json()["triggered_runs"][0]["run_id"]
+    from tests.conftest import drive_run, get_run
+
+    drive_run(client, workspace_id, worker_id="github-comment-worker")
+    result = get_run(client, run_id, workspace_id)
+    assert result["status"] == "completed"
+    assert result["side_effects"][0]["result"] == {
+        "comment_id": 9876, "html_url": "https://github.com/acme/relay/issues/17#issuecomment-9876",
+    }
+    assert calls[0][0] == f"https://api.github.com/app/installations/{installation_id}/access_tokens"
+    assert json.loads(calls[0][3]) == {"repositories": ["relay"], "permissions": {"issues": "write"}}
+    assert calls[1][0] == "https://api.github.com/repos/acme/relay/issues/17/comments"
+    assert json.loads(calls[1][3]) == {"body": "RelayCore verified this pull request."}
 
 
 def test_github_callback_requires_the_initiating_admin_and_matching_app(client, monkeypatch):

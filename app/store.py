@@ -1014,6 +1014,9 @@ def persist_webhook_event(
             if actions == {"http"}:
                 if not allow_http_workflow_triggers:
                     continue
+            elif "github_issue_comment" in actions:
+                if not allow_http_workflow_triggers or not actions <= {"http", "github_issue_comment"}:
+                    continue
             elif not allow_workflow_triggers or "http" in actions:
                 continue
             seed = f"{endpoint_id}:{event_key}:{match['version_id']}".encode()
@@ -1386,7 +1389,7 @@ def create_workflow_schedule(
         return None
     if workflow["status"] != "active":
         raise WorkflowDisabled
-    if any(has_event_references(step["payload"].get("body")) for step in workflow["definition"]["steps"]):
+    if any(has_event_references(step["payload"]) for step in workflow["definition"]["steps"]):
         raise ValueError("Workflows that require webhook event data cannot be scheduled.")
 
     schedule_id = str(uuid.uuid4())
@@ -1478,7 +1481,7 @@ def dispatch_due_schedules(conn: DBConnection, batch_size: int = 20) -> int:
                         reason = "workflow_missing"
                     elif version["status"] != "active":
                         reason = "workflow_disabled"
-                    elif any(has_event_references(step["payload"].get("body"))
+                    elif any(has_event_references(step["payload"])
                              for step in version["definition"]["steps"]):
                         reason = "workflow_requires_webhook_event"
                     if reason:
@@ -1808,7 +1811,7 @@ def execute_step(conn: DBConnection, worker_id: str, task: dict[str, Any], reque
 
     step = steps[index]
     action, payload = step["action"], step["payload"]
-    external_actions = {"http", "slack_message"}
+    external_actions = {"http", "slack_message", "github_issue_comment"}
     result: dict[str, Any] | None
     if (DEMO_MODE and action in external_actions) or (not DEMO_MODE and action not in external_actions):
         raise PermanentActionError("Workflow action is not allowed in the current execution mode.")
@@ -1828,7 +1831,9 @@ def execute_step(conn: DBConnection, worker_id: str, task: dict[str, Any], reque
                 conn.execute("""UPDATE tasks SET status='cancelled',lease_owner=NULL,lease_until=NULL,
                               updated_at=clock_timestamp() WHERE id=%s AND lease_owner=%s""",
                              (task["id"], worker_id))
-                kind = "task.cancelled_before_http_action" if action == "http" else "task.cancelled_before_slack_action"
+                kind = {"http": "task.cancelled_before_http_action",
+                        "slack_message": "task.cancelled_before_slack_action",
+                        "github_issue_comment": "task.cancelled_before_github_action"}[action]
                 emit_event(conn, task["tenant_id"], kind, run_id=task["run_id"],
                            task_id=task["id"], worker_id=worker_id, request_id=request_id)
             return
@@ -1856,7 +1861,7 @@ def execute_step(conn: DBConnection, worker_id: str, task: dict[str, Any], reque
             result = execute_http_action(action_payload, credential["secret"], f"{task['run_id']}:{index}",
                                          credential["allowed_host"], task.get("trigger_payload"),
                                          step_results=step_results)
-        else:
+        elif action == "slack_message":
             from app.slack import post_message
 
             credential_id = slack_action_credential_id(conn, task["tenant_id"])
@@ -1866,6 +1871,26 @@ def execute_step(conn: DBConnection, worker_id: str, task: dict[str, Any], reque
                 raise PermanentActionError("Slack App credential is unavailable.")
             heartbeat(conn, worker_id, task["id"], LEASE_SECONDS)
             result = post_message(payload, credential["secret"], timeout_seconds=LEASE_SECONDS / 2)
+        else:
+            from app.github import GitHubError, execute_issue_comment_action, github_settings
+
+            integration = github_installation_for_workspace(conn, task["tenant_id"])
+            if not integration or integration["status"] != "active":
+                raise PermanentActionError("GitHub App installation is unavailable.")
+            try:
+                config = github_settings()
+            except RuntimeError as exc:
+                raise PermanentActionError("GitHub App configuration is incomplete.") from exc
+            if not config:
+                raise PermanentActionError("GitHub App configuration is unavailable.")
+            heartbeat(conn, worker_id, task["id"], LEASE_SECONDS)
+            try:
+                result = execute_issue_comment_action(
+                    config, integration, payload, event_payload=task.get("trigger_payload"),
+                    timeout_seconds=LEASE_SECONDS / 2,
+                )
+            except GitHubError as exc:
+                raise PermanentActionError("GitHub action could not be completed.") from exc
         heartbeat(conn, worker_id, task["id"], LEASE_SECONDS)
     else:
         from app.sandbox import execute_sandbox_action

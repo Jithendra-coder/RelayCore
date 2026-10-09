@@ -630,15 +630,24 @@ def delete_api_token(workspace_id: str, token_id: str, request: Request,
 def validate_workflow_actions(conn, workspace_id: str, steps: list[dict[str, Any]], trigger: Any = None) -> None:
     actions = {step["action"] for step in steps}
     if DEMO_MODE:
-        if actions & {"http", "slack_message"}:
+        if actions & {"http", "slack_message", "github_issue_comment"}:
             raise HTTPException(422, "Provider actions are disabled in Demo Mode.")
         return
-    if actions - {"http", "slack_message"}:
-        raise HTTPException(422, "Production workflows support only allowlisted HTTP and Slack message actions.")
+    if actions - {"http", "slack_message", "github_issue_comment"}:
+        raise HTTPException(422, "Production workflow contains an unsupported action.")
     if "slack_message" in actions and not slack_action_credential_id(conn, workspace_id):
         raise HTTPException(422, "Slack message actions require an active Slack App connection in this workspace.")
-    if not trigger and any(has_event_references(step["payload"].get("body")) for step in steps):
-        raise HTTPException(422, "HTTP body event references require a webhook trigger.")
+    if "github_issue_comment" in actions:
+        integration = github_installation_for_workspace(conn, workspace_id)
+        if not integration or integration["status"] != "active":
+            raise HTTPException(422, "GitHub issue comments require an active GitHub App connection in this workspace.")
+        if trigger and (trigger["endpoint_id"] != integration["endpoint_id"] or trigger["event_type"] not in {
+            "github.pull_request.opened", "github.pull_request.reopened",
+            "github.pull_request.synchronize", "github.pull_request.closed",
+        }):
+            raise HTTPException(422, "GitHub issue comments can only use this workspace's pull-request webhook.")
+    if not trigger and any(has_event_references(step["payload"]) for step in steps):
+        raise HTTPException(422, "Workflow event references require a webhook trigger.")
     for step in steps:
         if step["action"] != "http":
             continue
@@ -1334,7 +1343,7 @@ def create_schedule(
                 raise HTTPException(409, "Workflow is disabled.")
             latest = max(definition["versions"], key=lambda version: version["version_number"])
             snapshot = latest["definition"]
-            if any(has_event_references(step["payload"].get("body")) for step in snapshot["steps"]):
+            if any(has_event_references(step["payload"]) for step in snapshot["steps"]):
                 raise HTTPException(422, "Workflows that require webhook event data cannot be scheduled.")
             validate_workflow_actions(conn, workspace_id, snapshot["steps"], snapshot.get("trigger"))
             result = create_workflow_schedule(
@@ -1479,7 +1488,7 @@ def run_workflow_definition(
             if definition:
                 latest = max(definition["versions"], key=lambda version: version["version_number"])
                 snapshot = latest["definition"]
-                if any(has_event_references(step["payload"].get("body")) for step in snapshot["steps"]):
+                if any(has_event_references(step["payload"]) for step in snapshot["steps"]):
                     raise HTTPException(422, "This workflow requires a webhook event and cannot be started manually.")
                 validate_workflow_actions(conn, user.tenant_id, snapshot["steps"], snapshot.get("trigger"))
             result = trigger_workflow_definition(conn, user.tenant_id, workflow_id, key, request_id(request))
@@ -1615,7 +1624,7 @@ def replay(dead_letter_id: int, request: Request, user: Principal = Depends(prin
             (user.tenant_id, item["run_id"]),
         ).fetchone()
         if run and run["trigger_event_id"] and any(
-            has_event_references(step["payload"].get("body")) for step in run["definition"]["steps"]
+            has_event_references(step["payload"]) for step in run["definition"]["steps"]
         ):
             source_event = conn.execute(
                 "SELECT payload FROM incoming_events WHERE id=%s AND workspace_id=%s FOR UPDATE",

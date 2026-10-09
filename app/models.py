@@ -8,6 +8,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
+from app.github import validate_issue_comment_step
 from app.http_action import step_references, validate_http_host, validate_http_step
 from app.slack import validate_message_step
 
@@ -16,7 +17,8 @@ class WorkflowStep(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(min_length=1, max_length=80, pattern=r"^[\w .:-]+$")
-    action: Literal["record", "charge", "sleep", "fail_once", "fail_until_replay", "http", "slack_message"]
+    action: Literal["record", "charge", "sleep", "fail_once", "fail_until_replay", "http", "slack_message",
+                    "github_issue_comment"]
     payload: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("payload")
@@ -32,6 +34,8 @@ class WorkflowStep(BaseModel):
             validate_http_step(self.payload)
         if self.action == "slack_message":
             validate_message_step(self.payload)
+        if self.action == "github_issue_comment":
+            validate_issue_comment_step(self.payload)
         if self.action == "sleep":
             seconds = self.payload.get("seconds", 0)
             if not isinstance(seconds, (int, float)) or isinstance(seconds, bool) or not 0 <= seconds <= 30:
