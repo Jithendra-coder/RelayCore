@@ -315,6 +315,10 @@ def test_dashboard_uses_session_auth_and_requires_workspace_selection():
     assert "managed outside API" in html
     assert "RelayCore API is unreachable. For the local demo" in html
     assert "throw apiError(e)" in html
+    assert 'id="schedulePanel"' in html
+    assert "data-schedule-status" in html
+    assert "Idempotency-Key':scheduleCreateKey" in html
+    assert "$('schedulePanel').classList.add('hidden')" in html
 
 
 def test_oidc_configuration_requires_complete_https_credentials(monkeypatch):
