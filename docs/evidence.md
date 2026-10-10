@@ -92,3 +92,9 @@ GitHub Actions run [37947393988](https://github.com/Jithendra-coder/RelayCore/ac
 ## Evidence boundaries
 
 The “charge” is a unique local PostgreSQL side-effect record, not a payment. Recovery and process restart were measured in one local deployment. Public-cloud deployment, external-service idempotency, TLS, and distributed tracing with an OpenTelemetry collector are not proven here. The CI restore drill passed against disposable PostgreSQL 16 databases; managed retention and disaster recovery remain unverified. Docker Compose configuration and image build pass in CI, but the stack was not launched locally.
+
+## Supervised worker shutdown and Docker context
+
+The integration test starts a real supervised worker, requests shutdown while it holds a Demo Mode sleep task, and verifies the active step completes and persists before the worker exits. POSIX shutdown allows up to 32 seconds for this drain, then force-stops stragglers for lease recovery. Windows workers have no console, so shutdown force-stops them immediately; any active action can be retried after lease expiry.
+
+The Docker context is restricted to the runtime requirements and application directory; the CI image build and separate API/worker browser smoke passed. CI run [38017056281](https://github.com/Jithendra-coder/RelayCore/actions/runs/38017056281) passed **134 tests at 83.17% app coverage**, Mypy, Ruff, pre-commit, both Compose config checks, Prometheus validation, and the browser smoke. The PostgreSQL 16 restore drill recovered all 17 migrations in the same run. Container security [run 38017056278](https://github.com/Jithendra-coder/RelayCore/actions/runs/38017056278) and dependency audit [run 38017056316](https://github.com/Jithendra-coder/RelayCore/actions/runs/38017056316) passed. This proves CI and local code paths, not a managed deployment or live external action.

@@ -74,7 +74,7 @@ Identity, workspace authorization, signed durable webhook intake, encrypted work
 
 ## Latest change
 
-The latest change adds bounded Slack message text references to persisted results from earlier HTTP steps. CI commit `668a4b0` passed **133 tests at 83.03% app coverage**, Mypy, Ruff, pre-commit, SDK wheel validation, the API/worker browser smoke, Compose validation, Prometheus checks, and the PostgreSQL 16 restore drill. The restore recovered all 17 migrations. Container security [run 38016036835](https://github.com/Jithendra-coder/RelayCore/actions/runs/38016036835) and dependency audit [run 38016036831](https://github.com/Jithendra-coder/RelayCore/actions/runs/38016036831) passed. Slack interoperability with live credentials remains unverified.
+The latest change drains active API-supervised worker steps on POSIX shutdown for up to 32 seconds, records graceful versus forced worker shutdown limitations by platform, and narrows the Docker build context to `requirements.txt` and `app/`. CI commit `c0a2105` passed **134 tests at 83.17% app coverage**, Mypy, Ruff, pre-commit, SDK wheel validation, the API/worker browser smoke, Compose validation, Prometheus checks, and the PostgreSQL 16 restore drill. The restore recovered all 17 migrations. Container security [run 38017056278](https://github.com/Jithendra-coder/RelayCore/actions/runs/38017056278) and dependency audit [run 38017056316](https://github.com/Jithendra-coder/RelayCore/actions/runs/38017056316) passed. Live provider interoperability and cloud deployment remain unverified.
 
 ## Next milestone
 
