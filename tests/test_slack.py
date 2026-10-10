@@ -303,14 +303,14 @@ def test_slack_message_action_uses_connected_workspace_token(client, monkeypatch
 
 def test_slack_message_can_use_an_earlier_http_result(client, monkeypatch):
     configure_slack(monkeypatch)
-    monkeypatch.setenv("RELAYCORE_HTTP_ALLOWED_HOSTS", "hooks.example.test")
+    monkeypatch.setenv("RELAYCORE_HTTP_ALLOWED_HOSTS", "hooks.example.com")
     _, workspace_id, headers = create_workspace(client, f"slack-result-{uuid.uuid4()}@example.test")
     credential_secret = "http-bearer-" + "x" * 24
     credential = client.post(
         f"/api/workspaces/{workspace_id}/credentials",
         headers={**headers, "Idempotency-Key": f"slack-result:credential:{uuid.uuid4()}"},
         json={"provider": "http", "name": "build service", "secret": credential_secret,
-              "allowed_host": "hooks.example.test"},
+              "allowed_host": "hooks.example.com"},
     )
     assert credential.status_code == 201, credential.text
     connect_slack(client, monkeypatch, headers, grant("T" + uuid.uuid4().hex[:12].upper()))
@@ -324,7 +324,7 @@ def test_slack_message_can_use_an_earlier_http_result(client, monkeypatch):
     monkeypatch.setattr(store, "DEMO_MODE", False)
     steps = [
         {"name": "check build", "action": "http", "payload": {
-            "method": "GET", "url": "https://hooks.example.test/v1/status",
+            "method": "GET", "url": "https://hooks.example.com/v1/status",
             "credential_id": credential.json()["id"],
         }},
         {"name": "announce build", "action": "slack_message", "payload": {
