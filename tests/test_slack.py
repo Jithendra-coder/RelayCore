@@ -283,8 +283,8 @@ def test_slack_message_action_uses_connected_workspace_token(client, monkeypatch
     assert definition.status_code == 201, definition.text
 
     calls = []
-    monkeypatch.setattr(slack, "post_message", lambda payload, token, *, timeout_seconds: (
-        calls.append((payload, token, timeout_seconds))
+    monkeypatch.setattr(slack, "post_message", lambda payload, token, *, timeout_seconds, step_results: (
+        calls.append((payload, token, timeout_seconds, step_results))
         or {"channel": payload["channel"], "message_ts": "1710000000.000100"}
     ))
     run = client.post(f"/api/workflow-definitions/{definition.json()['id']}/runs",
@@ -297,8 +297,102 @@ def test_slack_message_action_uses_connected_workspace_token(client, monkeypatch
     assert completed["side_effects"][0]["result"] == {
         "channel": "C123TEST", "message_ts": "1710000000.000100",
     }
-    assert calls == [(steps[0]["payload"], BOT_TOKEN, 0.6)]
+    assert calls == [(steps[0]["payload"], BOT_TOKEN, 0.6, {})]
     assert BOT_TOKEN not in json.dumps(completed, default=str)
+
+
+def test_slack_message_can_use_an_earlier_http_result(client, monkeypatch):
+    configure_slack(monkeypatch)
+    monkeypatch.setenv("RELAYCORE_HTTP_ALLOWED_HOSTS", "hooks.example.test")
+    _, workspace_id, headers = create_workspace(client, f"slack-result-{uuid.uuid4()}@example.test")
+    credential_secret = "http-bearer-" + "x" * 24
+    credential = client.post(
+        f"/api/workspaces/{workspace_id}/credentials",
+        headers={**headers, "Idempotency-Key": f"slack-result:credential:{uuid.uuid4()}"},
+        json={"provider": "http", "name": "build service", "secret": credential_secret,
+              "allowed_host": "hooks.example.test"},
+    )
+    assert credential.status_code == 201, credential.text
+    connect_slack(client, monkeypatch, headers, grant("T" + uuid.uuid4().hex[:12].upper()))
+
+    import app.http_action as http_action
+    import app.main as main
+    import app.slack as slack
+    import app.store as store
+
+    monkeypatch.setattr(main, "DEMO_MODE", False)
+    monkeypatch.setattr(store, "DEMO_MODE", False)
+    steps = [
+        {"name": "check build", "action": "http", "payload": {
+            "method": "GET", "url": "https://hooks.example.test/v1/status",
+            "credential_id": credential.json()["id"],
+        }},
+        {"name": "announce build", "action": "slack_message", "payload": {
+            "channel": "C123TEST", "text": {"$step": {"index": 0, "pointer": "/body/summary"}},
+        }},
+    ]
+    definition = client.post(
+        "/api/workflow-definitions",
+        headers={**headers, "Idempotency-Key": f"slack-result:workflow:{uuid.uuid4()}"},
+        json={"title": "Announce build status", "steps": steps},
+    )
+    assert definition.status_code == 201, definition.text
+
+    http_result = {"status_code": 200, "response_bytes": 0, "content_type": "application/json",
+                   "body": {"summary": "Production healthy"}}
+    monkeypatch.setattr(http_action, "execute_http_action", lambda *_args, **_kwargs: http_result)
+    calls = []
+
+    def post(payload, token, *, timeout_seconds, step_results):
+        calls.append((payload, token, timeout_seconds, step_results))
+        return {"channel": payload["channel"], "message_ts": "1710000000.000100"}
+
+    monkeypatch.setattr(slack, "post_message", post)
+    run = client.post(
+        f"/api/workflow-definitions/{definition.json()['id']}/runs",
+        headers={**headers, "Idempotency-Key": f"slack-result:run:{uuid.uuid4()}"},
+    )
+    assert run.status_code == 202, run.text
+    from tests.conftest import drive_run, get_run
+    drive_run(client, workspace_id, worker_id="slack-result-reference-worker")
+    completed = get_run(client, run.json()["id"], workspace_id)
+
+    assert completed["status"] == "completed"
+    assert calls == [(steps[1]["payload"], BOT_TOKEN, 0.6, {0: http_result})]
+    assert completed["side_effects"][1]["result"]["channel"] == "C123TEST"
+    assert BOT_TOKEN not in json.dumps(completed, default=str)
+    assert credential_secret not in json.dumps(completed, default=str)
+
+
+def test_slack_result_references_must_point_to_an_earlier_http_step(monkeypatch):
+    from pydantic import ValidationError
+
+    from app.models import WorkflowRequest
+
+    monkeypatch.setenv("RELAYCORE_HTTP_ALLOWED_HOSTS", "hooks.example.com")
+    http = {"name": "fetch", "action": "http", "payload": {
+        "method": "GET", "url": "https://hooks.example.com/status", "credential_id": str(uuid.uuid4()),
+    }}
+
+    def slack_step(index):
+        return {"name": "announce", "action": "slack_message", "payload": {
+            "channel": "C123TEST", "text": {"$step": {"index": index, "pointer": "/body/summary"}},
+        }}
+
+    WorkflowRequest.model_validate({"title": "valid chain", "steps": [http, slack_step(0)]})
+
+    for steps, message in (([http, slack_step(1)], "earlier workflow step"),
+                           ([slack_step(1), http], "earlier workflow step"),
+                           ([{"name": "record", "action": "record"}, slack_step(0)], "earlier HTTP action")):
+        with pytest.raises(ValidationError, match=message):
+            WorkflowRequest.model_validate({"title": "invalid chain", "steps": steps})
+
+    with pytest.raises(ValidationError, match="Slack message text"):
+        WorkflowRequest.model_validate({"title": "event text", "steps": [
+            {"name": "announce", "action": "slack_message", "payload": {
+                "channel": "C123TEST", "text": {"$event": "/type"},
+            }},
+        ]})
 
 
 def test_slack_message_api_is_bounded_and_honors_rate_limit(monkeypatch):
@@ -339,6 +433,7 @@ def test_slack_message_api_is_bounded_and_honors_rate_limit(monkeypatch):
     calls = []
     responses = iter([
         Response(b'{"ok":true,"channel":"C123TEST","ts":"1710000000.000100"}', 200),
+        Response(b'{"ok":true,"channel":"C123TEST","ts":"1710000000.000100"}', 200),
         Response(b"{}", 429, {"Retry-After": "2"}),
         Response(b"{}", 429, {}),
         Response(b"{}", 500, {}),
@@ -367,6 +462,20 @@ def test_slack_message_api_is_bounded_and_honors_rate_limit(monkeypatch):
     assert headers["Authorization"] == f"Bearer {BOT_TOKEN}"
     assert json.loads(body) == payload
     assert connection.closed
+
+    mapped = {"channel": "C123TEST", "text": {"$step": {"index": 0, "pointer": "/body/summary"}}}
+    assert post_message(mapped, BOT_TOKEN, step_results={0: {"body": {"summary": "Production healthy"}}}) == {
+        "channel": "C123TEST", "message_ts": "1710000000.000100",
+    }
+    assert json.loads(calls[-1][5].request_args[2]) == {"channel": "C123TEST", "text": "Production healthy"}
+    connection_count = len(calls)
+    with pytest.raises(PermanentActionError, match="was not present"):
+        post_message(mapped, BOT_TOKEN)
+    with pytest.raises(PermanentActionError, match="Resolved Slack message text"):
+        post_message(mapped, BOT_TOKEN, step_results={0: {"body": {"summary": {"unsafe": True}}}})
+    with pytest.raises(PermanentActionError, match="Resolved Slack message text"):
+        post_message(mapped, BOT_TOKEN, step_results={0: {"body": {"summary": "x" * 4001}}})
+    assert len(calls) == connection_count
 
     with pytest.raises(RetryableActionError, match="rate limited") as error:
         post_message(payload, BOT_TOKEN)

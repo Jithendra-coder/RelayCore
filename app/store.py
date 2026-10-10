@@ -1869,8 +1869,18 @@ def execute_step(conn: DBConnection, worker_id: str, task: dict[str, Any], reque
                           if credential_id else None)
             if not credential or credential["provider"] != "slack":
                 raise PermanentActionError("Slack App credential is unavailable.")
+            referenced_indices = sorted({source for source, _ in step_references(payload.get("text"))})
+            slack_step_results: dict[int, dict[str, Any]] = {}
+            if referenced_indices:
+                rows = conn.execute(
+                    """SELECT step_index,result FROM side_effects
+                       WHERE tenant_id=%s AND run_id=%s AND step_index<%s AND step_index=ANY(%s)""",
+                    (task["tenant_id"], task["run_id"], index, referenced_indices),
+                ).fetchall()
+                slack_step_results = {row["step_index"]: row["result"] for row in rows}
             heartbeat(conn, worker_id, task["id"], LEASE_SECONDS)
-            result = post_message(payload, credential["secret"], timeout_seconds=LEASE_SECONDS / 2)
+            result = post_message(payload, credential["secret"], timeout_seconds=LEASE_SECONDS / 2,
+                                  step_results=slack_step_results)
         else:
             from app.github import GitHubError, execute_issue_comment_action, github_settings
 

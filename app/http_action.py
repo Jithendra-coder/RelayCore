@@ -139,7 +139,7 @@ def validate_http_step(payload: dict) -> None:
             json.dumps(payload["body"], ensure_ascii=False, allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise ValueError("HTTP action body must be valid JSON.") from exc
-        _validate_body_references(payload["body"])
+        validate_references(payload["body"])
     timeout = payload.get("timeout_seconds", MAX_TIMEOUT_SECONDS)
     if (not isinstance(timeout, (int, float)) or isinstance(timeout, bool)
             or not 0.1 <= timeout <= MAX_TIMEOUT_SECONDS):
@@ -151,25 +151,25 @@ def _valid_json_pointer(value: object) -> bool:
             and re.search(r"~(?![01])", value) is None)
 
 
-def _validate_body_references(value) -> None:
+def validate_references(value, label: str = "HTTP body") -> None:
     if isinstance(value, dict):
         if _EVENT_REFERENCE in value:
             pointer = value[_EVENT_REFERENCE]
             if set(value) != {_EVENT_REFERENCE} or not _valid_json_pointer(pointer):
-                raise ValueError("HTTP body event references must be {$event: '/json/pointer'} objects.")
+                raise ValueError(f"{label} event references must be {{$event: '/json/pointer'}} objects.")
             return
         if _STEP_REFERENCE in value:
             reference = value[_STEP_REFERENCE]
             if (set(value) != {_STEP_REFERENCE} or not isinstance(reference, dict)
                     or set(reference) != {"index", "pointer"} or type(reference["index"]) is not int
                     or reference["index"] < 0 or not _valid_json_pointer(reference["pointer"])):
-                raise ValueError("HTTP body step references must be {$step: {index, pointer}} objects.")
+                raise ValueError(f"{label} step references must be {{$step: {{index, pointer}}}} objects.")
             return
         for item in value.values():
-            _validate_body_references(item)
+            validate_references(item, label)
     elif isinstance(value, list):
         for item in value:
-            _validate_body_references(item)
+            validate_references(item, label)
 
 
 def step_references(value) -> Iterator[tuple[int, str]]:
@@ -194,7 +194,7 @@ def has_event_references(value) -> bool:
     return False
 
 
-def _resolve_json_pointer(document, pointer: str, label: str):
+def _resolve_json_pointer(document, pointer: str, label: str, action_label: str):
     current = document
     for part in pointer[1:].split("/"):
         part = part.replace("~1", "/").replace("~0", "~")
@@ -203,28 +203,29 @@ def _resolve_json_pointer(document, pointer: str, label: str):
         elif isinstance(current, list) and part.isdigit() and (part == "0" or not part.startswith("0")):
             index = int(part)
             if index >= len(current):
-                raise PermanentActionError(f"HTTP action {label} was not present.")
+                raise PermanentActionError(f"{action_label} {label} was not present.")
             current = current[index]
         else:
-            raise PermanentActionError(f"HTTP action {label} was not present.")
+            raise PermanentActionError(f"{action_label} {label} was not present.")
     return current
 
 
-def _resolve_body_references(value, event_payload, step_results):
+def resolve_references(value, event_payload, step_results, action_label: str = "HTTP action"):
     if isinstance(value, dict):
         if _EVENT_REFERENCE in value:
             if not isinstance(event_payload, dict):
-                raise PermanentActionError("HTTP action requires a webhook event payload.")
-            return _resolve_json_pointer(event_payload, value[_EVENT_REFERENCE], "event reference")
+                raise PermanentActionError(f"{action_label} requires a webhook event payload.")
+            return _resolve_json_pointer(event_payload, value[_EVENT_REFERENCE], "event reference", action_label)
         if _STEP_REFERENCE in value:
             reference = value[_STEP_REFERENCE]
             result = step_results.get(reference["index"]) if isinstance(step_results, dict) else None
             if not isinstance(result, dict):
-                raise PermanentActionError("HTTP action step result was not present.")
-            return _resolve_json_pointer(result, reference["pointer"], "step result reference")
-        return {key: _resolve_body_references(item, event_payload, step_results) for key, item in value.items()}
+                raise PermanentActionError(f"{action_label} step result was not present.")
+            return _resolve_json_pointer(result, reference["pointer"], "step result reference", action_label)
+        return {key: resolve_references(item, event_payload, step_results, action_label)
+                for key, item in value.items()}
     if isinstance(value, list):
-        return [_resolve_body_references(item, event_payload, step_results) for item in value]
+        return [resolve_references(item, event_payload, step_results, action_label) for item in value]
     return value
 
 
@@ -293,7 +294,7 @@ def execute_http_action(payload: dict, credential: str, idempotency_key: str,
     headers = {"Accept": "application/json", "Authorization": f"Bearer {credential}",
                "Idempotency-Key": idempotency_key, "User-Agent": "RelayCore/0.1"}
     if "body" in payload:
-        resolved_body = _resolve_body_references(payload["body"], event_payload, step_results)
+        resolved_body = resolve_references(payload["body"], event_payload, step_results)
         body = json.dumps(resolved_body, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
         if len(body) > 4096:
             raise PermanentActionError("Rendered HTTP action body exceeded the 4 KiB limit.")

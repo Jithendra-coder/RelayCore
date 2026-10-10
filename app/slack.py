@@ -17,6 +17,8 @@ from app.http_action import (
     RetryableActionError,
     _PinnedHTTPSConnection,
     _resolve_public_addresses,
+    resolve_references,
+    validate_references,
 )
 
 
@@ -68,19 +70,30 @@ def validate_message_step(payload: dict[str, Any]) -> None:
     channel, message = payload["channel"], payload["text"]
     if not isinstance(channel, str) or not _CHANNEL_ID.fullmatch(channel):
         raise ValueError("Slack message channel must be a conversation ID.")
-    if (not isinstance(message, str) or not message.strip() or len(message) > 4000
-            or any((ord(char) < 32 and char not in "\n\r\t") or ord(char) == 127 for char in message)):
-        raise ValueError("Slack message text must contain 1–4000 printable characters.")
+    if isinstance(message, dict) and set(message) == {"$step"}:
+        validate_references(message, "Slack message text")
+    elif not _valid_message_text(message):
+        raise ValueError("Slack message text must be 1–4000 printable characters or an earlier HTTP result reference.")
 
 
-def post_message(payload: dict[str, Any], bot_token: str, *, timeout_seconds: float = MAX_MESSAGE_TIMEOUT_SECONDS
-                  ) -> dict[str, Any]:
+def _valid_message_text(message: object) -> bool:
+    return (isinstance(message, str) and bool(message.strip()) and len(message) <= 4000
+            and not any((ord(char) < 32 and char not in "\n\r\t") or ord(char) == 127 for char in message))
+
+
+def post_message(payload: dict[str, Any], bot_token: str, *, timeout_seconds: float = MAX_MESSAGE_TIMEOUT_SECONDS,
+                 step_results: dict[int, dict[str, Any]] | None = None) -> dict[str, Any]:
     validate_message_step(payload)
-    if (not isinstance(bot_token, str) or not bot_token.startswith("xoxb-")
-            or not 16 <= len(bot_token) <= 4096
+    resolved_payload = {"channel": payload["channel"],
+                        "text": resolve_references(payload["text"], None, step_results, "Slack message")}
+    if not _valid_message_text(resolved_payload["text"]):
+        raise PermanentActionError("Resolved Slack message text must be 1–4000 printable characters.")
+    if not isinstance(bot_token, str) or not bot_token.startswith("xoxb-"):
+        raise PermanentActionError("Slack app credential is invalid.")
+    if (not 16 <= len(bot_token) <= 4096
             or any(ord(char) < 32 or ord(char) == 127 for char in bot_token)):
         raise PermanentActionError("Slack app credential is invalid.")
-    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
+    body = json.dumps(resolved_payload, separators=(",", ":"), ensure_ascii=False).encode()
     timeout_seconds = min(timeout_seconds, MAX_MESSAGE_TIMEOUT_SECONDS)
     deadline = time.monotonic() + timeout_seconds
     addresses = _resolve_public_addresses("slack.com", 443, timeout_seconds)
@@ -142,7 +155,7 @@ def post_message(payload: dict[str, Any], bot_token: str, *, timeout_seconds: fl
             raise RetryableActionError("Slack message was rate limited.")
         raise PermanentActionError("Slack rejected the message action.")
     channel, message_ts = result.get("channel"), result.get("ts")
-    if channel != payload["channel"] or not isinstance(message_ts, str) or not _MESSAGE_TS.fullmatch(message_ts):
+    if channel != resolved_payload["channel"] or not isinstance(message_ts, str) or not _MESSAGE_TS.fullmatch(message_ts):
         raise PermanentActionError("Slack message response could not be verified.")
     return {"channel": channel, "message_ts": message_ts}
 

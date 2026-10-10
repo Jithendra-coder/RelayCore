@@ -66,13 +66,17 @@ class WorkflowRequest(BaseModel):
     @model_validator(mode="after")
     def validate_step_references(self) -> "WorkflowRequest":
         for index, step in enumerate(self.steps):
-            if step.action != "http":
+            if step.action == "http":
+                value, label = step.payload.get("body"), "HTTP step"
+            elif step.action == "slack_message":
+                value, label = step.payload.get("text"), "Slack message"
+            else:
                 continue
-            for source_index, _ in step_references(step.payload.get("body")):
+            for source_index, _ in step_references(value):
                 if source_index >= index:
-                    raise ValueError("HTTP step references must point to an earlier workflow step.")
+                    raise ValueError(f"{label} references must point to an earlier workflow step.")
                 if self.steps[source_index].action != "http":
-                    raise ValueError("HTTP step references can only read an earlier HTTP action result.")
+                    raise ValueError(f"{label} references can only read an earlier HTTP action result.")
         return self
 
 
