@@ -96,8 +96,8 @@ class WorkerSupervisor:
         with self.lock:
             processes = [process for process in self.processes.values() if process.poll() is None]
             for process in processes:
-                self._terminate_tree(process, force=False)
-            deadline = time.monotonic() + 32
+                self._terminate_tree(process, force=os.name == "nt")
+            deadline = time.monotonic() + (3 if os.name == "nt" else 32)
             for process in processes:
                 try:
                     process.wait(timeout=max(0.1, deadline - time.monotonic()))

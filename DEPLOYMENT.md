@@ -42,7 +42,7 @@ For Slack, the OAuth callback must return to the signed-in RelayCore admin who s
 
 For separate deployment roles, set `RELAYCORE_WORKERS=0` on the API and run one or more containers from the same image with `python -m app.worker`. Workers need the same `DATABASE_URL`, `RELAYCORE_DEMO_MODE`, lease settings, encryption key, and HTTP host policy as the API. Each worker defaults to an ID built from its hostname and process ID; set a unique `RELAYCORE_WORKER_ID` if the runtime does not provide unique hostnames. Run at least one worker or accepted runs will remain queued. The local override `compose.workers.yaml` demonstrates this process boundary. Demo kill/restart controls are available only when the API supervises its workers.
 
-When the API supervises workers, shutdown asks them to finish their active step and wait up to 32 seconds before force-stopping any process still running. Demo Mode sleep steps are capped at 30 seconds; if a process exceeds the drain window, lease recovery retries its task after expiry, so external actions must remain idempotent.
+On POSIX, API shutdown asks supervised workers to finish their active step and waits up to 32 seconds before force-stopping any process still running. Demo Mode sleep steps are capped at 30 seconds; if a process exceeds the drain window, lease recovery retries its task after expiry. On Windows, the no-console worker process is force-stopped immediately because Windows control signals require an attached console; any active action can be retried after lease expiry. External actions must remain idempotent in both cases.
 
 ## Deployment status
 
