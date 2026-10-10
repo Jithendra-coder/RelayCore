@@ -55,6 +55,7 @@ services:
     ports:
       - "127.0.0.1:${RELAYCORE_PORT:-8000}:8000"
     restart: unless-stopped
+    stop_grace_period: 45s
 
 volumes:
   relaycore_data:

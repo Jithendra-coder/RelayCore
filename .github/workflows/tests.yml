@@ -47,6 +47,17 @@ jobs:
       - run: python -m pytest --cov=app --cov-report=term-missing --cov-fail-under=80 -q
       - run: docker compose config --quiet
       - run: docker compose -f compose.yaml -f compose.workers.yaml config --quiet
+      - name: Validate production Compose configuration
+        env:
+          DATABASE_URL: postgresql://relaycore:placeholder@db.example.com:5432/relaycore?sslmode=verify-full
+          RELAYCORE_IMAGE: ghcr.io/example/relaycore@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          RELAYCORE_SECRET_ENCRYPTION_KEY: ci-placeholder
+          RELAYCORE_OIDC_ISSUER: https://identity.example.com
+          RELAYCORE_OIDC_CLIENT_ID: ci-placeholder
+          RELAYCORE_OIDC_CLIENT_SECRET: ci-placeholder
+          RELAYCORE_OIDC_REDIRECT_URI: https://relay.example.com/auth/callback
+          RELAYCORE_OIDC_STATE_SECRET: ci-placeholder-state-secret-with-32-chars
+        run: docker compose -f compose.production.yaml config --quiet
       - name: Smoke test separate API and worker containers
         run: python -m scripts.compose_smoke
       - name: Validate Prometheus rules and config

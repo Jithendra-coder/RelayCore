@@ -22,7 +22,23 @@ Production requires a UTF-8 PostgreSQL database and all of the following environ
 
 Issuer, discovery, and redirect URLs must use HTTPS. Register the exact callback `/auth/callback` at the identity provider and serve the UI over HTTPS so the secure session cookie is sent. Put secrets in a secret manager; do not commit them to `.env` or source control. The OIDC provider flow has not been live-tested because provider credentials are not available here.
 
-The Compose API service passes the documented OIDC, encryption, outbound-host, GitHub, and Slack settings through from its environment or the project `.env` file. Use `.env` only for local development; production should inject secrets directly from its secret manager. The standalone worker checks its recent PostgreSQL heartbeat instead of inheriting the API's HTTP health probe.
+The local Compose API service passes the documented OIDC, encryption, outbound-host, GitHub, and Slack settings through from its environment or the project `.env` file. Use `.env` only for local development. The standalone worker checks its recent PostgreSQL heartbeat instead of inheriting the API's HTTP health probe.
+
+## Provider-neutral Docker deployment
+
+`compose.production.yaml` is a production-oriented Docker Compose template for one host and an external managed PostgreSQL database. It does not provision a cloud account, database, TLS proxy, container registry, or secret manager. Build and publish an immutable image for the deployment host, then set `RELAYCORE_IMAGE` to its digest (not a mutable tag). Configure every required variable from the production contract in the host environment using the selected secret manager; Compose refuses to start when the image, database, OIDC, or Fernet values are missing. Do not store production values in a committed file.
+
+The template runs the API with Demo Mode and in-process workers disabled, then starts a separate worker after the API has applied database migrations and passed its health check. It binds the API only to host loopback; configure a host-local reverse proxy to terminate TLS and forward to that port, and expose only the proxy to the internet. The API and worker run read-only with dropped Linux capabilities and a 45-second shutdown grace period. Scale workers with `docker compose -f compose.production.yaml up -d --scale worker=2` when measured queue demand requires it.
+
+Example after image and environment variables are configured:
+
+```sh
+docker compose -f compose.production.yaml pull
+docker compose -f compose.production.yaml up -d
+docker compose -f compose.production.yaml ps
+```
+
+The template uses container environment variables, which users with Docker daemon access can inspect. Use only a trusted host and restrict Docker access; for stronger secret isolation, use a deployment platform with native secret mounts and add explicit `*_FILE` support before using mounted files. This generic Compose path does not establish managed backups, rollback, alert delivery, staging, or a cloud smoke test. Follow [docs/runbook.md](docs/runbook.md) for operating procedures.
 
 For GitHub App events, set the App's setup and OAuth callback URLs to the configured values, use the configured webhook secret, grant Pull requests read-only access, and subscribe to `pull_request` and `installation`. RelayCore's GitHub callback requires the same signed-in RelayCore admin who began linking the workspace. The App credentials and live GitHub delivery have not been verified in this environment.
 
@@ -40,7 +56,7 @@ For Slack, the OAuth callback must return to the signed-in RelayCore admin who s
 
 ## API and worker processes
 
-For separate deployment roles, set `RELAYCORE_WORKERS=0` on the API and run one or more containers from the same image with `python -m app.worker`. Workers need the same `DATABASE_URL`, `RELAYCORE_DEMO_MODE`, lease settings, encryption key, and HTTP host policy as the API. Each worker defaults to an ID built from its hostname and process ID; set a unique `RELAYCORE_WORKER_ID` if the runtime does not provide unique hostnames. Run at least one worker or accepted runs will remain queued. The local override `compose.workers.yaml` demonstrates this process boundary. Demo kill/restart controls are available only when the API supervises its workers.
+For separate deployment roles, set `RELAYCORE_WORKERS=0` on the API and run one or more containers from the same image with `python -m app.worker`. Workers need the same `DATABASE_URL`, `RELAYCORE_DEMO_MODE`, lease settings, encryption key, HTTP host policy, and all GitHub App settings when GitHub actions are enabled. Each worker defaults to an ID built from its hostname and process ID; set a unique `RELAYCORE_WORKER_ID` if the runtime does not provide unique hostnames. Run at least one worker or accepted runs will remain queued. The local override `compose.workers.yaml` demonstrates this process boundary. Demo kill/restart controls are available only when the API supervises its workers.
 
 On POSIX, API shutdown asks supervised workers to finish their active step and waits up to 32 seconds before force-stopping any process still running. Demo Mode sleep steps are capped at 30 seconds; if a process exceeds the drain window, lease recovery retries its task after expiry. On Windows, the no-console worker process is force-stopped immediately because Windows control signals require an attached console; any active action can be retried after lease expiry. External actions must remain idempotent in both cases.
 
