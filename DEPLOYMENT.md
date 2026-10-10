@@ -42,6 +42,8 @@ For Slack, the OAuth callback must return to the signed-in RelayCore admin who s
 
 For separate deployment roles, set `RELAYCORE_WORKERS=0` on the API and run one or more containers from the same image with `python -m app.worker`. Workers need the same `DATABASE_URL`, `RELAYCORE_DEMO_MODE`, lease settings, encryption key, and HTTP host policy as the API. Each worker defaults to an ID built from its hostname and process ID; set a unique `RELAYCORE_WORKER_ID` if the runtime does not provide unique hostnames. Run at least one worker or accepted runs will remain queued. The local override `compose.workers.yaml` demonstrates this process boundary. Demo kill/restart controls are available only when the API supervises its workers.
 
+When the API supervises workers, shutdown asks them to finish their active step and wait up to 32 seconds before force-stopping any process still running. Demo Mode sleep steps are capped at 30 seconds; if a process exceeds the drain window, lease recovery retries its task after expiry, so external actions must remain idempotent.
+
 ## Deployment status
 
 There is no staging or production infrastructure, Terraform, image publishing, migration rollout, rollback automation, or cloud smoke test yet. PostgreSQL logical backup/restore scripts exist, but managed retention and disaster recovery are unverified. A production release is blocked until provider-backed workflow actions and deployment controls are verified. See [LIMITATIONS.md](LIMITATIONS.md).

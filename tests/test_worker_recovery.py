@@ -153,6 +153,35 @@ def test_real_worker_process_kill_expires_lease_and_reassigns(client):
         supervisor.close()
 
 
+def test_supervisor_drains_active_step_before_shutdown(client):
+    supervisor = WorkerSupervisor(1)
+    supervisor.start()
+    try:
+        response = make_workflow(client, steps=[
+            {"name": "finish before shutdown", "action": "sleep", "payload": {"seconds": 0.8}},
+        ])
+        run_id = response.json()["id"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with client.app.state.pool.connection() as conn:
+                active = conn.execute(
+                    "SELECT 1 FROM tasks WHERE run_id=%s AND status='running' AND lease_owner='worker-1'",
+                    (run_id,),
+                ).fetchone()
+            if active:
+                break
+            time.sleep(0.05)
+        assert active, "Worker did not claim the shutdown test task."
+
+        supervisor.close()
+
+        run = get_run(client, run_id)
+        assert run["status"] == "completed"
+        assert len(run["side_effects"]) == 1
+    finally:
+        supervisor.close()
+
+
 def test_worker_reconnects_after_postgres_drops_its_connection(client):
     supervisor = WorkerSupervisor(1)
     supervisor.start()

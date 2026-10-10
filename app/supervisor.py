@@ -71,7 +71,10 @@ class WorkerSupervisor:
                 command.append("/F")
             subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         else:
-            os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+            try:
+                os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+            except ProcessLookupError:
+                pass
 
     def state(self) -> dict[str, bool]:
         with self.lock:
@@ -91,13 +94,13 @@ class WorkerSupervisor:
         if self.monitor:
             self.monitor.join(timeout=2)
         with self.lock:
-            for process in self.processes.values():
-                if process.poll() is None:
+            processes = [process for process in self.processes.values() if process.poll() is None]
+            for process in processes:
+                self._terminate_tree(process, force=False)
+            deadline = time.monotonic() + 32
+            for process in processes:
+                try:
+                    process.wait(timeout=max(0.1, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
                     self._terminate_tree(process, force=True)
-            deadline = time.monotonic() + 3
-            for process in self.processes.values():
-                if process.poll() is None:
-                    try:
-                        process.wait(timeout=max(0.1, deadline - time.monotonic()))
-                    except subprocess.TimeoutExpired:
-                        self._terminate_tree(process, force=True)
+                    process.wait(timeout=3)
